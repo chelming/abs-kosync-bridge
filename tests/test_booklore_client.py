@@ -535,6 +535,46 @@ def test_search_books_hit_skips_refresh_when_cache_is_fresh(booklore_client):
     booklore_client._refresh_book_cache.assert_not_called()
 
 
+def test_search_books_filtered_variant_miss_refreshes_even_when_cache_is_fresh(booklore_client):
+    booklore_client._book_cache = {
+        "ubik.m4b": {
+            "id": "audio-ubik",
+            "fileName": "Ubik.m4b",
+            "title": "Ubik",
+            "authors": "Philip K. Dick",
+            "bookType": "AUDIOBOOK",
+        }
+    }
+    booklore_client._book_id_cache = {
+        "audio-ubik": booklore_client._book_cache["ubik.m4b"]
+    }
+    booklore_client._cache_timestamp = time.time() - 10
+    booklore_client._is_refresh_on_cooldown = MagicMock(return_value=False)
+
+    def refresh_side_effect(**kwargs):
+        booklore_client._book_cache["01. ubik - philip k. dick (2004).epub"] = {
+            "id": "ebook-ubik",
+            "fileName": "01. Ubik - Philip K. Dick (2004).epub",
+            "title": "Ubik",
+            "subtitle": "The Screenplay",
+            "authors": "Philip K. Dick",
+            "bookType": "EPUB",
+        }
+        booklore_client._book_id_cache["ebook-ubik"] = booklore_client._book_cache[
+            "01. ubik - philip k. dick (2004).epub"
+        ]
+        booklore_client._cache_timestamp = time.time()
+        return True
+
+    booklore_client._refresh_book_cache = MagicMock(side_effect=refresh_side_effect)
+
+    results = booklore_client.search_books("Ubik", filename_suffix=".epub")
+
+    assert len(results) == 1
+    assert results[0]["fileName"] == "01. Ubik - Philip K. Dick (2004).epub"
+    booklore_client._refresh_book_cache.assert_called_once()
+
+
 def test_refresh_book_cache_hydrates_small_library(booklore_client):
     books = [make_list_book(f"book-{idx}", title=f"Small Book {idx}") for idx in range(3)]
     booklore_client._make_request = MagicMock(side_effect=paginated_responses(books))

@@ -1093,7 +1093,7 @@ def get_searchable_ebooks(search_term):
     if container.booklore_client().is_configured():
         try:
             if search_term:
-                books = container.booklore_client().search_books(search_term)
+                books = container.booklore_client().search_books(search_term, filename_suffix='.epub')
             else:
                 # For scan workloads, use the broader cache-oriented API to avoid
                 # repeated aggressive refresh behavior from per-query search calls.
@@ -2180,7 +2180,7 @@ def forge_search_text():
     # 1. Booklore
     if container.booklore_client().is_configured():
         try:
-            books = container.booklore_client().search_books(query)
+            books = container.booklore_client().search_books(query, filename_suffix='.epub')
             if books:
                 for b in books:
                     fname = b.get('fileName', '')

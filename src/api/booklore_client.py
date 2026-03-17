@@ -1282,10 +1282,18 @@ class BookloreClient:
 
         return self._refresh_book_cache()
 
-    def search_books(self, search_term):
-        """Search books by title, author, or filename. Returns list of matching books."""
+    def search_books(self, search_term, filename_suffix=None):
+        """Search books by title, author, or filename.
+
+        When ``filename_suffix`` is provided, only results with matching filenames are
+        returned. A cache hit that only matches other Booklore variants (for example an
+        audiobook hit during an EPUB search) is treated as a refreshable miss so newly
+        added variants become visible immediately.
+        """
         if not self.is_configured():
             return []
+
+        normalized_suffix = str(filename_suffix or "").strip().lower()
 
         def search_in_cache(term):
             search_lower = term.lower()
@@ -1363,6 +1371,14 @@ class BookloreClient:
 
             return self._dedupe_book_results(matches)
 
+        def apply_filename_filter(books):
+            if not normalized_suffix:
+                return books
+            return [
+                book for book in books
+                if str(book.get('fileName') or '').lower().endswith(normalized_suffix)
+            ]
+
         # Avoid expensive full-library refreshes on rapid UI search requests.
         # Keep refresh cadence aligned with other read paths.
         if time.time() - self._cache_timestamp > 3600 and not self._is_refresh_on_cooldown():
@@ -1371,11 +1387,13 @@ class BookloreClient:
             self._refresh_book_cache(refresh_stale_details=False)
 
         if not search_term:
-            return self.get_all_books()
+            return apply_filename_filter(self.get_all_books())
 
-        results = search_in_cache(search_term)
+        raw_results = search_in_cache(search_term)
+        results = apply_filename_filter(raw_results)
         cache_age = time.time() - self._cache_timestamp
         safe_term = sanitize_log_data(search_term)
+        partial_variant_miss = bool(normalized_suffix and raw_results and not results)
         if results:
             now = time.time()
             hit_refresh_ready = (
@@ -1392,12 +1410,39 @@ class BookloreClient:
                     f"(term='{safe_term}', cache_age={cache_age:.0f}s, hits={len(results)})"
                 )
                 if self._refresh_book_cache(refresh_stale_details=False):
-                    return search_in_cache(search_term)
+                    return apply_filename_filter(search_in_cache(search_term))
             elif cache_age > self._search_hit_refresh_min_age and not hit_refresh_ready:
                 logger.debug(
                     f"Booklore search hit: quick validation throttled "
                     f"(term='{safe_term}', cooldown={self._search_hit_refresh_cooldown}s)"
                 )
+            return results
+
+        if partial_variant_miss:
+            now = time.time()
+            hit_refresh_ready = (
+                (now - self._last_search_hit_refresh_attempt) >= self._search_hit_refresh_cooldown
+            )
+            if self._is_refresh_on_cooldown():
+                logger.debug(
+                    "Booklore search variant miss: refresh skipped due to cooldown "
+                    f"(term='{safe_term}', suffix='{normalized_suffix}')"
+                )
+                return results
+            if not hit_refresh_ready:
+                logger.debug(
+                    "Booklore search variant miss: quick validation throttled "
+                    f"(term='{safe_term}', suffix='{normalized_suffix}', cooldown={self._search_hit_refresh_cooldown}s)"
+                )
+                return results
+
+            self._last_search_hit_refresh_attempt = now
+            logger.debug(
+                "Booklore search variant miss: refreshing cache once "
+                f"(term='{safe_term}', suffix='{normalized_suffix}', raw_hits={len(raw_results)})"
+            )
+            if self._refresh_book_cache(refresh_stale_details=False):
+                return apply_filename_filter(search_in_cache(search_term))
             return results
 
         if self._is_refresh_on_cooldown():
@@ -1419,7 +1464,7 @@ class BookloreClient:
             f"(term='{safe_term}', cache_age={cache_age:.0f}s)"
         )
         if self._refresh_book_cache(refresh_stale_details=False):
-            return search_in_cache(search_term)
+            return apply_filename_filter(search_in_cache(search_term))
 
         return results
 
