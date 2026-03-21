@@ -23,7 +23,7 @@
       
       
       <link rel="icon" href="../static/images/favicon.png">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.4">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.6">
     
     
       
@@ -580,22 +580,22 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
-  <a href="#633-2026-02-27" class="md-nav__link">
+  <a href="#633-2026-03-08" class="md-nav__link">
     <span class="md-ellipsis">
       
-        [6.3.3] - 2026-02-27
+        [6.3.3] - 2026-03-08
       
     </span>
   </a>
   
-    <nav class="md-nav" aria-label="[6.3.3] - 2026-02-27">
+    <nav class="md-nav" aria-label="[6.3.3] - 2026-03-08">
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#enhancements" class="md-nav__link">
+  <a href="#added" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Enhancements
+        Added
       
     </span>
   </a>
@@ -603,10 +603,21 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#fixes" class="md-nav__link">
+  <a href="#changed" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Fixes
+        Changed
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#fixed" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Fixed
       
     </span>
   </a>
@@ -642,7 +653,7 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#fixes_1" class="md-nav__link">
+  <a href="#fixes" class="md-nav__link">
     <span class="md-ellipsis">
       
         🐛 Fixes
@@ -703,22 +714,22 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
-  <a href="#633-2026-02-27" class="md-nav__link">
+  <a href="#633-2026-03-08" class="md-nav__link">
     <span class="md-ellipsis">
       
-        [6.3.3] - 2026-02-27
+        [6.3.3] - 2026-03-08
       
     </span>
   </a>
   
-    <nav class="md-nav" aria-label="[6.3.3] - 2026-02-27">
+    <nav class="md-nav" aria-label="[6.3.3] - 2026-03-08">
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#enhancements" class="md-nav__link">
+  <a href="#added" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Enhancements
+        Added
       
     </span>
   </a>
@@ -726,10 +737,21 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#fixes" class="md-nav__link">
+  <a href="#changed" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Fixes
+        Changed
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#fixed" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Fixed
       
     </span>
   </a>
@@ -765,7 +787,7 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#fixes_1" class="md-nav__link">
+  <a href="#fixes" class="md-nav__link">
     <span class="md-ellipsis">
       
         🐛 Fixes
@@ -814,19 +836,23 @@
 <h1 id="changelog">Changelog</h1>
 <p>For the full history of changes, please refer to the <strong><a href="https://github.com/cporcellijr/abs-kosync-bridge/releases">GitHub Releases</a></strong> page.</p>
 <hr />
-<h2 id="633-2026-02-27">[6.3.3] - 2026-02-27</h2>
-<h3 id="enhancements">Enhancements</h3>
+<h2 id="633-2026-03-08">[6.3.3] - 2026-03-08</h2>
+<h3 id="added">Added</h3>
 <ul>
-<li>Storyteller forced-alignment transcript JSON is now a top-priority transcript source (before SMIL and Whisper).</li>
-<li>Added optional <strong>Storyteller Assets Path</strong> support (<code>STORYTELLER_ASSETS_DIR</code>) for ingesting files from <code>{root}/assets/{title}/transcriptions</code>.</li>
-<li>Added storyteller-native direct alignment map generation from <code>wordTimeline</code>.</li>
-<li>Added direct timestamp-to-EPUB locator resolution for Storyteller transcript books (bypasses fuzzy-search lookup path).</li>
-<li>Added a Settings maintenance action to bulk backfill Storyteller transcripts and regenerate alignment maps for existing Storyteller-linked books.</li>
+<li>Added a dedicated <strong>Library Suggestions</strong> workspace with background scans, cached repeat scans, and a <strong>Full Refresh</strong> option.</li>
+<li>Added <strong>Booklore audiobook</strong> support across Match, Batch Match, Suggestions, Forge, and the dashboard.</li>
+<li>Added more flexible linking flows, including ebook-only links, Storyteller-only links, and a <strong>Refresh Booklore Cache</strong> action in Settings.</li>
 </ul>
-<h3 id="fixes">Fixes</h3>
+<h3 id="changed">Changed</h3>
 <ul>
-<li>Accepted both <code>00000-xxxxx.json</code> and <code>00001-xxxxx.json</code> Storyteller chapter filename prefixes.</li>
-<li>Added chapter format validation guardrails so incompatible JSON files are skipped cleanly during ingest/backfill.</li>
+<li>Match and dashboard views now show clearer source badges and audio-source details.</li>
+<li>Storyteller transcript ingest now accepts more real-world layouts while staying the preferred timing source when available.</li>
+</ul>
+<h3 id="fixed">Fixed</h3>
+<ul>
+<li>Fixed cross-format drift cases that could cause bounce-backs or bad resets.</li>
+<li>Fixed ebook-only links getting stuck in processing.</li>
+<li>Fixed edge cases where Storyteller-only links or stale Booklore data could break matching or syncing.</li>
 </ul>
 <hr />
 <h2 id="630-2026-02-18">[6.3.0] - 2026-02-18</h2>
@@ -842,7 +868,7 @@
 <li><strong>Telegram Notifications</strong>: Send log alerts to a Telegram chat at a configurable severity level.</li>
 <li><strong>UI Redesign</strong>: Horizontal dashboard cards, overhauled match pages, and responsive settings UI.</li>
 </ul>
-<h3 id="fixes_1">🐛 Fixes</h3>
+<h3 id="fixes">🐛 Fixes</h3>
 <ul>
 <li>Fixed KOReader sync crashes (XPath double <code>body</code> tag issue).</li>
 <li>Fixed KOSync hash overwrites by Storyteller artifacts.</li>
