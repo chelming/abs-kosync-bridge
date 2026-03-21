@@ -1965,13 +1965,14 @@ def forge_search_text():
 
 
 def forge_process():
-    """API: Start the forge process (copy files + cleanup in background)."""
+    """API: Start the forge process in the background."""
     data = request.get_json()
     if not data:
         return jsonify({"error": "Missing JSON payload"}), 400
 
     abs_id = data.get('abs_id')
     text_item = data.get('text_item')
+    forge_stage_mode = data.get('forge_stage_mode')
 
     if not abs_id or not text_item:
         return jsonify({"error": "Missing abs_id or text_item"}), 400
@@ -1990,8 +1991,21 @@ def forge_process():
 
     # Start manual forge in service
     try:
-        container.forge_service().start_manual_forge(abs_id, text_item, title, author)
-        msg = f"Forge started for '{title}'. Processing and cleanup running in background."
+        if forge_stage_mode:
+            container.forge_service().start_manual_forge(
+                abs_id,
+                text_item,
+                title,
+                author,
+                stage_mode=forge_stage_mode,
+            )
+        else:
+            container.forge_service().start_manual_forge(abs_id, text_item, title, author)
+        msg = (
+            f"Forge started for '{title}'. Processing and staged-source cleanup are running in background."
+            if str(forge_stage_mode or "").strip().lower() != "hardlink"
+            else f"Forge started for '{title}'. Processing is running in background and staged sources will be kept."
+        )
     except Exception as e:
         logger.error(f"❌ Failed to start forge: {e}")
         return jsonify({"error": f"Failed to start forge: {e}"}), 500
@@ -2017,6 +2031,7 @@ def match():
         ebook_source = (request.form.get('ebook_source') or request.form.get('source_type') or '').strip() or None
         ebook_source_id = (request.form.get('ebook_source_id') or request.form.get('source_id') or '').strip() or None
         storyteller_uuid = (request.form.get('storyteller_uuid') or '').strip() or None
+        forge_stage_mode = (request.form.get('forge_stage_mode') or '').strip() or None
         ebook_filename = selected_filename
         original_ebook_filename = selected_filename
         audiobooks = container.abs_client().get_all_audiobooks()
@@ -2122,6 +2137,7 @@ def match():
                     original_hash=kosync_doc_id,
                     audio_source='BookLore',
                     audio_source_id=audio_source_id,
+                    **({"stage_mode": forge_stage_mode} if forge_stage_mode else {}),
                 )
             else:
                 abs_title = manager.get_abs_title(selected_ab)
@@ -2143,7 +2159,8 @@ def match():
                     title=abs_title,
                     author=author,
                     original_filename=original_filename,
-                    original_hash=kosync_doc_id
+                    original_hash=kosync_doc_id,
+                    **({"stage_mode": forge_stage_mode} if forge_stage_mode else {}),
                 )
 
             forge_book_id = forge_id if audio_source == 'BookLore' else abs_id
@@ -2290,7 +2307,8 @@ def match():
         if hardcover_sync_client and hardcover_sync_client.is_configured():
             hardcover_sync_client._automatch_hardcover(book)
 
-        container.abs_client().add_to_collection(abs_id, ABS_COLLECTION_NAME)
+        if not str(abs_id).startswith('booklore:'):
+            container.abs_client().add_to_collection(abs_id, ABS_COLLECTION_NAME)
         if container.booklore_client().is_configured():
             # Use original filename for shelf if we switched to storyteller
             shelf_filename = original_ebook_filename or ebook_filename
@@ -2525,7 +2543,8 @@ def batch_match():
                     if hardcover_sync_client and hardcover_sync_client.is_configured():
                         hardcover_sync_client._automatch_hardcover(book)
 
-                    container.abs_client().add_to_collection(item['abs_id'], ABS_COLLECTION_NAME)
+                    if not str(item['abs_id']).startswith('booklore:'):
+                        container.abs_client().add_to_collection(item['abs_id'], ABS_COLLECTION_NAME)
                     if container.booklore_client().is_configured():
                         shelf_filename = original_ebook_filename or ebook_filename
                         container.booklore_client().add_to_shelf(shelf_filename, BOOKLORE_SHELF_NAME)
@@ -2796,7 +2815,8 @@ def batch_match():
                 if hardcover_sync_client and hardcover_sync_client.is_configured():
                     hardcover_sync_client._automatch_hardcover(book)
 
-                container.abs_client().add_to_collection(item['abs_id'], ABS_COLLECTION_NAME)
+                if not str(item['abs_id']).startswith('booklore:'):
+                    container.abs_client().add_to_collection(item['abs_id'], ABS_COLLECTION_NAME)
                 if container.booklore_client().is_configured():
                     shelf_filename = original_ebook_filename or ebook_filename
                     container.booklore_client().add_to_shelf(shelf_filename, BOOKLORE_SHELF_NAME)
@@ -3394,7 +3414,8 @@ def suggestions_page():
                 if hardcover_sync_client and hardcover_sync_client.is_configured():
                     hardcover_sync_client._automatch_hardcover(book)
 
-                container.abs_client().add_to_collection(item['abs_id'], ABS_COLLECTION_NAME)
+                if not str(item['abs_id']).startswith('booklore:'):
+                    container.abs_client().add_to_collection(item['abs_id'], ABS_COLLECTION_NAME)
                 if container.booklore_client().is_configured():
                     shelf_filename = original_ebook_filename or ebook_filename
                     container.booklore_client().add_to_shelf(shelf_filename, BOOKLORE_SHELF_NAME)
@@ -3671,14 +3692,18 @@ def cleanup_mapping_resources(book):
         logger.info(f"🗑️ Deleting KOSync document record for ebook-only mapping: '{book.kosync_doc_id}'")
         database_service.delete_kosync_document(book.kosync_doc_id)
 
-    if getattr(book, 'sync_mode', 'audiobook') != 'ebook_only':
+    is_abs_backed = (
+        getattr(book, 'sync_mode', 'audiobook') != 'ebook_only'
+        and not str(book.abs_id).startswith('booklore:')
+    )
+    if is_abs_backed:
         collection_name = os.environ.get('ABS_COLLECTION_NAME', 'Synced with KOReader')
         try:
             container.abs_client().remove_from_collection(book.abs_id, collection_name)
         except Exception as e:
             logger.warning(f"⚠️ Failed to remove from ABS collection: {e}")
     else:
-        logger.info(f"Skipping ABS collection cleanup for ebook-only mapping '{book.abs_id}'")
+        logger.info(f"Skipping ABS collection cleanup for non-ABS mapping '{book.abs_id}'")
 
     storyteller_uuid = getattr(book, 'storyteller_uuid', None)
     if not storyteller_uuid and getattr(book, 'ebook_filename', None):

@@ -1,6 +1,7 @@
 # KoSync Server - Extracted from web_server.py for clean code separation
 # Implements KOSync protocol compatible with kosync-dotnet
 import logging
+import mimetypes
 import os
 import threading
 import time
@@ -10,7 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify, request, send_file
 
 from src.utils.kosync_headers import hash_kosync_key
 
@@ -43,6 +44,16 @@ def init_kosync_server(database_service, container, manager, ebook_dir=None):
     _container = container
     _manager = manager
     _ebook_dir = ebook_dir
+
+
+def _get_koreader_device_sync_service():
+    if not _container:
+        return None
+    try:
+        return _container.koreader_device_sync_service()
+    except Exception as e:
+        logger.warning(f"KOReader device-sync service unavailable: {e}")
+        return None
 
 
 def _record_kosync_event(abs_id: str, title: str) -> None:
@@ -201,6 +212,13 @@ def kosync_get_progress(doc_id):
 
         has_progress = kosync_doc.percentage and float(kosync_doc.percentage) > 0
         if has_progress:
+            poison_pill = _suppress_empty_progress_response(
+                doc_id,
+                float(kosync_doc.percentage),
+                kosync_doc.progress,
+            )
+            if poison_pill is not None:
+                return poison_pill
             return jsonify({
                 "device": kosync_doc.device or "",
                 "device_id": kosync_doc.device_id or "",
@@ -479,6 +497,49 @@ def kosync_put_progress():
     }), 200
 
 
+@kosync_sync_bp.route('/device-sync/manifest', methods=['GET'])
+@kosync_sync_bp.route('/koreader/device-sync/manifest', methods=['GET'])
+@kosync_auth_required
+def koreader_device_sync_manifest():
+    """Return the optional KOReader managed-folder sync manifest."""
+    service = _get_koreader_device_sync_service()
+    if not service:
+        return jsonify({"error": "Device sync service unavailable"}), 503
+    return jsonify(service.build_manifest()), 200
+
+
+@kosync_sync_bp.route('/device-sync/books/<path:abs_id>/download', methods=['GET'])
+@kosync_sync_bp.route('/koreader/device-sync/books/<path:abs_id>/download', methods=['GET'])
+@kosync_auth_required
+def koreader_device_sync_download(abs_id):
+    """Download the original ebook for a bridge-managed KOReader sync item."""
+    service = _get_koreader_device_sync_service()
+    if not service:
+        return jsonify({"error": "Device sync service unavailable"}), 503
+
+    resolved = service.resolve_download(abs_id)
+    if not resolved:
+        return jsonify({"error": "Book not available"}), 404
+
+    path = resolved["path"]
+    filename = resolved["filename"]
+    content_hash = resolved["content_hash"]
+    mime_type = resolved.get("mime_type") or mimetypes.guess_type(filename)[0] or "application/octet-stream"
+
+    response = send_file(
+        path,
+        mimetype=mime_type,
+        as_attachment=True,
+        download_name=filename,
+        conditional=True,
+        etag=False,
+        max_age=0,
+    )
+    response.set_etag(content_hash)
+    response.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+    return response
+
+
 # ---------------- Helper Functions ----------------
 
 def _upsert_kosync_metadata(document_hash, filename, source, mtime=None, booklore_id=None):
@@ -679,6 +740,9 @@ def _respond_from_book_states(doc_id, book):
     if docs_with_progress:
         best_doc = max(docs_with_progress, key=lambda d: float(d.percentage))
         logger.info(f"KOSync: Resolved {doc_id} to '{book.abs_title}' via sibling hash {best_doc.document_hash} ({float(best_doc.percentage):.2%})")
+        poison_pill = _suppress_empty_progress_response(doc_id, float(best_doc.percentage), best_doc.progress)
+        if poison_pill is not None:
+            return poison_pill
         return jsonify({
             "device": best_doc.device or "abs-kosync-bridge",
             "device_id": best_doc.device_id or "abs-kosync-bridge",
@@ -693,13 +757,18 @@ def _respond_from_book_states(doc_id, book):
 
     kosync_state = next((s for s in states if s.client_name.lower() == 'kosync'), None)
     latest_state = kosync_state or max(states, key=lambda s: s.last_updated if s.last_updated else 0)
+    latest_progress = (latest_state.xpath or latest_state.cfi or "") if hasattr(latest_state, 'xpath') else ""
+    latest_pct = float(latest_state.percentage) if latest_state.percentage else 0
+    poison_pill = _suppress_empty_progress_response(doc_id, latest_pct, latest_progress)
+    if poison_pill is not None:
+        return poison_pill
 
     return jsonify({
         "device": "abs-kosync-bridge",
         "device_id": "abs-kosync-bridge",
         "document": doc_id,
-        "percentage": float(latest_state.percentage) if latest_state.percentage else 0,
-        "progress": (latest_state.xpath or latest_state.cfi) if hasattr(latest_state, 'xpath') else "",
+        "percentage": latest_pct,
+        "progress": latest_progress,
         "timestamp": int(latest_state.last_updated) if latest_state.last_updated else 0
     }), 200
 
@@ -776,6 +845,17 @@ def _run_get_auto_discovery(doc_id: str):
 
 
 # ---------------- KOSync Document Management API ----------------
+
+def _suppress_empty_progress_response(doc_id: str, percentage: float, progress: Optional[str]):
+    safe_progress = progress.strip() if isinstance(progress, str) else ""
+    if percentage > 0 and not safe_progress:
+        logger.warning(
+            "KOSync: Suppressing response for %s - percentage %.2f%% but no locator available. Returning 502 to prevent page-0 reset.",
+            doc_id,
+            percentage * 100.0,
+        )
+        return jsonify({"message": "Document not found on server"}), 502
+    return None
 
 @kosync_admin_bp.route('/api/kosync-documents', methods=['GET'])
 def api_get_kosync_documents():

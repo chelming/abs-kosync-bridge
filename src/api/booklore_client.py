@@ -52,6 +52,7 @@ class BookloreClient:
         self._last_audiobook_search_miss_refresh_attempt = 0
         self._refresh_lock = threading.Lock()
         self._cache_lock = threading.RLock()
+        self._epub_cfi_write_disabled_for_books = set()
 
         self._token = None
         self._token_timestamp = 0
@@ -256,6 +257,12 @@ class BookloreClient:
         except Exception:
             return "<unavailable>"
 
+    @staticmethod
+    def _normalize_optional_string(value):
+        if value in (None, ""):
+            return None
+        return str(value)
+
     def _parse_json_response(self, response, context):
         try:
             return response.json()
@@ -326,7 +333,7 @@ class BookloreClient:
         # Strategy 2: Fallback - Scan a few books to find unique libraries
         try:
             logger.info("Booklore: Scanning books to discover libraries...")
-            response = self._make_request("GET", "/api/v1/books?page=0&size=50")
+            response = self._make_request("GET", "/api/v1/books")
             if response and response.status_code == 200:
                 data = self._parse_json_response(response, "Booklore library discovery scan")
                 if isinstance(data, list):
@@ -494,7 +501,8 @@ class BookloreClient:
     def _build_books_endpoint(self, page, batch_size, use_server_side_filter):
         if use_server_side_filter and self.target_library_id:
             return f"/api/v1/libraries/{self.target_library_id}/book"
-        return f"/api/v1/books?page={page}&size={batch_size}"
+        # Grimmory /api/v1/books returns all books as a flat list (no pagination).
+        return "/api/v1/books"
 
     def _filter_books_by_library(self, books):
         if not self.target_library_id:
@@ -787,6 +795,11 @@ class BookloreClient:
                     break
 
                 if raw_batch_size != batch_size:
+                    break
+
+                # Grimmory /api/v1/books returns a flat list; always stop after
+                # first fetch for non-library-scoped scans.
+                if not use_server_side_filter:
                     break
 
                 page += 1
@@ -1422,12 +1435,6 @@ class BookloreClient:
 
         try:
             response = self.session.get(url, headers=headers, timeout=60)
-            
-            # Fallback for newer Booklore versions or different configurations
-            if response.status_code == 404:
-                file_url = f"{self.base_url}/api/v1/books/{book_id}/file"
-                logger.debug(f"404 on /download, trying fallback: {file_url}")
-                response = self.session.get(file_url, headers=headers, timeout=60)
 
             if response.status_code != 200:
                 if response.status_code == 404:
@@ -1554,6 +1561,74 @@ class BookloreClient:
         if not response or response.status_code != 200:
             return None, None
         return response.content, response.headers.get('Content-Type', 'image/jpeg')
+
+    def download_book_to_path(self, book_id, output_path, expected_size: int = 0) -> bool:
+        """Stream-download the audiobook file directly to disk.
+
+        Uses Grimmory's audiobook stream endpoint for full-file delivery.
+        """
+        token = self._get_fresh_token()
+        if not token:
+            return False
+        headers = {"Authorization": f"Bearer {token}"}
+        urls = [
+            f"{self.base_url}/api/v1/audiobooks/{book_id}/stream",
+        ]
+        for url in urls:
+            try:
+                with self.session.get(url, headers=headers, stream=True, timeout=300) as response:
+                    if response.status_code == 404:
+                        logger.debug(
+                            f"Booklore audiobook download: 404 on {url}, trying next"
+                        )
+                        continue
+                    if response.status_code != 200:
+                        logger.error(
+                            f"❌ Booklore audiobook download failed: book_id={book_id} "
+                            f"url={url} status={response.status_code}"
+                        )
+                        return False
+
+                    # Check Content-Length if available early
+                    content_length = response.headers.get('Content-Length')
+                    if content_length and expected_size and int(content_length) < expected_size * 0.1:
+                        logger.warning(
+                            f"Booklore download candidate too small ({content_length} bytes) on {url}, searching for larger stream..."
+                        )
+                        continue
+
+                    output_path = Path(output_path)
+                    output_path.parent.mkdir(parents=True, exist_ok=True)
+                    with open(output_path, "wb") as handle:
+                        for chunk in response.iter_content(chunk_size=65536):
+                            if chunk:
+                                handle.write(chunk)
+                    actual_size = output_path.stat().st_size
+                    size_display = f"{actual_size // (1024 * 1024)} MiB" if actual_size > 1024 * 1024 else f"{actual_size // 1024} KiB"
+                    
+                    # If we downloaded a file that is still too small, try next endpoint
+                    if expected_size and actual_size < expected_size * 0.1:
+                        logger.warning(
+                            f"Booklore downloaded file too small ({size_display}) from {url}, trying next endpoint..."
+                        )
+                        continue
+
+                    logger.info(
+                        f"Booklore audiobook download: book_id={book_id} "
+                        f"-> '{output_path.name}' ({size_display}) via {url.split('/')[-1]}"
+                    )
+                    if expected_size and actual_size < expected_size * 0.5:
+                        logger.warning(
+                            f"Booklore audiobook download size mismatch: "
+                            f"expected ~{expected_size // (1024 * 1024)} MiB, "
+                            f"got {size_display} — file may be incomplete"
+                        )
+                    return True
+            except Exception as e:
+                logger.error(f"❌ Booklore audiobook download error: book_id={book_id} url={url} {e}")
+                return False
+        logger.error(f"❌ Booklore audiobook download: stream endpoint unavailable for book_id={book_id}")
+        return False
 
     def download_audiobook_track(self, book_id, track_index, output_path):
         token = self._get_fresh_token()
@@ -1725,32 +1800,54 @@ class BookloreClient:
 
         clear_reset = book_type == 'EPUB' and percentage <= 0
         cfi = rich_locator.cfi if rich_locator and rich_locator.cfi else None
+        href = rich_locator.href if rich_locator and rich_locator.href else None
+        primary_file = book.get('primaryFile') or {}
+        book_file_id = primary_file.get('id')
 
         payload_variants = []
-        if book_type == 'EPUB':
-            base_payload = {"bookId": book_id, "epubProgress": {"percentage": pct_display}}
-            if clear_reset:
-                # Booklore variants differ by version/build. Try common clear forms.
-                payload_variants = [
-                    ("null_cfi", {"bookId": book_id, "epubProgress": {"percentage": pct_display, "cfi": None}}),
-                    ("no_cfi", base_payload),
-                ]
-            else:
-                if cfi is not None:
-                    logger.debug(f"Booklore: Setting CFI: {cfi}")
+        if book_type in ('EPUB', 'PDF', 'CBX') and book_file_id is not None:
+            file_progress = {
+                "bookFileId": self._to_optional_int(book_file_id) or book_file_id,
+                "progressPercent": pct_display,
+            }
+            if cfi:
+                file_progress["positionData"] = cfi
+            if href:
+                file_progress["positionHref"] = href
+            payload_variants.append(("fileProgress", {"bookId": book_id, "fileProgress": file_progress}))
+
+        if not payload_variants:
+            if book_type == 'EPUB':
+                base_payload = {"bookId": book_id, "epubProgress": {"percentage": pct_display}}
+                if clear_reset:
                     payload_variants = [
-                        ("with_cfi", {"bookId": book_id, "epubProgress": {"percentage": pct_display, "cfi": cfi}}),
+                        ("null_cfi", {"bookId": book_id, "epubProgress": {"percentage": pct_display, "cfi": None}}),
                         ("no_cfi", base_payload),
                     ]
+                elif cfi is not None:
+                    cfi_write_disabled = str(book_id) in self._epub_cfi_write_disabled_for_books
+                    if cfi_write_disabled:
+                        logger.debug(
+                            "Booklore: skipping with_cfi variant for file=%s book_id=%s due to prior verified incompatibility",
+                            safe_filename,
+                            book_id,
+                        )
+                        payload_variants = [("no_cfi", base_payload)]
+                    else:
+                        logger.debug(f"Booklore: Setting CFI: {cfi}")
+                        payload_variants = [
+                            ("with_cfi", {"bookId": book_id, "epubProgress": {"percentage": pct_display, "cfi": cfi}}),
+                            ("no_cfi", base_payload),
+                        ]
                 else:
                     payload_variants = [("standard", base_payload)]
-        elif book_type == 'PDF':
-            payload_variants = [("standard", {"bookId": book_id, "pdfProgress": {"page": 1, "percentage": pct_display}})]
-        elif book_type == 'CBX':
-            payload_variants = [("standard", {"bookId": book_id, "cbxProgress": {"page": 1, "percentage": pct_display}})]
-        else:
-            logger.warning(f"Booklore: Unknown book type {book_type} for {safe_filename}")
-            return False
+            elif book_type == 'PDF':
+                payload_variants = [("standard", {"bookId": book_id, "pdfProgress": {"page": 1, "percentage": pct_display}})]
+            elif book_type == 'CBX':
+                payload_variants = [("standard", {"bookId": book_id, "cbxProgress": {"page": 1, "percentage": pct_display}})]
+            else:
+                logger.warning(f"Booklore: Unknown book type {book_type} for {safe_filename}")
+                return False
 
         logger.debug(
             f"Booklore progress write start: file={safe_filename} book_id={book_id} type={book_type} "
@@ -1759,18 +1856,18 @@ class BookloreClient:
         )
 
         last_status = "No response"
+        with_cfi_failed = False
         for variant_idx, (variant_name, payload) in enumerate(payload_variants, start=1):
             if clear_reset:
                 logger.debug(f"Booklore: Clearing CFI for 0% reset (variant={variant_name})")
 
-            progress_payload = payload.get('epubProgress') or payload.get('pdfProgress') or payload.get('cbxProgress') or {}
-            has_payload_cfi = isinstance(payload.get('epubProgress'), dict) and ('cfi' in payload.get('epubProgress', {}))
-            payload_cfi_value = payload.get('epubProgress', {}).get('cfi') if has_payload_cfi else None
+            progress_payload = payload.get('fileProgress') or payload.get('epubProgress') or payload.get('pdfProgress') or payload.get('cbxProgress') or {}
+            payload_pct = progress_payload.get('progressPercent', progress_payload.get('percentage', 'n/a'))
+            has_payload_cfi = bool(progress_payload.get('positionData') or (isinstance(payload.get('epubProgress'), dict) and 'cfi' in payload.get('epubProgress', {})))
             logger.debug(
                 f"Booklore progress write attempt {variant_idx}/{len(payload_variants)}: "
                 f"file={safe_filename} book_id={book_id} variant={variant_name} "
-                f"payload_pct={progress_payload.get('percentage', 'n/a')} has_cfi={has_payload_cfi} "
-                f"cfi_len={len(str(payload_cfi_value)) if payload_cfi_value is not None else 0}"
+                f"payload_pct={payload_pct} has_position_data={has_payload_cfi}"
             )
 
             response = self._make_request("POST", "/api/v1/books/progress", payload)
@@ -1820,6 +1917,8 @@ class BookloreClient:
                         continue
                 elif verified_pct is not None:
                     if abs(verified_pct - percentage) > 0.005:
+                        if variant_name == "with_cfi":
+                            with_cfi_failed = True
                         logger.warning(
                             f"Booklore progress write mismatch for {safe_filename} "
                             f"(variant={variant_name}, expected={pct_display:.2f}%, observed={verified_pct * 100:.2f}%). Retrying..."
@@ -1853,6 +1952,12 @@ class BookloreClient:
                         logger.debug(f"Booklore: Cache updated in-place for book {book_id}")
             except Exception:
                 logger.debug("Booklore: In-place cache update failed, will refresh on next read")
+            if variant_name == "no_cfi" and with_cfi_failed and cfi is not None and not clear_reset:
+                self._epub_cfi_write_disabled_for_books.add(str(book_id))
+                logger.info(
+                    "Booklore: disabling with_cfi retries for book_id=%s after verified no_cfi fallback success",
+                    book_id,
+                )
             return True
 
         logger.debug(
