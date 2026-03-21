@@ -171,6 +171,19 @@ class DatabaseService:
                 session.expunge(book)  # Detach from session
             return book
 
+    def get_book_by_audio_source(self, audio_source: str, audio_source_id: str) -> Optional[Book]:
+        """Get a book by its primary audio source identity."""
+        if not audio_source or not audio_source_id:
+            return None
+        with self.get_session() as session:
+            book = session.query(Book).filter(
+                Book.audio_source == audio_source,
+                Book.audio_source_id == audio_source_id,
+            ).first()
+            if book:
+                session.expunge(book)
+            return book
+
     def get_book_by_kosync_id(self, kosync_id: str) -> Optional[Book]:
         """Get a book by its KoSync document ID."""
         with self.get_session() as session:
@@ -203,9 +216,12 @@ class DatabaseService:
 
             if existing:
                 # Update existing book
-                for attr in ['abs_title', 'ebook_filename', 'original_ebook_filename', 'kosync_doc_id',
-                           'transcript_file', 'status', 'duration', 'sync_mode', 'transcript_source', 'storyteller_uuid',
-                           'abs_ebook_item_id']:
+                for attr in ['abs_title', 'audio_source', 'audio_source_id', 'audio_title',
+                           'audio_cover_url', 'audio_duration', 'audio_provider_book_id',
+                           'audio_provider_file_id', 'ebook_filename', 'ebook_source',
+                           'ebook_source_id', 'original_ebook_filename', 'kosync_doc_id',
+                           'transcript_file', 'status', 'duration', 'sync_mode',
+                           'transcript_source', 'storyteller_uuid', 'abs_ebook_item_id']:
                     if hasattr(book, attr):
                         setattr(existing, attr, getattr(book, attr))
                 session.flush()
@@ -401,7 +417,10 @@ class DatabaseService:
                 for attr in ['hardcover_book_id', 'hardcover_slug', 'hardcover_edition_id', 'hardcover_pages',
                            'hardcover_audio_seconds', 'isbn', 'asin', 'matched_by']:
                     if hasattr(details, attr):
-                        setattr(existing, attr, getattr(details, attr))
+                        new_value = getattr(details, attr)
+                        if new_value is None and getattr(existing, attr) is not None:
+                            continue
+                        setattr(existing, attr, new_value)
                 session.flush()
                 session.refresh(existing)
                 session.expunge(existing)
@@ -637,7 +656,7 @@ class DatabaseService:
             ).first()
 
             if existing:
-                for attr in ['title', 'author', 'cover_url', 'matches_json', 'status']:
+                for attr in ['source', 'title', 'author', 'cover_url', 'matches_json', 'status']:
                     if hasattr(suggestion, attr):
                         setattr(existing, attr, getattr(suggestion, attr))
                 session.flush()
@@ -670,6 +689,14 @@ class DatabaseService:
             for s in suggestions:
                 session.expunge(s)
             return suggestions
+
+    def get_ignored_suggestion_source_ids(self) -> List[str]:
+        """Get source IDs that should never be suggested again."""
+        with self.get_session() as session:
+            rows = session.query(PendingSuggestion.source_id).filter(
+                PendingSuggestion.status == 'ignored'
+            ).all()
+            return [row[0] for row in rows if row and row[0]]
 
     def dismiss_suggestion(self, source_id: str) -> bool:
         """Mark a suggestion as dismissed."""
@@ -775,6 +802,21 @@ class DatabaseService:
         except Exception as e:
             logger.error(f"❌ Failed to delete Booklore book '{filename}': {e}")
             return False
+
+
+    def clear_all_booklore_books(self) -> bool:
+        """Delete all cached Booklore books."""
+        session = self.db_manager.get_session()
+        try:
+            session.query(BookloreBook).delete(synchronize_session=False)
+            session.commit()
+            return True
+        except Exception as e:
+            session.rollback()
+            logger.error(f"âŒ Failed to clear Booklore cache table: {e}")
+            return False
+        finally:
+            session.close()
 
 
 class DatabaseMigrator:

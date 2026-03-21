@@ -92,19 +92,101 @@ class ABSClient:
                 all_audiobooks.extend(r_items)
             return all_audiobooks
         except Exception as e:
-            logger.error(f"❌ Exception fetching audiobooks: {e}")
+            logger.error(f"ABS: Exception fetching audiobooks: {e}")
             return []
+
+    @staticmethod
+    def _item_has_audio(item: dict) -> bool:
+        media = (item or {}).get('media', {}) or {}
+        audio_files = media.get('audioFiles') or []
+        if isinstance(audio_files, list) and len(audio_files) > 0:
+            return True
+        num_audio_files = media.get('numAudioFiles')
+        try:
+            if int(num_audio_files or 0) > 0:
+                return True
+        except (TypeError, ValueError):
+            pass
+        duration = media.get('duration')
+        try:
+            return float(duration or 0) > 0
+        except (TypeError, ValueError):
+            return False
 
     def get_audiobooks_for_lib(self, lib: str):
         if not self.is_configured(): return []
         self._update_session_headers()
         items_url = f"{self.base_url}/api/libraries/{lib}/items"
-        params = {"mediaType": "audiobook"}
-        r_items = self.session.get(items_url, params=params, timeout=self.timeout)
+
+        # Preferred path for dedicated audiobook libraries.
+        r_items = self.session.get(items_url, params={"mediaType": "audiobook"}, timeout=self.timeout)
         if r_items.status_code == 200:
-            return r_items.json().get('results', [])
-        logger.warning(f"⚠️ ABS - Failed to fetch audiobooks for library '{lib}'")
+            filtered = r_items.json().get('results', []) or []
+            if filtered:
+                return filtered
+
+        # Fallback for ABS "book" libraries where audio and ebook content are mixed.
+        r_fallback = self.session.get(items_url, timeout=self.timeout)
+        if r_fallback.status_code == 200:
+            all_items = r_fallback.json().get('results', []) or []
+            return [item for item in all_items if self._item_has_audio(item)]
+
+        logger.warning(f"ABS: Failed to fetch audiobooks for library '{lib}'")
         return []
+
+    def search_audiobooks(self, query: str, library_id: str = None):
+        """Search libraries for audiobook-capable items."""
+        if not self.is_configured():
+            return []
+        self._update_session_headers()
+        results = []
+        seen_ids = set()
+        try:
+            r_libs = self.session.get(f"{self.base_url}/api/libraries", timeout=self.timeout)
+            if r_libs.status_code != 200:
+                logger.warning(f"ABS Audio Search: Failed to get libraries (status {r_libs.status_code})")
+                return []
+
+            libraries = r_libs.json().get('libraries', []) or []
+            if library_id:
+                libraries = [lib for lib in libraries if str(lib.get('id')) == str(library_id)]
+
+            logger.debug(f"ABS Audio Search: Found {len(libraries)} libraries to search")
+            for lib in libraries:
+                lib_name = lib.get('name', 'Unknown')
+                lib_type = lib.get('mediaType', 'unknown')
+                logger.debug(f"   Searching audio in library '{lib_name}' (type: {lib_type})")
+                search_url = f"{self.base_url}/api/libraries/{lib['id']}/search"
+                r = self.session.get(search_url, params={'q': query, 'limit': 20}, timeout=self.timeout)
+                if r.status_code != 200:
+                    continue
+
+                data = r.json() or {}
+                items = data.get('book', []) or data.get('libraryItem', []) or data.get('results', []) or []
+                hit_count = 0
+                for item in items:
+                    lib_item = item.get('libraryItem', item) if isinstance(item, dict) else {}
+                    if not isinstance(lib_item, dict):
+                        continue
+                    item_id = lib_item.get('id') or item.get('id')
+                    if not item_id or item_id in seen_ids:
+                        continue
+                    if not self._item_has_audio(lib_item):
+                        # ABS search in mixed "book" libraries can return skeletal matches
+                        # without media/audio fields. Re-hydrate details before rejecting.
+                        details = self.get_item_details(item_id)
+                        if not details or not self._item_has_audio(details):
+                            continue
+                        lib_item = details
+                    seen_ids.add(item_id)
+                    results.append(lib_item)
+                    hit_count += 1
+                logger.debug(f"   ABS Audio Search: Found {hit_count} audio hits in library '{lib_name}'")
+
+            return results
+        except Exception as e:
+            logger.error(f"ABS: Error searching audiobooks: {e}")
+            return []
 
     def get_audio_files(self, item_id):
         if not self.is_configured(): return []
@@ -190,9 +272,6 @@ class ABSClient:
                     # ABS returns different keys: book, podcast, libraryItem, etc.
                     # For books: data.get('book', [])
                     # For audiobooks in mixed mode: data might have 'libraryItem' or similar
-                    
-                    # Log the response keys to understand structure
-                    logger.debug(f"   Response keys: {list(data.keys())}")
                     
                     # Try different possible keys
                     items = data.get('book', []) or data.get('libraryItem', []) or data.get('results', [])
@@ -599,12 +678,15 @@ class KoSyncClient:
             return False
         return bool(self.base_url and self.user)
 
+    def _is_local_server(self):
+        return '127.0.0.1' in self.base_url or 'localhost' in self.base_url
+
     def check_connection(self):
         if not self.is_configured():
             logger.warning("⚠️ KoSync not configured (skipping)")
             return False
             
-        is_local = '127.0.0.1' in self.base_url or 'localhost' in self.base_url
+        is_local = self._is_local_server()
         url = f"{self.base_url}/healthcheck"
         headers = kosync_auth_headers(self.user, self.auth_token)
         try:
@@ -668,8 +750,8 @@ class KoSyncClient:
         }
         url = f"{self.base_url}/syncs/progress"
 
-        # Use XPath if provided, otherwise format percentage
-        progress_val = xpath if xpath else ""
+        # Match KOReader's payload shape for external KoSync servers.
+        progress_val = str(xpath) if xpath else ""
 
         payload = {
             "document": doc_id,
@@ -677,12 +759,13 @@ class KoSyncClient:
             "progress": progress_val,
             "device": "abs-sync-bot",
             "device_id": "abs-sync-bot",
-            "timestamp": int(time.time()),
-            "force": True  # [NEW] Force update to override server-side "furthest wins" logic
         }
+        if self._is_local_server():
+            payload["timestamp"] = int(time.time())
+            payload["force"] = True
         try:
             r = self.session.put(url, headers=headers, json=payload, timeout=10)
-            if r.status_code in (200, 201, 204):
+            if r.status_code in (200, 202, 201, 204):
                 logger.debug(f"   📡 KoSync Updated: {percentage:.1%} with progress '{progress_val}' for doc {doc_id}")
                 return True
             else:
@@ -692,3 +775,4 @@ class KoSyncClient:
             logger.error(f"❌ Failed to update KoSync: {e}")
             return False
 # [END FILE]
+

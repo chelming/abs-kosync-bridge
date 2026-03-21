@@ -6,12 +6,23 @@ No patches needed - clean dependency injection pattern.
 import unittest
 import tempfile
 import os
+import json
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 import sys
 
 # Add project root to Python path
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from src.utils.kosync_headers import hash_kosync_key
+
+
+def _http_response(status_code, payload=None, text=""):
+    response = Mock()
+    response.status_code = status_code
+    response.text = text
+    response.json.return_value = payload or {}
+    return response
 
 
 class MockContainer:
@@ -126,6 +137,17 @@ class CleanFlaskIntegrationTest(unittest.TestCase):
         # Clean up temp directory
         import shutil
         shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _prepare_storyteller_assets(self, title: str, chapter_count: int = 2):
+        assets_root = Path(self.temp_dir) / "storyteller_assets"
+        transcriptions_dir = assets_root / "assets" / title / "transcriptions"
+        transcriptions_dir.mkdir(parents=True, exist_ok=True)
+        for idx in range(chapter_count):
+            filename = f"{idx + 1:05d}-00001.json"
+            payload = {"transcript": f"chapter {idx + 1}", "wordTimeline": []}
+            (transcriptions_dir / filename).write_text(json.dumps(payload), encoding="utf-8")
+        os.environ["STORYTELLER_ASSETS_DIR"] = str(assets_root)
+        self.addCleanup(lambda: os.environ.pop("STORYTELLER_ASSETS_DIR", None))
 
     def test_dependency_injection_works(self):
         """Verify that dependency injection is working properly."""
@@ -521,6 +543,193 @@ class CleanFlaskIntegrationTest(unittest.TestCase):
         )
         self.mock_database_service.delete_book.assert_called_once_with('delete-st-2')
 
+    @patch('src.web_server.ingest_storyteller_transcripts', return_value=None)
+    def test_api_storyteller_link_preserves_storyteller_source_when_ingest_missing(self, _mock_ingest):
+        from src.db.models import Book
+
+        test_book = Book(
+            abs_id='story-link-1',
+            abs_title='Story Link',
+            ebook_filename='original.epub',
+            storyteller_uuid=None,
+            transcript_source=None,
+            transcript_file=None,
+            status='active'
+        )
+        self.mock_database_service.get_book.return_value = test_book
+        self.mock_storyteller_client.download_book.return_value = True
+        self.mock_abs_client.get_item_details.return_value = {
+            'media': {'chapters': [{'start': 0.0, 'end': 10.0}]}
+        }
+
+        response = self.client.post('/api/storyteller/link/story-link-1', json={'uuid': 'uuid-123'})
+
+        self.assertEqual(response.status_code, 200)
+        self.mock_database_service.save_book.assert_called_once()
+        saved_book = self.mock_database_service.save_book.call_args[0][0]
+        self.assertEqual(saved_book.storyteller_uuid, 'uuid-123')
+        self.assertEqual(saved_book.transcript_source, 'storyteller')
+        self.assertIsNone(saved_book.transcript_file)
+        self.mock_database_service.dismiss_suggestion.assert_called_once_with('story-link-1')
+
+    def test_api_storyteller_link_real_ingest_persists_manifest(self):
+        from src.db.models import Book
+
+        self._prepare_storyteller_assets("Story Link", chapter_count=2)
+
+        test_book = Book(
+            abs_id='story-link-real',
+            abs_title='Story Link',
+            ebook_filename='original.epub',
+            storyteller_uuid=None,
+            transcript_source=None,
+            transcript_file=None,
+            status='active'
+        )
+        self.mock_database_service.get_book.return_value = test_book
+        self.mock_storyteller_client.download_book.return_value = True
+        self.mock_abs_client.get_item_details.return_value = {
+            'media': {
+                'chapters': [
+                    {'start': 0.0, 'end': 10.0},
+                    {'start': 10.0, 'end': 20.0},
+                ]
+            }
+        }
+
+        response = self.client.post('/api/storyteller/link/story-link-real', json={'uuid': 'uuid-real'})
+
+        self.assertEqual(response.status_code, 200)
+        self.mock_database_service.save_book.assert_called_once()
+        saved_book = self.mock_database_service.save_book.call_args[0][0]
+        self.assertEqual(saved_book.storyteller_uuid, 'uuid-real')
+        self.assertEqual(saved_book.transcript_source, 'storyteller')
+        self.assertIsNotNone(saved_book.transcript_file)
+        self.assertTrue(Path(saved_book.transcript_file).exists())
+
+    @patch('src.web_server.ingest_storyteller_transcripts', return_value='/tmp/storyteller-manifest.json')
+    @patch('src.web_server.get_kosync_id_for_ebook', return_value='hash-ebook-only-link-1')
+    def test_api_storyteller_link_ebook_only_skips_abs_chapter_lookup(self, _mock_kosync, _mock_ingest):
+        from src.db.models import Book
+
+        test_book = Book(
+            abs_id='ebook-link-1',
+            abs_title='Ebook Link',
+            ebook_filename='ebook-link.epub',
+            kosync_doc_id='hash-existing',
+            sync_mode='ebook_only',
+            status='active',
+        )
+        self.mock_database_service.get_book.return_value = test_book
+        self.mock_storyteller_client.download_book.return_value = True
+
+        response = self.client.post('/api/storyteller/link/ebook-link-1', json={'uuid': 'uuid-ebook-only'})
+
+        self.assertEqual(response.status_code, 200)
+        self.mock_abs_client.get_item_details.assert_not_called()
+        self.mock_database_service.save_book.assert_called_once()
+        saved_book = self.mock_database_service.save_book.call_args[0][0]
+        self.assertEqual(saved_book.sync_mode, 'ebook_only')
+        self.assertEqual(saved_book.storyteller_uuid, 'uuid-ebook-only')
+        self.assertEqual(saved_book.transcript_source, 'storyteller')
+
+    def test_index_endpoint_ebook_only_uses_cached_ebook_metadata_for_display(self):
+        from src.db.models import Book, BookloreBook
+
+        test_book = Book(
+            abs_id='ebook-only-1',
+            abs_title='book-file',
+            ebook_filename='book-file.epub',
+            sync_mode='ebook_only',
+            status='active'
+        )
+        cached_book = BookloreBook(
+            filename='book-file.epub',
+            title='Displayed Title',
+            authors='Displayed Author',
+            raw_metadata=json.dumps({
+                'title': 'Displayed Title',
+                'subtitle': 'Displayed Subtitle',
+                'authors': 'Displayed Author'
+            })
+        )
+
+        self.mock_database_service.get_all_books.return_value = [test_book]
+        self.mock_database_service.get_all_states.return_value = []
+        self.mock_database_service.get_all_hardcover_details.return_value = []
+        self.mock_database_service.get_all_pending_suggestions.return_value = []
+        self.mock_database_service.get_booklore_book.side_effect = lambda filename: cached_book if filename == 'book-file.epub' else None
+        self.mock_booklore_client.is_configured.return_value = False
+
+        clients_dict = {
+            'ABS': Mock(is_configured=Mock(return_value=True)),
+            'KoSync': Mock(is_configured=Mock(return_value=True)),
+            'Storyteller': Mock(is_configured=Mock(return_value=False))
+        }
+        self.mock_container.mock_sync_clients.items.return_value = clients_dict.items()
+
+        import src.web_server
+        original_render = src.web_server.render_template
+        mock_render = Mock(return_value="Mocked HTML Response")
+        src.web_server.render_template = mock_render
+
+        try:
+            response = self.client.get('/')
+            self.assertEqual(response.status_code, 200)
+            mapping = mock_render.call_args.kwargs['mappings'][0]
+            self.assertEqual(mapping['abs_title'], 'Displayed Title')
+            self.assertEqual(mapping['abs_subtitle'], 'Displayed Subtitle')
+            self.assertEqual(mapping['abs_author'], 'Displayed Author')
+        finally:
+            src.web_server.render_template = original_render
+
+    def test_index_endpoint_storyteller_uses_storyteller_metadata_for_display(self):
+        from src.db.models import Book
+
+        test_book = Book(
+            abs_id='ebook-storyteller-1',
+            abs_title='storyteller_uuid-book',
+            ebook_filename='storyteller_uuid-book.epub',
+            storyteller_uuid='uuid-story-1',
+            sync_mode='ebook_only',
+            status='active'
+        )
+
+        self.mock_database_service.get_all_books.return_value = [test_book]
+        self.mock_database_service.get_all_states.return_value = []
+        self.mock_database_service.get_all_hardcover_details.return_value = []
+        self.mock_database_service.get_all_pending_suggestions.return_value = []
+        self.mock_database_service.get_booklore_book.return_value = None
+        self.mock_booklore_client.is_configured.return_value = False
+        self.mock_storyteller_client.is_configured.return_value = True
+        self.mock_storyteller_client.get_book_details.return_value = {
+            'title': 'Storyteller Title',
+            'subtitle': 'Storyteller Subtitle',
+            'authors': [{'name': 'Storyteller Author'}]
+        }
+
+        clients_dict = {
+            'ABS': Mock(is_configured=Mock(return_value=True)),
+            'KoSync': Mock(is_configured=Mock(return_value=True)),
+            'Storyteller': Mock(is_configured=Mock(return_value=True))
+        }
+        self.mock_container.mock_sync_clients.items.return_value = clients_dict.items()
+
+        import src.web_server
+        original_render = src.web_server.render_template
+        mock_render = Mock(return_value="Mocked HTML Response")
+        src.web_server.render_template = mock_render
+
+        try:
+            response = self.client.get('/')
+            self.assertEqual(response.status_code, 200)
+            mapping = mock_render.call_args.kwargs['mappings'][0]
+            self.assertEqual(mapping['abs_title'], 'Storyteller Title')
+            self.assertEqual(mapping['abs_subtitle'], 'Storyteller Subtitle')
+            self.assertEqual(mapping['abs_author'], 'Storyteller Author')
+        finally:
+            src.web_server.render_template = original_render
+
     def test_clear_progress_endpoint_clean_di(self):
         """Test clear progress endpoint with clean dependency injection."""
         # Setup mock book
@@ -585,6 +794,171 @@ class CleanFlaskIntegrationTest(unittest.TestCase):
 
         finally:
             src.web_server.render_template = original_render
+
+    def test_shelfmark_redirects_to_configured_external_url(self):
+        with patch.dict(os.environ, {'SHELFMARK_URL': 'shelfmark.blackcatmedia.xyz'}, clear=False):
+            response = self.client.get('/shelfmark')
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response.headers['Location'], 'http://shelfmark.blackcatmedia.xyz')
+
+    def test_shelfmark_redirects_to_index_when_not_configured(self):
+        with patch.dict(os.environ, {'SHELFMARK_URL': ''}, clear=False):
+            response = self.client.get('/shelfmark')
+
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(response.headers['Location'].endswith('/'))
+
+    def test_api_health_endpoint(self):
+        response = self.client.get('/api/health')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()['ok'], True)
+        self.assertIn('no-store', response.headers.get('Cache-Control', ''))
+
+    @patch('src.web_server.start_restart_async')
+    def test_api_restart_endpoint(self, mock_start_restart_async):
+        response = self.client.post('/api/restart')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()['ok'], True)
+        self.assertIn('no-store', response.headers.get('Cache-Control', ''))
+        mock_start_restart_async.assert_called_once()
+
+    @patch('src.web_server.requests.get')
+    def test_test_connection_abs_uses_post_payload_not_saved_env(self, mock_get):
+        def fake_get(url, headers=None, timeout=None):
+            self.assertEqual(url, 'http://typed-abs/api/me')
+            self.assertEqual(headers, {'Authorization': 'Bearer wrong-token'})
+            self.assertEqual(timeout, 10)
+            return _http_response(403)
+
+        mock_get.side_effect = fake_get
+
+        with patch.dict(os.environ, {'ABS_SERVER': 'http://saved-abs', 'ABS_KEY': 'saved-token'}, clear=False):
+            response = self.client.post(
+                '/api/test-connection/abs',
+                json={'ABS_SERVER': 'typed-abs', 'ABS_KEY': 'wrong-token'},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertFalse(data['ok'])
+        self.assertIn('Authentication failed', data['message'])
+        mock_get.assert_called_once()
+
+    @patch('src.web_server.requests.get')
+    def test_test_connection_kosync_fails_when_auth_fails(self, mock_get):
+        def fake_get(url, headers=None, timeout=None):
+            if url == 'http://typed-kosync/healthcheck':
+                self.assertIsNone(headers)
+                self.assertEqual(timeout, 5)
+                return _http_response(200)
+            if url == 'http://typed-kosync/users/auth':
+                self.assertEqual(headers['x-auth-user'], 'reader')
+                self.assertEqual(headers['x-auth-key'], hash_kosync_key('wrong-pass'))
+                self.assertEqual(timeout, 5)
+                return _http_response(401)
+            raise AssertionError(f'Unexpected URL {url}')
+
+        mock_get.side_effect = fake_get
+
+        response = self.client.post(
+            '/api/test-connection/kosync',
+            json={
+                'KOSYNC_ENABLED': True,
+                'KOSYNC_SERVER': 'typed-kosync',
+                'KOSYNC_USER': 'reader',
+                'KOSYNC_KEY': 'wrong-pass',
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertFalse(data['ok'])
+        self.assertIn('Authentication failed', data['message'])
+        self.assertEqual(mock_get.call_count, 2)
+
+    @patch('src.web_server.requests.get')
+    def test_test_connection_kosync_succeeds_after_healthcheck_and_auth(self, mock_get):
+        def fake_get(url, headers=None, timeout=None):
+            if url == 'http://typed-kosync/healthcheck':
+                return _http_response(200)
+            if url == 'http://typed-kosync/users/auth':
+                self.assertEqual(headers['x-auth-user'], 'reader')
+                self.assertEqual(headers['x-auth-key'], hash_kosync_key('good-pass'))
+                return _http_response(200)
+            raise AssertionError(f'Unexpected URL {url}')
+
+        mock_get.side_effect = fake_get
+
+        response = self.client.post(
+            '/api/test-connection/kosync',
+            json={
+                'KOSYNC_ENABLED': True,
+                'KOSYNC_SERVER': 'typed-kosync',
+                'KOSYNC_USER': 'reader',
+                'KOSYNC_KEY': 'good-pass',
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertTrue(data['ok'])
+        self.assertIn('credentials are valid', data['message'])
+        self.assertEqual(mock_get.call_count, 2)
+
+    @patch('src.web_server.requests.post')
+    def test_test_connection_storyteller_uses_post_payload_not_saved_env(self, mock_post):
+        def fake_post(url, data=None, headers=None, timeout=None):
+            self.assertEqual(url, 'http://typed-storyteller/api/token')
+            self.assertEqual(data, {'username': 'typed-user', 'password': 'wrong-pass'})
+            self.assertEqual(headers, {'Content-Type': 'application/x-www-form-urlencoded'})
+            self.assertEqual(timeout, 10)
+            return _http_response(401)
+
+        mock_post.side_effect = fake_post
+
+        with patch.dict(os.environ, {
+            'STORYTELLER_ENABLED': 'true',
+            'STORYTELLER_API_URL': 'http://saved-storyteller',
+            'STORYTELLER_USER': 'saved-user',
+            'STORYTELLER_PASSWORD': 'saved-pass',
+        }, clear=False):
+            response = self.client.post(
+                '/api/test-connection/storyteller',
+                json={
+                    'STORYTELLER_ENABLED': True,
+                    'STORYTELLER_API_URL': 'typed-storyteller',
+                    'STORYTELLER_USER': 'typed-user',
+                    'STORYTELLER_PASSWORD': 'wrong-pass',
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertFalse(data['ok'])
+        self.assertIn('Invalid username or password', data['message'])
+        mock_post.assert_called_once()
+
+    @patch('src.web_server.requests.post')
+    def test_test_connection_storyteller_respects_payload_disabled_flag(self, mock_post):
+        with patch.dict(os.environ, {'STORYTELLER_ENABLED': 'true'}, clear=False):
+            response = self.client.post(
+                '/api/test-connection/storyteller',
+                json={
+                    'STORYTELLER_ENABLED': False,
+                    'STORYTELLER_API_URL': 'typed-storyteller',
+                    'STORYTELLER_USER': 'typed-user',
+                    'STORYTELLER_PASSWORD': 'typed-pass',
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertFalse(data['ok'])
+        self.assertEqual(data['message'], 'Storyteller is disabled')
+        mock_post.assert_not_called()
 
     def test_clear_stale_suggestions_api(self):
         """Test the clear-stale-suggestions API endpoint."""

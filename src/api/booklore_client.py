@@ -1,6 +1,7 @@
 import os
 import time
 import logging
+import threading
 from typing import Optional
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -12,6 +13,13 @@ from src.utils.logging_utils import sanitize_log_data
 from src.sync_clients.sync_client_interface import LocatorResult
 
 logger = logging.getLogger(__name__)
+
+BULK_DETAIL_FETCH_LIMIT = 5000
+STALE_REFRESH_BATCH_SIZE = 1000
+MAX_DETAIL_FETCHES_PER_REFRESH_CYCLE = int(
+    os.getenv("BOOKLORE_MAX_DETAIL_FETCHES_PER_REFRESH_CYCLE", "1200")
+)
+MAX_DETAIL_FETCHES_PER_SEARCH = 20
 
 class BookloreClient:
     def __init__(self, database_service=None):
@@ -30,10 +38,33 @@ class BookloreClient:
         self._last_refresh_failed = False
         self._last_refresh_attempt = 0
         self._refresh_cooldown = 300  # 5 min cooldown after failed refresh
+        self._search_miss_refresh_min_age = 60  # Avoid repeated refreshes on rapid search misses
+        self._search_hit_refresh_min_age = int(
+            os.getenv("BOOKLORE_SEARCH_HIT_REFRESH_MIN_AGE", "1800")
+        )  # Validate hit results periodically without hammering full scans
+        self._search_hit_refresh_cooldown = int(
+            os.getenv("BOOKLORE_SEARCH_HIT_REFRESH_COOLDOWN", "600")
+        )
+        self._last_search_hit_refresh_attempt = 0
+        self._audiobook_search_miss_refresh_cooldown = int(
+            os.getenv("BOOKLORE_AUDIOBOOK_SEARCH_MISS_REFRESH_COOLDOWN", "30")
+        )
+        self._last_audiobook_search_miss_refresh_attempt = 0
+        self._refresh_lock = threading.Lock()
+        self._cache_lock = threading.RLock()
+        self._epub_cfi_write_disabled_for_books = set()
 
         self._token = None
         self._token_timestamp = 0
         self._token_max_age = 300
+        self._token_lock = threading.Lock()
+        self._token_login_retry_delay = float(
+            os.getenv("BOOKLORE_LOGIN_RETRY_DELAY_SECONDS", "1.1")
+        )
+        self._token_login_max_attempts = max(
+            1,
+            int(os.getenv("BOOKLORE_LOGIN_MAX_ATTEMPTS", "2"))
+        )
         self.session = requests.Session()
 
         # Legacy Cache file path (for migration only)
@@ -41,6 +72,7 @@ class BookloreClient:
 
         # Load cache from DB (and migrate if needed)
         self.target_library_id = os.environ.get("BOOKLORE_LIBRARY_ID")
+        self._server_side_filter_supported = None
         self._load_cache()
 
     def _load_cache(self):
@@ -87,33 +119,36 @@ class BookloreClient:
         if self.db:
             try:
                 db_books = self.db.get_all_booklore_books()
-                self._book_cache = {}
-                self._book_id_cache = {}
-                
-                for db_book in db_books:
-                    # Parse raw metadata back to dict
-                    book_info = db_book.raw_metadata_dict
-                    # Ensure minimal fields exist
-                    if not book_info:
-                        book_info = {
-                            'fileName': db_book.filename,
-                            'title': db_book.title,
-                            'authors': db_book.authors
-                        }
-                    
-                    self._book_cache[db_book.filename] = book_info
-                    
-                    # Update ID cache
-                    bid = book_info.get('id')
-                    if bid:
-                        self._book_id_cache[bid] = book_info
+                with self._cache_lock:
+                    self._book_cache = {}
+                    self._book_id_cache = {}
+
+                    for db_book in db_books:
+                        # Parse raw metadata back to dict
+                        book_info = db_book.raw_metadata_dict
+                        # Ensure minimal fields exist
+                        if not book_info:
+                            book_info = {
+                                'fileName': db_book.filename,
+                                'title': db_book.title,
+                                'authors': db_book.authors
+                            }
+
+                        self._book_cache[db_book.filename.lower()] = book_info
+
+                        # Update ID cache
+                        bid = book_info.get('id')
+                        if bid:
+                            self._book_id_cache[bid] = book_info
                         
                 # Set to 0 to force a refresh/validation against API on next access
                 self._cache_timestamp = 0
                 logger.info(f"📚 Booklore: Loaded {len(self._book_cache)} books from database")
             except Exception as e:
                 logger.error(f"❌ Failed to load Booklore cache from DB: {e}")
-                self._book_cache = {}
+                with self._cache_lock:
+                    self._book_cache = {}
+                    self._book_id_cache = {}
 
     def _save_cache(self):
         """
@@ -123,27 +158,68 @@ class BookloreClient:
         """
         pass # Database persistence is handled atomically per book elsewhere
 
-    def _get_fresh_token(self):
-        if self._token and (time.time() - self._token_timestamp) < self._token_max_age:
-            return self._token
-        if not all([self.base_url, self.username, self.password]): return None
+    @staticmethod
+    def _is_duplicate_refresh_token_failure(response) -> bool:
+        if response is None:
+            return False
+        if getattr(response, "status_code", None) not in (400, 409):
+            return False
         try:
-            # Use session for login to handle cookies if needed
-            response = self.session.post(
-                f"{self.base_url}/api/v1/auth/login",
-                json={"username": self.username, "password": self.password},
-                timeout=10
-            )
-            if response.status_code == 200:
-                data = response.json()
-                # Booklore v1.17+ uses accessToken instead of token
-                self._token = data.get("accessToken") or data.get("token")
-                self._token_timestamp = time.time()
+            text = (response.text or "").lower()
+        except Exception:
+            text = ""
+        return (
+            "uq_refresh_token" in text
+            or ("duplicate entry" in text and "refresh_token" in text)
+        )
+
+    def _current_token_is_fresh(self) -> bool:
+        return bool(self._token) and (time.time() - self._token_timestamp) < self._token_max_age
+
+    def _get_fresh_token(self):
+        if self._current_token_is_fresh():
+            return self._token
+        if not all([self.base_url, self.username, self.password]):
+            return None
+        with self._token_lock:
+            if self._current_token_is_fresh():
                 return self._token
-            else:
-                logger.error(f"❌ Booklore login failed: {response.status_code} - {response.text}")
-        except Exception as e:
-            logger.error(f"❌ Booklore login error: {e}")
+            try:
+                for attempt in range(1, self._token_login_max_attempts + 1):
+                    # Use session for login to handle cookies if needed
+                    response = self.session.post(
+                        f"{self.base_url}/api/v1/auth/login",
+                        json={"username": self.username, "password": self.password},
+                        timeout=10
+                    )
+                    if response.status_code == 200:
+                        data = self._parse_json_response(response, "Booklore login")
+                        if not isinstance(data, dict):
+                            return None
+                        # Booklore v1.17+ uses accessToken instead of token
+                        self._token = data.get("accessToken") or data.get("token")
+                        self._token_timestamp = time.time()
+                        return self._token
+
+                    duplicate_conflict = self._is_duplicate_refresh_token_failure(response)
+                    if duplicate_conflict and attempt < self._token_login_max_attempts:
+                        logger.warning(
+                            "Booklore login conflict (duplicate refresh token). "
+                            "Retrying in %.1fs (attempt %d/%d).",
+                            self._token_login_retry_delay,
+                            attempt,
+                            self._token_login_max_attempts,
+                        )
+                        time.sleep(self._token_login_retry_delay)
+                        continue
+
+                    logger.error(
+                        f"❌ Booklore login failed: {response.status_code} - "
+                        f"{self._response_text_preview(response, limit=300)}"
+                    )
+                    return None
+            except Exception as e:
+                logger.error(f"❌ Booklore login error: {e}")
         return None
 
     def _make_request(self, method, endpoint, json_data=None):
@@ -159,7 +235,9 @@ class BookloreClient:
             else: return None
 
             if response.status_code == 401:
-                self._token = None
+                with self._token_lock:
+                    self._token = None
+                    self._token_timestamp = 0
                 token = self._get_fresh_token()
                 if not token: return None
                 headers["Authorization"] = f"Bearer {token}"
@@ -170,6 +248,30 @@ class BookloreClient:
             return response
         except Exception as e:
             logger.error(f"❌ Booklore API request failed: {e}")
+            return None
+
+    @staticmethod
+    def _response_text_preview(response, limit=200):
+        try:
+            return (response.text or "")[:limit]
+        except Exception:
+            return "<unavailable>"
+
+    @staticmethod
+    def _normalize_optional_string(value):
+        if value in (None, ""):
+            return None
+        return str(value)
+
+    def _parse_json_response(self, response, context):
+        try:
+            return response.json()
+        except Exception as e:
+            logger.error(
+                f"âŒ Booklore: Failed to parse JSON from {context} "
+                f"(status={getattr(response, 'status_code', 'unknown')}, "
+                f"body={self._response_text_preview(response)!r}): {e}"
+            )
             return None
 
     def is_configured(self):
@@ -214,22 +316,37 @@ class BookloreClient:
         try:
             response = self._make_request("GET", "/api/v1/libraries")
             if response and response.status_code == 200:
-                libs = response.json()
-                # Return standardized list
-                return [{'id': l.get('id'), 'name': l.get('name'), 'path': l.get('root', {}).get('path') or l.get('path')} for l in libs]
+                libs = self._parse_json_response(response, "Booklore libraries list")
+                if isinstance(libs, list):
+                    # Return standardized list
+                    return [
+                        {
+                            'id': l.get('id'),
+                            'name': l.get('name'),
+                            'path': l.get('root', {}).get('path') or l.get('path')
+                        }
+                        for l in libs if isinstance(l, dict)
+                    ]
         except Exception as e:
             logger.debug(f"Booklore: Failed to fetch /api/v1/libraries: {e}")
 
         # Strategy 2: Fallback - Scan a few books to find unique libraries
         try:
             logger.info("Booklore: Scanning books to discover libraries...")
-            response = self._make_request("GET", "/api/v1/books?page=0&size=50")
+            response = self._make_request("GET", "/api/v1/books")
             if response and response.status_code == 200:
-                data = response.json()
-                books = data if isinstance(data, list) else data.get('content', [])
+                data = self._parse_json_response(response, "Booklore library discovery scan")
+                if isinstance(data, list):
+                    books = data
+                elif isinstance(data, dict):
+                    books = data.get('content', [])
+                else:
+                    books = []
                 
                 unique_libs = {}
                 for b in books:
+                    if not isinstance(b, dict):
+                        continue
                     lid = b.get('libraryId')
                     if lid and lid not in unique_libs:
                         unique_libs[lid] = {
@@ -258,7 +375,9 @@ class BookloreClient:
             # Use requests directly (not self.session) for thread safety
             response = requests.get(url, headers=headers, timeout=10)
             if response.status_code == 200:
-                return response.json()
+                return self._parse_json_response(response, f"Booklore book detail {book_id}")
+            if response.status_code == 404:
+                self._evict_cached_book(book_id=book_id, reason="detail returned 404")
             return None
         except Exception as e:
             logger.debug(f"Booklore: Error fetching book {book_id}: {e}")
@@ -274,193 +393,602 @@ class BookloreClient:
             return True
         return False
 
-    def _refresh_book_cache(self):
+    def _has_cached_books(self) -> bool:
+        with self._cache_lock:
+            return bool(self._book_cache or self._book_id_cache)
+
+    def _snapshot_book_cache_items(self):
+        with self._cache_lock:
+            return list(self._book_cache.items())
+
+    def _snapshot_book_cache_values(self):
+        with self._cache_lock:
+            return list(self._book_cache.values())
+
+    def _snapshot_book_id_items(self):
+        with self._cache_lock:
+            return list(self._book_id_cache.items())
+
+    def _dedupe_book_results(self, books):
+        canonical_by_id = {
+            str(bid): book_info
+            for bid, book_info in self._snapshot_book_id_items()
+            if bid is not None and isinstance(book_info, dict)
+        }
+        deduped = []
+        seen = set()
+
+        for book_info in books:
+            if not isinstance(book_info, dict):
+                continue
+
+            bid = book_info.get('id')
+            if bid is not None:
+                canonical = canonical_by_id.get(str(bid))
+                if canonical is not None:
+                    book_info = canonical
+                key = f"id:{bid}"
+            else:
+                key = f"file:{(book_info.get('fileName') or '').lower()}"
+
+            if key in seen:
+                continue
+
+            seen.add(key)
+            deduped.append(book_info)
+
+        return deduped
+
+    def _evict_cached_book(self, book_id=None, filename=None, reason=None):
+        """Remove a stale Booklore entry from memory and persistent cache."""
+        target_id = str(book_id) if book_id is not None else None
+        target_filename = Path(filename).name.lower() if filename else None
+        removed_filenames = set()
+        removed_ids = set()
+
+        with self._cache_lock:
+            for cache_key, book_info in list(self._book_id_cache.items()):
+                cache_id = book_info.get('id')
+                cache_filename = (book_info.get('fileName') or '').lower()
+                id_match = target_id is not None and (
+                    str(cache_key) == target_id or
+                    (cache_id is not None and str(cache_id) == target_id)
+                )
+                filename_match = bool(target_filename and cache_filename == target_filename)
+                if not id_match and not filename_match:
+                    continue
+                removed = self._book_id_cache.pop(cache_key)
+                if removed.get('id') is not None:
+                    removed_ids.add(str(removed.get('id')))
+                if removed.get('fileName'):
+                    removed_filenames.add(removed['fileName'].lower())
+
+            for cache_filename, book_info in list(self._book_cache.items()):
+                cache_id = book_info.get('id')
+                id_match = target_id is not None and cache_id is not None and str(cache_id) == target_id
+                filename_match = bool(target_filename and cache_filename == target_filename)
+                removed_filename_match = cache_filename in removed_filenames
+                if not id_match and not filename_match and not removed_filename_match:
+                    continue
+                removed = self._book_cache.pop(cache_filename)
+                if removed.get('id') is not None:
+                    removed_ids.add(str(removed.get('id')))
+                if removed.get('fileName'):
+                    removed_filenames.add(removed['fileName'].lower())
+
+        if target_filename:
+            removed_filenames.add(target_filename)
+        removed_filenames.discard("")
+        removed_ids.discard("None")
+
+        for cached_filename in removed_filenames:
+            if self.db:
+                try:
+                    self.db.delete_booklore_book(cached_filename)
+                except Exception as e:
+                    logger.error(f"❌ Failed to evict stale Booklore book {cached_filename}: {e}")
+
+        removed_any = bool(removed_filenames or removed_ids)
+        if removed_any:
+            self._cache_timestamp = 0
+            reason_msg = f" ({reason})" if reason else ""
+            logger.info(
+                f"📚 Booklore: Evicted stale cached book"
+                f"{reason_msg}: ids={sorted(removed_ids) or ['?']} files={sorted(removed_filenames) or ['?']}"
+            )
+        return removed_any
+
+    def _build_books_endpoint(self, page, batch_size, use_server_side_filter):
+        if use_server_side_filter and self.target_library_id:
+            return f"/api/v1/libraries/{self.target_library_id}/book"
+        # Grimmory /api/v1/books returns all books as a flat list (no pagination).
+        return "/api/v1/books"
+
+    def _filter_books_by_library(self, books):
+        if not self.target_library_id:
+            return list(books)
+
+        filtered_batch = []
+        for b in books:
+            lid = b.get('libraryId')
+            lname = b.get('libraryName', 'Unknown')
+
+            if lid is not None and str(lid) == str(self.target_library_id):
+                filtered_batch.append(b)
+            elif lid is None:
+                filtered_batch.append(b)
+            else:
+                logger.debug(f"Booklore: Ignoring book '{b.get('title')}' in Library '{lname}' (ID: {lid})")
+
+        return filtered_batch
+
+    @staticmethod
+    def _format_authors(authors):
+        if isinstance(authors, str):
+            return authors.strip()
+
+        author_list = []
+        if isinstance(authors, list):
+            for author in authors:
+                if isinstance(author, dict):
+                    name = (author.get('name') or author.get('authorName') or '').strip()
+                    if name:
+                        author_list.append(name)
+                elif isinstance(author, str):
+                    name = author.strip()
+                    if name:
+                        author_list.append(name)
+        elif isinstance(authors, dict):
+            name = (authors.get('name') or authors.get('authorName') or '').strip()
+            if name:
+                author_list.append(name)
+
+        return ', '.join(author_list)
+
+    def _extract_book_summary_fields(self, book):
+        metadata = book.get('metadata') or {}
+        primary_file = book.get('primaryFile') or {}
+        title = (book.get('title') or metadata.get('title') or '').strip()
+        subtitle = (metadata.get('subtitle') or book.get('subtitle') or '').strip()
+        authors = self._format_authors(
+            book.get('authors')
+            or book.get('authorName')
+            or metadata.get('authors')
+            or metadata.get('authorName')
+            or metadata.get('author')
+            or []
+        )
+        file_name = (
+            primary_file.get('fileName')
+            or book.get('fileName')
+            or ''
+        )
+        book_type = (
+            primary_file.get('bookType')
+            or book.get('bookType')
+            or ''
+        )
+        return {
+            'title': title,
+            'subtitle': subtitle,
+            'authors': authors,
+            'fileName': file_name,
+            'bookType': book_type,
+        }
+
+    @staticmethod
+    def _infer_book_type_from_name(name):
+        suffix = Path(name or '').suffix.lower()
+        if suffix == '.epub':
+            return 'EPUB'
+        if suffix == '.pdf':
+            return 'PDF'
+        if suffix in {'.cbz', '.cbr', '.cbt', '.cb7'}:
+            return 'CBX'
+        return ''
+
+    def _get_book_type(self, book):
+        if not isinstance(book, dict):
+            return ''
+
+        raw_book_type = (
+            book.get('bookType')
+            or book.get('primaryFile', {}).get('bookType')
+            or self._infer_book_type_from_name(book.get('fileName'))
+            or self._infer_book_type_from_name(book.get('filePath'))
+        )
+        return str(raw_book_type or '').upper()
+
+    @staticmethod
+    def _iter_audio_format_candidates(book):
+        if not isinstance(book, dict):
+            return []
+
+        candidates = []
+        primary_file = book.get('primaryFile') or {}
+        if isinstance(primary_file, dict):
+            candidates.append(primary_file)
+
+        for key in ('bookFiles', 'alternativeFormats', 'supplementaryFiles'):
+            entries = book.get(key) or []
+            if isinstance(entries, list):
+                candidates.extend(entry for entry in entries if isinstance(entry, dict))
+
+        return candidates
+
+    @staticmethod
+    def _has_audiobook_metadata(book):
+        if not isinstance(book, dict):
+            return False
+
+        audiobook_metadata = book.get('audiobookMetadata')
+        if not isinstance(audiobook_metadata, dict):
+            metadata = book.get('metadata') or {}
+            audiobook_metadata = metadata.get('audiobookMetadata') if isinstance(metadata, dict) else None
+        if not isinstance(audiobook_metadata, dict):
+            return False
+
+        return any(
+            audiobook_metadata.get(key) is not None
+            for key in ('durationSeconds', 'durationMs', 'chapterCount', 'chapters')
+        )
+
+    @staticmethod
+    def _has_audio_shape_fields(book):
+        if not isinstance(book, dict):
+            return False
+        return any(
+            key in book
+            for key in ('alternativeFormats', 'supplementaryFiles', 'audiobookMetadata')
+        )
+
+    def _book_supports_audiobook(self, book):
+        if not isinstance(book, dict):
+            return False
+        if self._get_book_type(book) == 'AUDIOBOOK':
+            return True
+        for file_info in self._iter_audio_format_candidates(book):
+            if str(file_info.get('bookType') or '').upper() == 'AUDIOBOOK':
+                return True
+        if self._has_audiobook_metadata(book):
+            return True
+        if book.get('audiobookProgress') is not None:
+            return True
+        return False
+
+    def _get_audiobook_file_id(self, book):
+        if not isinstance(book, dict):
+            return None
+        for file_info in self._iter_audio_format_candidates(book):
+            if str(file_info.get('bookType') or '').upper() == 'AUDIOBOOK':
+                return file_info.get('id') or file_info.get('bookFileId')
+        info_file_id = book.get('audiobookInfo', {}).get('bookFileId') if isinstance(book.get('audiobookInfo'), dict) else None
+        return info_file_id
+
+    def _upsert_lightweight_entry(self, book):
+        bid = book.get('id')
+        if bid is None:
+            return
+
+        with self._cache_lock:
+            existing = self._book_id_cache.get(bid)
+            if existing and not existing.get('_needs_detail'):
+                return
+
+            summary = self._extract_book_summary_fields(book)
+            lightweight_info = dict(existing or {})
+            lightweight_info.update({
+                'id': bid,
+                'title': summary['title'] or lightweight_info.get('title') or '',
+                'subtitle': summary['subtitle'] or lightweight_info.get('subtitle') or '',
+                'authors': summary['authors'] or lightweight_info.get('authors') or '',
+                'fileName': summary['fileName'] or lightweight_info.get('fileName'),
+                'bookType': summary['bookType'] or lightweight_info.get('bookType') or '',
+                'libraryId': book.get('libraryId'),
+                'libraryName': book.get('libraryName'),
+                '_needs_detail': True,
+            })
+            self._book_id_cache[bid] = lightweight_info
+            if lightweight_info.get('fileName'):
+                self._book_cache[lightweight_info['fileName'].lower()] = lightweight_info
+
+    def _prune_stale_cache_entries(self, live_ids):
+        live_id_strings = {str(bid) for bid in live_ids}
+        stale_entries = []
+
+        with self._cache_lock:
+            stale_ids = [bid for bid in list(self._book_id_cache.keys()) if str(bid) not in live_id_strings]
+            for bid in stale_ids:
+                stale_entry = self._book_id_cache.pop(bid)
+                stale_entries.append(stale_entry)
+
+                filename = (stale_entry.get('fileName') or '').lower()
+                if filename:
+                    self._book_cache.pop(filename, None)
+
+        for stale_entry in stale_entries:
+            filename = (stale_entry.get('fileName') or '').lower()
+            if self.db and filename and not stale_entry.get('_needs_detail'):
+                try:
+                    self.db.delete_booklore_book(filename)
+                except Exception as e:
+                    logger.error(f"âŒ Failed to prune stale book {filename}: {e}")
+
+        if stale_entries:
+            logger.info(f"📚 Booklore: Pruned {len(stale_entries)} books no longer in library")
+
+    def _refresh_book_cache(self, refresh_stale_details=True):
         """
         Refresh the book cache using robust pagination.
         Fetches books in batches to ensure complete library sync.
         """
-        self._last_refresh_attempt = time.time()
-        all_books_list = []
-        page = 0
-        batch_size = 200  # Reasonable chunk size
-        
-        logger.info("📚 Booklore: Starting full library scan...")
-        
-        while True:
-            # Request specific page and size
-            # Note: Booklore/Spring usually expects 'page' (0-indexed) and 'size'
-            endpoint = f"/api/v1/books?page={page}&size={batch_size}"
-            response = self._make_request("GET", endpoint)
-            
-            if not response or response.status_code != 200:
-                logger.error(f"❌ Booklore: Failed to fetch page {page}")
-                self._last_refresh_failed = True
-                return False
-
-            data = response.json()
-            
-            # Handle different response shapes (List vs Page Object)
-            current_batch = []
-            if isinstance(data, list):
-                current_batch = data
-            elif isinstance(data, dict) and 'content' in data:
-                # Spring Data Page object wrapper
-                current_batch = data['content']
-            
-            if not current_batch:
-                break  # No more books, we are done
-            
-            # Filter by libraryId if configured
-            if self.target_library_id and current_batch:
-                filtered_batch = []
-                for b in current_batch:
-                    lid = b.get('libraryId')
-                    lname = b.get('libraryName', 'Unknown')
-
-                    # Robust comparison (str vs int)
-                    if lid is not None and str(lid) == str(self.target_library_id):
-                        filtered_batch.append(b)
-                    elif lid is None:
-                        # Conservative: Keep if ID missing, verify later
-                        filtered_batch.append(b)
-                    else:
-                        # Log exclusion at DEBUG
-                        logger.debug(f"Booklore: Ignoring book '{b.get('title')}' in Library '{lname}' (ID: {lid})")
-                current_batch = filtered_batch
-
-            all_books_list.extend(current_batch)
-            logger.debug(f"Booklore: Fetched page {page} ({len(current_batch)} items)")
-            
-            # If we got fewer items than requested, we are on the last page
-            # Also break if we got MORE items than requested (server ignored size param)
-            if len(current_batch) != batch_size:
-                break
-                
-            page += 1
-
-        if not all_books_list:
-            logger.debug("Booklore: No books found in library")
-            self._book_cache = {}
-            self._book_id_cache = {}
-            self._cache_timestamp = time.time()
-            self._save_cache() # No-op now
-            self._last_refresh_failed = False
+        # Avoid overlapping full scans from concurrent API requests.
+        # Returning True here means "refresh skipped because another one is running",
+        # which allows callers to continue serving from the current cache.
+        if not self._refresh_lock.acquire(blocking=False):
+            logger.debug("Booklore: Cache refresh already in progress; skipping duplicate refresh request")
             return True
 
-        logger.info(f"📚 Booklore: Scan complete. Found {len(all_books_list)} total books.")
+        self._last_refresh_attempt = time.time()
+        try:
+            all_books_list = []
+            page = 0
+            batch_size = 200  # Reasonable chunk size
+            use_server_side_filter = bool(self.target_library_id and self._server_side_filter_supported is not False)
+            should_probe_server_side_filter = bool(self.target_library_id and self._server_side_filter_supported is None)
 
-        # --- Pruning Stale Data ---
-        if self.db and all_books_list:
-            # 1. Map valid IDs to their live data for strict verification
-            live_map = {str(b['id']): b for b in all_books_list if b.get('id')}
-            
-            # 2. Check existing cache for ghosts
-            cached_filenames = list(self._book_cache.keys())
-            stale_count = 0
-            
-            for fname in cached_filenames:
-                book_info = self._book_cache[fname]
-                bid = book_info.get('id')
-                
-                is_stale = False
-                
-                # Check 1: ID Validity
-                if not bid or str(bid) not in live_map:
-                    is_stale = True
-                    logger.debug(f"   Pruning {fname}: ID {bid} not in live map")
-                else:
-                    # Check 2: Content Consistency
-                    
-                    # A. Filename Check
-                    # Ideally, we compare the Live filename with the Cached filename.
-                    # Problem 1: The Live API 'List' view might return empty filenames (Live: '').
-                    # Problem 2: Cache Key 'fname' is lowercase, but real filename is in book_info['fileName'].
-                    
-                    live_book = live_map[str(bid)]
-                    raw_live_filename = live_book.get('primaryFile', {}).get('fileName', live_book.get('fileName', ''))
-                    # Clean filename to ensure we don't treat whitespace/control chars as valid names
-                    live_filename = str(raw_live_filename).strip() if raw_live_filename else ''
-                    
-                    cached_real_filename = book_info.get('fileName', fname)
-                    
-                    # Only prune if we HAVE a valid, non-empty live filename to compare against
-                    if live_filename:
-                        # Strict check: If API returns explicit filename, it must match.
-                        # We compare against the REAL cached filename (preserving case if possible)
-                        # Normalize both sides to be safe (strip)
-                        if live_filename != str(cached_real_filename).strip():
-                             is_stale = True
-                             # Use repr() to reveal any invisible characters/whitespace in debug logs
-                             logger.debug(f"   Pruning {fname}: Filename mismatch. Live: {repr(raw_live_filename)} vs Cache: {repr(cached_real_filename)}")
+            logger.info("📚 Booklore: Starting full library scan...")
+
+            while True:
+                endpoint = self._build_books_endpoint(page, batch_size, use_server_side_filter)
+                response = self._make_request("GET", endpoint)
+
+                if not response or response.status_code != 200:
+                    logger.error(f"❌ Booklore: Failed to fetch page {page}")
+                    self._last_refresh_failed = True
+                    return False
+
+                data = self._parse_json_response(response, f"Booklore books page {page}")
+                if data is None:
+                    self._last_refresh_failed = True
+                    return False
+
+                current_batch = []
+                if isinstance(data, list):
+                    current_batch = data
+                elif isinstance(data, dict) and 'content' in data:
+                    current_batch = data['content']
+
+                raw_batch_size = len(current_batch)
+                if should_probe_server_side_filter and page == 0 and not current_batch:
+                    self._server_side_filter_supported = True
+                    should_probe_server_side_filter = False
+
+                if not current_batch:
+                    break
+
+                if should_probe_server_side_filter and page == 0:
+                    if any(
+                        b.get('libraryId') is not None and str(b.get('libraryId')) != str(self.target_library_id)
+                        for b in current_batch
+                    ):
+                        self._server_side_filter_supported = False
+                        should_probe_server_side_filter = False
+                        use_server_side_filter = False
+                        all_books_list = []
+                        page = 0
+                        logger.info("Booklore: Server-side library filter not supported, using client-side filtering")
+                        continue
+
+                    self._server_side_filter_supported = True
+                    should_probe_server_side_filter = False
+
+                if self.target_library_id and not use_server_side_filter:
+                    current_batch = self._filter_books_by_library(current_batch)
+
+                all_books_list.extend(current_batch)
+                logger.debug(f"Booklore: Fetched page {page} ({len(current_batch)} items)")
+
+                # Booklore's library-scoped endpoint returns the full library as a plain list.
+                # It is not pageable, so stop after the first successful fetch.
+                if use_server_side_filter and self.target_library_id:
+                    break
+
+                if raw_batch_size != batch_size:
+                    break
+
+                # Grimmory /api/v1/books returns a flat list; always stop after
+                # first fetch for non-library-scoped scans.
+                if not use_server_side_filter:
+                    break
+
+                page += 1
+
+            live_ids = {b.get('id') for b in all_books_list if b.get('id') is not None}
+            self._prune_stale_cache_entries(live_ids)
+
+            if not all_books_list:
+                logger.debug("Booklore: No books found in library")
+                self._cache_timestamp = time.time()
+                self._save_cache()  # No-op now
+                self._last_refresh_failed = False
+                return True
+
+            logger.info(f"📚 Booklore: Scan complete. Found {len(all_books_list)} total books.")
+
+            # Legacy stale pruning path left disabled; _book_id_cache pruning now runs above.
+            if False and self.db and all_books_list:
+                live_map = {str(b['id']): b for b in all_books_list if b.get('id')}
+
+                cached_filenames = list(self._book_cache.keys())
+                stale_count = 0
+
+                for fname in cached_filenames:
+                    book_info = self._book_cache[fname]
+                    bid = book_info.get('id')
+
+                    is_stale = False
+
+                    if not bid or str(bid) not in live_map:
+                        is_stale = True
+                        logger.debug(f"   Pruning {fname}: ID {bid} not in live map")
                     else:
-                        # B. Fallback Title Check (if filename is missing in List View)
-                        # If titles differ significantly, it's likely a reused ID (Ghost)
-                        live_title = live_book.get('title')
-                        cached_title = book_info.get('title')
-                        
-                        if live_title and cached_title:
-                            # Normalize for safety (ignore case/whitespace/symbols)
-                            # This catches "The Book" vs "Another Book" (ID Reuse)
-                            lt_norm = self._normalize_string(live_title)
-                            ct_norm = self._normalize_string(cached_title)
-                            
-                            # Use a generous equality check to avoid false positives on minor edits
-                            if lt_norm and ct_norm and lt_norm != ct_norm:
-                                 is_stale = True
-                                 logger.debug(f"   Pruning {fname}: Title mismatch (ID Reuse?). Live: '{live_title}' vs Cache: '{cached_title}'")
+                        live_book = live_map[str(bid)]
+                        raw_live_filename = live_book.get('primaryFile', {}).get('fileName', live_book.get('fileName', ''))
+                        live_filename = str(raw_live_filename).strip() if raw_live_filename else ''
 
-                if is_stale:
-                    stale_count += 1
-                    # Remove from Memory
-                    self._book_cache.pop(fname, None)
-                    if bid:
-                        self._book_id_cache.pop(bid, None)
-                    
-                    # Remove from Database
-                    try:
-                        # Use the CACHE KEY (fname) which corresponds to the database `filename` column (lowercase)
-                        self.db.delete_booklore_book(fname)
-                    except Exception as e:
-                        logger.error(f"❌ Failed to prune stale book {fname}: {e}")
+                        cached_real_filename = book_info.get('fileName', fname)
 
-            if stale_count > 0:
-                logger.info(f"🧹 Booklore: Pruned {stale_count} stale books from database.")
+                        if live_filename:
+                            if live_filename != str(cached_real_filename).strip():
+                                is_stale = True
+                                logger.debug(
+                                    f"   Pruning {fname}: Filename mismatch. Live: {repr(raw_live_filename)} vs Cache: {repr(cached_real_filename)}"
+                                )
+                        else:
+                            live_title = live_book.get('title')
+                            cached_title = book_info.get('title')
 
-        # --- Proceed with Step 2: Detail Fetching (Same as before) ---
-        
-        # Step 2: For books not in cache, fetch details to get fileName
-        new_book_ids = [b['id'] for b in all_books_list if b['id'] not in self._book_id_cache]
+                            if live_title and cached_title:
+                                lt_norm = self._normalize_string(live_title)
+                                ct_norm = self._normalize_string(cached_title)
 
-        if new_book_ids:
-            logger.debug(f"Booklore: Fetching details for {len(new_book_ids)} new books...")
-            token = self._get_fresh_token()
-            if not token:
-                self._last_refresh_failed = True
-                return False
+                                if lt_norm and ct_norm and lt_norm != ct_norm:
+                                    is_stale = True
+                                    logger.debug(
+                                        f"   Pruning {fname}: Title mismatch (ID Reuse?). Live: '{live_title}' vs Cache: '{cached_title}'"
+                                    )
 
-            def fetch_one(book_id):
-                return book_id, self._fetch_book_detail(book_id, token)
+                    if is_stale:
+                        stale_count += 1
+                        self._book_cache.pop(fname, None)
+                        if bid:
+                            self._book_id_cache.pop(bid, None)
 
-            with ThreadPoolExecutor(max_workers=10) as executor:
-                futures = {executor.submit(fetch_one, bid): bid for bid in new_book_ids}
-                for future in as_completed(futures):
-                    try:
-                        book_id, detail = future.result()
-                        if detail and isinstance(detail, dict):
-                            self._process_book_detail(detail)
-                    except Exception as e:
-                        logger.debug(f"Booklore: Error fetching details: {e}")
+                        try:
+                            self.db.delete_booklore_book(fname)
+                        except Exception as e:
+                            logger.error(f"❌ Failed to prune stale book {fname}: {e}")
 
-        # Refresh existing items from the new list
-        for book in all_books_list:
-             if book['id'] in self._book_id_cache:
-                 # Optional: Update shallow fields if needed
-                 pass
+                if stale_count > 0:
+                    logger.info(f"🧹 Booklore: Pruned {stale_count} stale books from database.")
 
-        self._cache_timestamp = time.time()
-        # self._save_cache() # DB is updated inside _process_book_detail
-        self._last_refresh_failed = False
-        return True
+            id_snapshot = self._snapshot_book_id_items()
+            existing_id_strings = {str(bid) for bid, _ in id_snapshot}
+            existing_lightweight_ids = {
+                str(bid) for bid, book_info in id_snapshot if book_info.get('_needs_detail')
+            }
+            new_book_ids = [
+                b.get('id') for b in all_books_list
+                if b.get('id') is not None and str(b.get('id')) not in existing_id_strings
+            ]
+
+            for book in all_books_list:
+                if str(book.get('id')) in existing_lightweight_ids:
+                    self._upsert_lightweight_entry(book)
+
+            new_detail_fetch_count = 0
+            if new_book_ids:
+                if len(new_book_ids) > BULK_DETAIL_FETCH_LIMIT:
+                    for book in all_books_list:
+                        self._upsert_lightweight_entry(book)
+
+                    logger.warning(
+                        f"📚 Booklore: {len(new_book_ids)} new books detected. "
+                        f"Skipping bulk detail fetch (limit: {BULK_DETAIL_FETCH_LIMIT}). "
+                        f"Book details will be fetched on demand. "
+                        f"Consider setting BOOKLORE_LIBRARY_ID to reduce scan scope."
+                    )
+                else:
+                    new_detail_fetch_count = len(new_book_ids)
+                    logger.debug(f"Booklore: Fetching details for {len(new_book_ids)} new books...")
+                    token = self._get_fresh_token()
+                    if not token:
+                        self._last_refresh_failed = True
+                        return False
+
+                    def fetch_one(book_id):
+                        return book_id, self._fetch_book_detail(book_id, token)
+
+                    with ThreadPoolExecutor(max_workers=10) as executor:
+                        futures = {executor.submit(fetch_one, bid): bid for bid in new_book_ids}
+                        for future in as_completed(futures):
+                            try:
+                                _, detail = future.result()
+                                if detail and isinstance(detail, dict):
+                                    self._process_book_detail(detail)
+                            except Exception as e:
+                                logger.debug(f"Booklore: Error fetching details: {e}")
+
+            id_snapshot = self._snapshot_book_id_items()
+            if id_snapshot and refresh_stale_details:
+                stale_refresh_budget = max(
+                    0,
+                    MAX_DETAIL_FETCHES_PER_REFRESH_CYCLE - new_detail_fetch_count
+                )
+                if stale_refresh_budget <= 0:
+                    logger.debug(
+                        "Booklore: Skipping stale details refresh this cycle "
+                        f"(new_details={new_detail_fetch_count}, "
+                        f"max_per_cycle={MAX_DETAIL_FETCHES_PER_REFRESH_CYCLE})"
+                    )
+                    stale_ids = []
+                else:
+                    stale_batch_size = min(STALE_REFRESH_BATCH_SIZE, stale_refresh_budget)
+                    logger.debug(
+                        "Booklore: Stale details refresh budget "
+                        f"(new_details={new_detail_fetch_count}, "
+                        f"stale_batch={stale_batch_size}, "
+                        f"max_per_cycle={MAX_DETAIL_FETCHES_PER_REFRESH_CYCLE})"
+                    )
+                stale_candidates = []
+                for bid, book_info in id_snapshot:
+                    if bid is None:
+                        continue
+                    detail_fetched_at = 0
+                    if isinstance(book_info, dict):
+                        raw_detail_fetched_at = book_info.get('_detail_fetched_at', 0)
+                        try:
+                            detail_fetched_at = float(raw_detail_fetched_at or 0)
+                        except (TypeError, ValueError):
+                            detail_fetched_at = 0
+                    stale_candidates.append((detail_fetched_at, bid))
+
+                stale_candidates.sort(key=lambda item: item[0])
+                if stale_refresh_budget > 0:
+                    stale_ids = [bid for _, bid in stale_candidates[:stale_batch_size]]
+                if stale_ids:
+                    logger.debug(
+                        f"Booklore: Refreshing stale details for {len(stale_ids)} books "
+                        f"(batch_size={len(stale_ids)})"
+                    )
+                    token = self._get_fresh_token()
+                    if not token:
+                        self._last_refresh_failed = True
+                        return False
+
+                    def fetch_stale_one(book_id):
+                        return book_id, self._fetch_book_detail(book_id, token)
+
+                    with ThreadPoolExecutor(max_workers=10) as executor:
+                        futures = {executor.submit(fetch_stale_one, bid): bid for bid in stale_ids}
+                        for future in as_completed(futures):
+                            try:
+                                _, detail = future.result()
+                                if detail and isinstance(detail, dict):
+                                    self._process_book_detail(detail)
+                            except Exception as e:
+                                logger.debug(f"Booklore: Error refreshing stale detail: {e}")
+            elif id_snapshot and not refresh_stale_details:
+                logger.debug(
+                    "Booklore: Skipping stale details refresh for quick search-triggered cache validation"
+                )
+
+            self._cache_timestamp = time.time()
+            self._last_refresh_failed = False
+            return True
+        finally:
+            self._refresh_lock.release()
 
     def _process_book_detail(self, detail):
         """Process a book detail response and add to cache."""
@@ -478,20 +1006,11 @@ class BookloreClient:
             return
 
         metadata = detail.get('metadata') or {}
-        authors = metadata.get('authors') or []
-        # Handle both list of strings and list of dicts for authors
-        author_list = []
-        for a in authors:
-            if isinstance(a, dict):
-                name = a.get('name', '')
-                if name: author_list.append(name)
-            elif isinstance(a, str) and a.strip():
-                author_list.append(a.strip())
-
-        author_str = ', '.join(author_list)
+        author_str = self._format_authors(metadata.get('authors') or [])
         subtitle = metadata.get('subtitle') or ''
         title = metadata.get('title') or detail.get('title') or filename
 
+        stale_filenames = []
         book_info = {
             'id': detail.get('id'),
             'fileName': filename,
@@ -500,16 +1019,49 @@ class BookloreClient:
             'subtitle': subtitle,
             'authors': author_str,
             'bookType': book_type,
+            'primaryFile': detail.get('primaryFile'),
+            'bookFiles': detail.get('bookFiles'),
+            'alternativeFormats': detail.get('alternativeFormats'),
+            'supplementaryFiles': detail.get('supplementaryFiles'),
+            'audiobookMetadata': metadata.get('audiobookMetadata'),
+            'audiobookProgress': detail.get('audiobookProgress'),
             'epubProgress': detail.get('epubProgress'),
             'pdfProgress': detail.get('pdfProgress'),
             'cbxProgress': detail.get('cbxProgress'),
             'koreaderProgress': detail.get('koreaderProgress'),
+            '_detail_fetched_at': time.time(),
         }
 
         # Let's keep it consistent with what we see in database migration
-        
-        self._book_cache[filename.lower()] = book_info
-        self._book_id_cache[detail['id']] = book_info
+        with self._cache_lock:
+            detail_id = detail.get('id')
+            current_filename = filename.lower()
+            if detail_id is not None:
+                for cached_filename, cached_info in list(self._book_cache.items()):
+                    if cached_filename == current_filename:
+                        continue
+                    cached_id = cached_info.get('id') if isinstance(cached_info, dict) else None
+                    if cached_id is None or str(cached_id) != str(detail_id):
+                        continue
+                    self._book_cache.pop(cached_filename, None)
+                    stale_filenames.append(cached_filename)
+
+            self._book_cache[filename.lower()] = book_info
+            self._book_id_cache[detail['id']] = book_info
+
+        for stale_filename in stale_filenames:
+            if self.db:
+                try:
+                    self.db.delete_booklore_book(stale_filename)
+                except Exception as e:
+                    logger.error(f"❌ Failed to remove stale Booklore alias '{stale_filename}': {e}")
+
+        if stale_filenames:
+            logger.info(
+                "📚 Booklore: Removed stale filename aliases for book %s: %s",
+                detail.get('id'),
+                stale_filenames,
+            )
 
         # Persist to DB
         if self.db:
@@ -529,6 +1081,61 @@ class BookloreClient:
 
         return None
 
+    def _fetch_and_cache_detail(self, book_id, force_refresh=False):
+        """Fetch detail for a single book on demand and add it to cache."""
+        with self._cache_lock:
+            cached = self._book_id_cache.get(book_id)
+            if cached and not cached.get('_needs_detail') and not force_refresh:
+                return cached
+
+        token = self._get_fresh_token()
+        if not token:
+            return None
+
+        detail = self._fetch_book_detail(book_id, token)
+        if detail and isinstance(detail, dict):
+            self._process_book_detail(detail)
+            with self._cache_lock:
+                return self._book_id_cache.get(book_id)
+        return None
+
+    def _get_cached_book_by_id(self, book_id):
+        target_id = str(book_id)
+        with self._cache_lock:
+            direct = self._book_id_cache.get(book_id)
+            if isinstance(direct, dict):
+                return direct
+
+            for cache_key, book_info in self._book_id_cache.items():
+                if not isinstance(book_info, dict):
+                    continue
+                cache_book_id = book_info.get("id")
+                if str(cache_key) == target_id or str(cache_book_id) == target_id:
+                    return book_info
+        return None
+
+    @staticmethod
+    def _has_hydrated_file_metadata(book):
+        if not isinstance(book, dict):
+            return False
+
+        if isinstance(book.get("primaryFile"), dict):
+            return True
+
+        if any(isinstance(book.get(key), list) for key in ("bookFiles", "alternativeFormats", "supplementaryFiles")):
+            return True
+
+        return bool(book.get("filePath"))
+
+    def get_book_by_id(self, book_id, allow_refresh=True):
+        """Return a hydrated BookLore book detail by ID."""
+        cached = self._get_cached_book_by_id(book_id)
+        if cached and self._has_hydrated_file_metadata(cached):
+            return cached
+        if not allow_refresh:
+            return cached
+        return self._fetch_and_cache_detail(book_id, force_refresh=True)
+
     def _normalize_string(self, s):
         """Remove non-alphanumeric characters and lowercase."""
         import re
@@ -540,7 +1147,7 @@ class BookloreClient:
         Find a book by its filename using exact, stem, or normalized matching.
         """
         # Ensure cache is initialized if empty, but respect allow_refresh for updates
-        if not self._book_cache and allow_refresh and not self._is_refresh_on_cooldown():
+        if not self._has_cached_books() and allow_refresh and not self._is_refresh_on_cooldown():
             self._refresh_book_cache()
 
         # Check cache freshness if refresh is allowed
@@ -548,18 +1155,23 @@ class BookloreClient:
             self._refresh_book_cache()
 
         target_name = Path(ebook_filename).name.lower()
-        
+
         # 1. Exact Filename Match
-        if target_name in self._book_cache: return self._book_cache[target_name]
+        with self._cache_lock:
+            exact_match = self._book_cache.get(target_name)
+        if exact_match:
+            return exact_match
 
         target_stem = Path(ebook_filename).stem.lower()
-        
+        cache_items = self._snapshot_book_cache_items()
+
         # 2. Strict Stem Match
-        for cached_name, book_info in list(self._book_cache.items()):
-            if Path(cached_name).stem.lower() == target_stem: return book_info
+        for cached_name, book_info in cache_items:
+            if Path(cached_name).stem.lower() == target_stem:
+                return book_info
 
         # 3. Partial Stem Match
-        for cached_name, book_info in list(self._book_cache.items()):
+        for cached_name, book_info in cache_items:
             if target_stem in cached_name or cached_name.replace('.epub', '') in target_stem:
                 # High confidence check: ensure significant overlap
                 return book_info
@@ -571,21 +1183,23 @@ class BookloreClient:
             from difflib import SequenceMatcher
             best_match = None
             best_ratio = 0.0
-            
-            for cached_name, book_info in list(self._book_cache.items()):
+
+            for cached_name, book_info in cache_items:
                 cached_norm = self._normalize_string(Path(cached_name).stem)
                 # Calculate similarity ratio
                 ratio = SequenceMatcher(None, target_norm, cached_norm).ratio()
-                
+
                 # Require high similarity (90%+) to avoid matching sequels
                 if ratio > 0.90 and ratio > best_ratio:
                     best_ratio = ratio
                     best_match = (cached_name, book_info)
-            
+
             if best_match:
                 logger.debug(f"Fuzzy match: '{target_stem}' ~= '{best_match[0]}' (similarity: {best_ratio:.1%})")
                 return best_match[1]
 
+        # Lightweight entries do not carry fileName, so filename lookup still
+        # depends on hydrated cache entries.
         # If not found, try refreshing cache once
         if allow_refresh and time.time() - self._cache_timestamp > 60 and not self._is_refresh_on_cooldown():
             if self._refresh_book_cache():
@@ -596,44 +1210,255 @@ class BookloreClient:
     def get_all_books(self):
         """Get all books from cache, refreshing if necessary."""
         # Use a reasonable cache time of 1 hour, similar to find_book_by_filename
-        if time.time() - self._cache_timestamp > 3600 and not self._is_refresh_on_cooldown(): self._refresh_book_cache()
-        if not self._book_cache and not self._is_refresh_on_cooldown(): self._refresh_book_cache()
-        return list(self._book_cache.values())
+        if time.time() - self._cache_timestamp > 3600 and not self._is_refresh_on_cooldown():
+            self._refresh_book_cache(refresh_stale_details=False)
+        if not self._has_cached_books() and not self._is_refresh_on_cooldown():
+            self._refresh_book_cache(refresh_stale_details=False)
+
+        with self._cache_lock:
+            all_books = list(self._book_cache.values())
+            fully_cached_ids = {str(b.get('id')) for b in all_books if b.get('id') is not None}
+            for bid, book_info in self._book_id_cache.items():
+                if str(bid) not in fully_cached_ids and book_info.get('_needs_detail'):
+                    all_books.append(book_info)
+        return self._dedupe_book_results(all_books)
+
+    def search_audiobooks(self, search_term, include_info=True):
+        """Search Booklore for audiobook-capable books."""
+        safe_term = str(search_term or "").strip()
+
+        def collect_results(books):
+            collected = []
+            seen_ids = set()
+            for book in books or []:
+                if not isinstance(book, dict):
+                    continue
+                bid = book.get('id')
+                if bid in seen_ids:
+                    continue
+                hydrated = book
+                requires_audio_refresh = (
+                    not book.get('_needs_detail')
+                    and not self._book_supports_audiobook(book)
+                    and not self._has_audio_shape_fields(book)
+                )
+                if book.get('_needs_detail') or not self._book_supports_audiobook(book):
+                    hydrated = self._fetch_and_cache_detail(
+                        bid,
+                        force_refresh=requires_audio_refresh,
+                    ) or book
+                if not self._book_supports_audiobook(hydrated):
+                    continue
+                if include_info:
+                    info = self.get_audiobook_info(bid)
+                    if info:
+                        hydrated = dict(hydrated)
+                        hydrated['audiobookInfo'] = info
+                collected.append(hydrated)
+                seen_ids.add(bid)
+            return collected
+
+        books = self.search_books(safe_term) if safe_term else self.get_all_books()
+        results = collect_results(books)
+        if results or not safe_term:
+            return results
+
+        if self._is_refresh_on_cooldown():
+            logger.debug(
+                "Booklore audiobook search miss: refresh skipped due to cooldown "
+                f"(term='{sanitize_log_data(safe_term)}')"
+            )
+            return results
+
+        now = time.time()
+        if (
+            now - self._last_audiobook_search_miss_refresh_attempt
+            < self._audiobook_search_miss_refresh_cooldown
+        ):
+            logger.debug(
+                "Booklore audiobook search miss: refresh throttled "
+                f"(term='{sanitize_log_data(safe_term)}', cooldown={self._audiobook_search_miss_refresh_cooldown}s)"
+            )
+            return results
+
+        self._last_audiobook_search_miss_refresh_attempt = now
+        logger.debug(
+            "Booklore audiobook search miss: forcing cache refresh once "
+            f"(term='{sanitize_log_data(safe_term)}')"
+        )
+        if self._refresh_book_cache(refresh_stale_details=False):
+            refreshed_books = self.search_books(safe_term)
+            return collect_results(refreshed_books)
+
+        return results
+
+    def clear_and_refresh(self):
+        """Clear all Booklore cache state (memory + DB) and run a full refresh."""
+        acquired = self._refresh_lock.acquire(timeout=30)
+        if not acquired:
+            logger.warning("⚠️ Booklore: Cache refresh already in progress, cannot clear cache right now")
+            return False
+
+        try:
+            with self._cache_lock:
+                self._book_cache = {}
+                self._book_id_cache = {}
+                self._cache_timestamp = 0
+
+            self._last_refresh_failed = False
+            self._last_refresh_attempt = 0
+            self._server_side_filter_supported = None
+
+            if self.db:
+                if not self.db.clear_all_booklore_books():
+                    logger.error("❌ Booklore: Failed to clear DB cache table")
+                    return False
+
+            logger.info("📚 Booklore: Cache cleared (memory + DB), starting full refresh...")
+        except Exception as e:
+            logger.error(f"❌ Booklore: Failed to clear cache before refresh: {e}")
+            return False
+        finally:
+            self._refresh_lock.release()
+
+        return self._refresh_book_cache()
 
     def search_books(self, search_term):
         """Search books by title, author, or filename. Returns list of matching books."""
-        if time.time() - self._cache_timestamp > 5 and not self._is_refresh_on_cooldown(): self._refresh_book_cache()
-        if not self._book_cache and not self._is_refresh_on_cooldown(): self._refresh_book_cache()
+        def search_in_cache(term):
+            search_lower = term.lower()
+            search_norm = self._normalize_string(term)
+            matches = []
+            matched_ids = set()
+
+            for book_info in self._dedupe_book_results(self._snapshot_book_cache_values()):
+                title = (book_info.get('title') or '').lower()
+                authors = (book_info.get('authors') or '').lower()
+                filename = (book_info.get('fileName') or '').lower()
+
+                # 1. Standard substring match
+                if search_lower in title or search_lower in authors or search_lower in filename:
+                    matches.append(book_info)
+                    if book_info.get('id') is not None:
+                        matched_ids.add(str(book_info.get('id')))
+                    continue
+
+                # 2. Normalized match (for "Dragon's" vs "Dragons")
+                # Only perform if standard match failed
+                title_norm = self._normalize_string(title)
+                authors_norm = self._normalize_string(authors)
+                filename_norm = self._normalize_string(filename)
+
+                if len(search_norm) > 3:  # Avoid extremely short noisy matches
+                    if (
+                        search_norm in title_norm or
+                        search_norm in authors_norm or
+                        search_norm in filename_norm
+                    ):
+                        matches.append(book_info)
+                        if book_info.get('id') is not None:
+                            matched_ids.add(str(book_info.get('id')))
+
+            detail_fetch_count = 0
+            for bid, book_info in self._snapshot_book_id_items():
+                if not book_info.get('_needs_detail'):
+                    continue
+                if str(bid) in matched_ids:
+                    continue
+
+                title = (book_info.get('title') or '').lower()
+                authors = (book_info.get('authors') or '').lower()
+                filename = (book_info.get('fileName') or '').lower()
+                title_norm = self._normalize_string(title)
+                authors_norm = self._normalize_string(authors)
+                filename_norm = self._normalize_string(filename)
+                is_match = search_lower in title
+                if not is_match and (search_lower in authors or search_lower in filename):
+                    is_match = True
+                if not is_match and len(search_norm) > 3:
+                    is_match = (
+                        search_norm in title_norm or
+                        search_norm in authors_norm or
+                        search_norm in filename_norm
+                    )
+                if not is_match:
+                    continue
+
+                if filename:
+                    matches.append(book_info)
+                    matched_ids.add(str(bid))
+                    continue
+
+                if detail_fetch_count >= MAX_DETAIL_FETCHES_PER_SEARCH:
+                    logger.debug("Booklore: Hit detail fetch limit for search, returning partial results")
+                    break
+
+                hydrated = self._fetch_and_cache_detail(bid)
+                detail_fetch_count += 1
+                if hydrated and hydrated.get('fileName'):
+                    matches.append(hydrated)
+                    matched_ids.add(str(hydrated.get('id')))
+
+            return self._dedupe_book_results(matches)
+
+        # Avoid expensive full-library refreshes on rapid UI search requests.
+        # Keep refresh cadence aligned with other read paths.
+        if time.time() - self._cache_timestamp > 3600 and not self._is_refresh_on_cooldown():
+            self._refresh_book_cache(refresh_stale_details=False)
+        if not self._has_cached_books() and not self._is_refresh_on_cooldown():
+            self._refresh_book_cache(refresh_stale_details=False)
 
         if not search_term:
-            return list(self._book_cache.values())
+            return self.get_all_books()
 
-        search_lower = search_term.lower()
-        search_norm = self._normalize_string(search_term)
-        
-        results = []
-        for book_info in list(self._book_cache.values()):
-            title = (book_info.get('title') or '').lower()
-            authors = (book_info.get('authors') or '').lower()
-            filename = (book_info.get('fileName') or '').lower()
+        results = search_in_cache(search_term)
+        cache_age = time.time() - self._cache_timestamp
+        safe_term = sanitize_log_data(search_term)
+        if results:
+            now = time.time()
+            hit_refresh_ready = (
+                (now - self._last_search_hit_refresh_attempt) >= self._search_hit_refresh_cooldown
+            )
+            if (
+                cache_age > self._search_hit_refresh_min_age
+                and not self._is_refresh_on_cooldown()
+                and hit_refresh_ready
+            ):
+                self._last_search_hit_refresh_attempt = now
+                logger.debug(
+                    f"Booklore search hit: validating cache once (quick mode, no stale rotation) "
+                    f"(term='{safe_term}', cache_age={cache_age:.0f}s, hits={len(results)})"
+                )
+                if self._refresh_book_cache(refresh_stale_details=False):
+                    return search_in_cache(search_term)
+            elif cache_age > self._search_hit_refresh_min_age and not hit_refresh_ready:
+                logger.debug(
+                    f"Booklore search hit: quick validation throttled "
+                    f"(term='{safe_term}', cooldown={self._search_hit_refresh_cooldown}s)"
+                )
+            return results
 
-            # 1. Standard substring match
-            if search_lower in title or search_lower in authors or search_lower in filename:
-                results.append(book_info)
-                continue
-            
-            # 2. Normalized match (for "Dragon's" vs "Dragons")
-            # Only perform if standard match failed
-            title_norm = self._normalize_string(title)
-            authors_norm = self._normalize_string(authors)
-            filename_norm = self._normalize_string(filename)
-            
-            if len(search_norm) > 3: # Avoid extremely short noisy matches
-                if (search_norm in title_norm or 
-                    search_norm in authors_norm or 
-                    search_norm in filename_norm):
-                    results.append(book_info)
-        
+        if self._is_refresh_on_cooldown():
+            logger.debug(
+                f"Booklore search miss: refresh skipped due to cooldown "
+                f"(term='{safe_term}', cache_age={cache_age:.0f}s)"
+            )
+            return results
+
+        if cache_age <= self._search_miss_refresh_min_age:
+            logger.debug(
+                f"Booklore search miss: refresh skipped (cache too fresh) "
+                f"(term='{safe_term}', cache_age={cache_age:.0f}s)"
+            )
+            return results
+
+        logger.debug(
+            f"Booklore search miss: refreshing cache once (quick mode, no stale rotation) "
+            f"(term='{safe_term}', cache_age={cache_age:.0f}s)"
+        )
+        if self._refresh_book_cache(refresh_stale_details=False):
+            return search_in_cache(search_term)
+
         return results
 
     def download_book(self, book_id):
@@ -647,14 +1472,10 @@ class BookloreClient:
 
         try:
             response = self.session.get(url, headers=headers, timeout=60)
-            
-            # Fallback for newer Booklore versions or different configurations
-            if response.status_code == 404:
-                file_url = f"{self.base_url}/api/v1/books/{book_id}/file"
-                logger.debug(f"404 on /download, trying fallback: {file_url}")
-                response = self.session.get(file_url, headers=headers, timeout=60)
 
             if response.status_code != 200:
+                if response.status_code == 404:
+                    self._evict_cached_book(book_id=book_id, reason="download returned 404")
                 logger.error(f"❌ Failed to download book: {response.status_code}")
                 return None
 
@@ -673,16 +1494,35 @@ class BookloreClient:
         except (TypeError, ValueError):
             return 0.0
 
+    @staticmethod
+    def _to_optional_int(raw_value):
+        if raw_value in (None, ""):
+            return None
+        try:
+            return int(raw_value)
+        except (TypeError, ValueError):
+            try:
+                return int(float(raw_value))
+            except (TypeError, ValueError):
+                return None
+
     def _get_progress_by_book_id(self, book_id):
         """
         Get progress tuple for a specific Booklore book id.
         Returns: (pct_fraction, cfi) or (None, None) on failure.
         """
         response = self._make_request("GET", f"/api/v1/books/{book_id}")
-        if not response or response.status_code != 200:
+        if not response:
+            return None, None
+        if response.status_code == 404:
+            self._evict_cached_book(book_id=book_id, reason="progress lookup returned 404")
+            return None, None
+        if response.status_code != 200:
             return None, None
 
-        data = response.json()
+        data = self._parse_json_response(response, f"Booklore progress for book {book_id}")
+        if not isinstance(data, dict):
+            return None, None
         book_type = str(
             data.get('primaryFile', {}).get('bookType')
             or data.get('bookType')
@@ -690,14 +1530,62 @@ class BookloreClient:
         ).upper()
         if book_type == 'EPUB':
             progress = data.get('epubProgress') or {}
-            return self._to_progress_fraction(progress.get('percentage', 0)), progress.get('cfi')
+            raw_pct = progress.get('percentage', 0)
+            parsed_pct = self._to_progress_fraction(raw_pct)
+            logger.debug(
+                f"Booklore verify read: book_id={book_id} type=EPUB "
+                f"raw_pct={raw_pct!r} parsed_pct={parsed_pct if parsed_pct is not None else 'None'} "
+                f"has_cfi={bool(progress.get('cfi'))}"
+            )
+            return parsed_pct, progress.get('cfi')
         if book_type == 'PDF':
             progress = data.get('pdfProgress') or {}
+            logger.debug(
+                f"Booklore verify read: book_id={book_id} type=PDF "
+                f"raw_pct={progress.get('percentage', 0)!r}"
+            )
             return self._to_progress_fraction(progress.get('percentage', 0)), None
         if book_type == 'CBX':
             progress = data.get('cbxProgress') or {}
+            logger.debug(
+                f"Booklore verify read: book_id={book_id} type=CBX "
+                f"raw_pct={progress.get('percentage', 0)!r}"
+            )
             return self._to_progress_fraction(progress.get('percentage', 0)), None
+        logger.debug(f"Booklore verify read: book_id={book_id} unknown book_type={book_type!r}")
         return None, None
+
+    def get_audiobook_info(self, book_id):
+        response = self._make_request("GET", f"/api/v1/audiobooks/{book_id}/info")
+        if not response or response.status_code != 200:
+            return None
+        data = self._parse_json_response(response, f"Booklore audiobook info for book {book_id}")
+        return data if isinstance(data, dict) else None
+
+    def get_audiobook_progress(self, book_id):
+        response = self._make_request("GET", f"/api/v1/books/{book_id}")
+        if not response:
+            return None
+        if response.status_code == 404:
+            self._evict_cached_book(book_id=book_id, reason="audiobook progress lookup returned 404")
+            return None
+        if response.status_code != 200:
+            return None
+        data = self._parse_json_response(response, f"Booklore audiobook progress for book {book_id}")
+        if not isinstance(data, dict):
+            return None
+        progress = data.get('audiobookProgress') or {}
+        if not isinstance(progress, dict):
+            return None
+        raw_pct = progress.get('percentage', 0)
+        parsed_pct = self._to_progress_fraction(raw_pct)
+        position_ms = self._to_optional_int(progress.get('positionMs'))
+        return {
+            'pct': parsed_pct,
+            'position_ms': position_ms,
+            'track_index': self._to_optional_int(progress.get('trackIndex')),
+            'track_position_ms': self._to_optional_int(progress.get('trackPositionMs')),
+        }
 
     def get_progress(self, ebook_filename):
         book = self.find_book_by_filename(ebook_filename)
@@ -705,109 +1593,421 @@ class BookloreClient:
             return None, None
         return self._get_progress_by_book_id(book['id'])
 
+    def get_audiobook_cover_bytes(self, book_id):
+        response = self._make_request("GET", f"/api/v1/audiobooks/{book_id}/cover")
+        if not response or response.status_code != 200:
+            return None, None
+        return response.content, response.headers.get('Content-Type', 'image/jpeg')
+
+    def download_book_to_path(self, book_id, output_path, expected_size: int = 0) -> bool:
+        """Stream-download the audiobook file directly to disk.
+
+        Uses Grimmory's audiobook stream endpoint for full-file delivery.
+        """
+        token = self._get_fresh_token()
+        if not token:
+            return False
+        headers = {"Authorization": f"Bearer {token}"}
+        urls = [
+            f"{self.base_url}/api/v1/audiobooks/{book_id}/stream",
+        ]
+        for url in urls:
+            try:
+                with self.session.get(url, headers=headers, stream=True, timeout=300) as response:
+                    if response.status_code == 404:
+                        logger.debug(
+                            f"Booklore audiobook download: 404 on {url}, trying next"
+                        )
+                        continue
+                    if response.status_code != 200:
+                        logger.error(
+                            f"❌ Booklore audiobook download failed: book_id={book_id} "
+                            f"url={url} status={response.status_code}"
+                        )
+                        return False
+
+                    # Check Content-Length if available early
+                    content_length = response.headers.get('Content-Length')
+                    if content_length and expected_size and int(content_length) < expected_size * 0.1:
+                        logger.warning(
+                            f"Booklore download candidate too small ({content_length} bytes) on {url}, searching for larger stream..."
+                        )
+                        continue
+
+                    output_path = Path(output_path)
+                    output_path.parent.mkdir(parents=True, exist_ok=True)
+                    with open(output_path, "wb") as handle:
+                        for chunk in response.iter_content(chunk_size=65536):
+                            if chunk:
+                                handle.write(chunk)
+                    actual_size = output_path.stat().st_size
+                    size_display = f"{actual_size // (1024 * 1024)} MiB" if actual_size > 1024 * 1024 else f"{actual_size // 1024} KiB"
+                    
+                    # If we downloaded a file that is still too small, try next endpoint
+                    if expected_size and actual_size < expected_size * 0.1:
+                        logger.warning(
+                            f"Booklore downloaded file too small ({size_display}) from {url}, trying next endpoint..."
+                        )
+                        continue
+
+                    logger.info(
+                        f"Booklore audiobook download: book_id={book_id} "
+                        f"-> '{output_path.name}' ({size_display}) via {url.split('/')[-1]}"
+                    )
+                    if expected_size and actual_size < expected_size * 0.5:
+                        logger.warning(
+                            f"Booklore audiobook download size mismatch: "
+                            f"expected ~{expected_size // (1024 * 1024)} MiB, "
+                            f"got {size_display} — file may be incomplete"
+                        )
+                    return True
+            except Exception as e:
+                logger.error(f"❌ Booklore audiobook download error: book_id={book_id} url={url} {e}")
+                return False
+        logger.error(f"❌ Booklore audiobook download: stream endpoint unavailable for book_id={book_id}")
+        return False
+
+    def download_audiobook_track(self, book_id, track_index, output_path):
+        token = self._get_fresh_token()
+        if not token:
+            return False
+        headers = {"Authorization": f"Bearer {token}"}
+        url = f"{self.base_url}/api/v1/audiobooks/{book_id}/track/{track_index}/stream"
+        try:
+            with self.session.get(url, headers=headers, stream=True, timeout=120) as response:
+                if response.status_code != 200:
+                    logger.error(
+                        f"❌ Booklore audiobook track download failed: book_id={book_id} "
+                        f"track_index={track_index} status={response.status_code}"
+                    )
+                    return False
+                output_path = Path(output_path)
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(output_path, "wb") as handle:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        if chunk:
+                            handle.write(chunk)
+                return True
+        except Exception as e:
+            logger.error(f"❌ Booklore audiobook track download error: {e}")
+            return False
+
+    def update_audiobook_progress(
+        self,
+        book_id,
+        book_file_id,
+        position_ms,
+        percentage,
+        track_index=None,
+        track_position_ms=None,
+    ):
+        pct_display = max(0.0, min(float(percentage), 1.0)) * 100.0
+        position_ms = max(int(position_ms or 0), 0)
+        track_index = self._to_optional_int(track_index)
+        if track_index is not None:
+            track_index = max(track_index, 0)
+        track_position_ms = self._to_optional_int(track_position_ms)
+        if track_position_ms is not None:
+            track_position_ms = max(track_position_ms, 0)
+
+        progress_payload = {
+            "positionMs": position_ms,
+            "percentage": pct_display,
+        }
+        if track_index is not None:
+            progress_payload["trackIndex"] = track_index
+        if track_position_ms is not None:
+            progress_payload["trackPositionMs"] = track_position_ms
+
+        payloads = []
+        book_file_id_value = None
+        if book_file_id not in (None, ""):
+            book_file_id_value = self._to_optional_int(book_file_id)
+            if book_file_id_value is None:
+                book_file_id_value = book_file_id
+            file_progress = {
+                "bookFileId": book_file_id_value,
+                "progressPercent": pct_display,
+                "positionData": str(position_ms),
+            }
+            if track_index is not None:
+                file_progress["positionHref"] = str(track_index)
+            payloads.append(("fileProgress", {"bookId": book_id, "fileProgress": file_progress}, True))
+        payloads.append(("audiobookProgress", {"bookId": book_id, "audiobookProgress": progress_payload}, False))
+
+        last_status = "No response"
+        file_progress_http_failed = False
+        for variant_name, payload, allow_http_fallback in payloads:
+            if variant_name == "audiobookProgress" and book_file_id_value is not None and not file_progress_http_failed:
+                # Skip the compatibility fallback until fileProgress actually fails at the HTTP layer.
+                continue
+            logger.debug(
+                "Booklore audiobook write attempt: book_id=%s variant=%s expected_pct=%.2f%% "
+                "stored_position_ms=%s track_index=%s track_position_ms=%s has_book_file_id=%s",
+                book_id,
+                variant_name,
+                pct_display,
+                position_ms,
+                track_index,
+                track_position_ms,
+                book_file_id_value is not None,
+            )
+            response = self._make_request("POST", "/api/v1/books/progress", payload)
+            if not response or response.status_code not in [200, 201, 204]:
+                last_status = response.status_code if response else "No response"
+                logger.debug(
+                    "Booklore audiobook write non-success: book_id=%s variant=%s status=%s body_preview=%r",
+                    book_id,
+                    variant_name,
+                    response.status_code if response else "no_response",
+                    self._response_text_preview(response),
+                )
+                if allow_http_fallback:
+                    file_progress_http_failed = True
+                    logger.debug(
+                        "Booklore audiobook write falling back after HTTP failure: book_id=%s "
+                        "variant=%s fallback=audiobookProgress",
+                        book_id,
+                        variant_name,
+                    )
+                    continue
+                break
+            time.sleep(0.25)
+            verified = self.get_audiobook_progress(book_id)
+            if verified:
+                observed_pct = verified.get('pct')
+                observed_position_ms = verified.get('position_ms')
+                observed_track_index = self._to_optional_int(verified.get('track_index'))
+                pct_delta = abs((observed_pct or 0.0) - float(percentage))
+                position_required = position_ms > 0
+                position_verifiable = observed_position_ms is not None
+                ts_delta_ms = (
+                    abs(int(observed_position_ms) - int(position_ms))
+                    if position_verifiable
+                    else None
+                )
+                logger.debug(
+                    f"Booklore audiobook verify comparison: book_id={book_id} variant={variant_name} "
+                    f"expected_pct={pct_display:.2f}% observed_pct={(observed_pct or 0.0) * 100:.2f}% "
+                    f"expected_position_ms={position_ms} observed_position_ms={observed_position_ms} "
+                    f"expected_track_index={track_index} observed_track_index={observed_track_index} "
+                    f"pct_delta={pct_delta:.4f} ts_delta_ms={ts_delta_ms} "
+                    f"position_verifiable={position_verifiable} position_required={position_required}"
+                )
+                if pct_delta > 0.01:
+                    last_status = f"verify_mismatch:{(observed_pct or 0.0) * 100:.2f}%"
+                    break
+                if position_required and not position_verifiable:
+                    last_status = "verify_missing_position"
+                    break
+                if position_verifiable and ts_delta_ms is not None and ts_delta_ms > 5000:
+                    last_status = f"verify_position_mismatch:{observed_position_ms}"
+                    break
+                if track_index is not None and observed_track_index != track_index:
+                    last_status = f"verify_track_mismatch:{observed_track_index}"
+                    break
+            elif position_ms > 0:
+                last_status = "verify_unavailable"
+                break
+            with self._cache_lock:
+                cached = self._book_id_cache.get(book_id)
+                if cached is not None:
+                    cached['audiobookProgress'] = dict(progress_payload)
+            return True
+
+        logger.error(f"❌ Booklore audiobook update failed: {last_status}")
+        return False
+
     def update_progress(self, ebook_filename, percentage, rich_locator: Optional[LocatorResult] = None):
         book = self.find_book_by_filename(ebook_filename)
         if not book:
             logger.debug(f"Booklore: Book not found: {ebook_filename}")
             return False
 
+        safe_filename = sanitize_log_data(ebook_filename)
         book_id = book['id']
-        book_type = (book.get('bookType') or '').upper()
+        if book.get('_needs_detail') or not self._get_book_type(book):
+            hydrated = self._fetch_and_cache_detail(book_id)
+            if hydrated:
+                book = hydrated
+            elif book.get('_needs_detail'):
+                logger.debug(f"Booklore: Could not hydrate lightweight entry for {safe_filename}")
+        book_type = self._get_book_type(book)
         pct_display = percentage * 100
 
         clear_reset = book_type == 'EPUB' and percentage <= 0
         cfi = rich_locator.cfi if rich_locator and rich_locator.cfi else None
+        href = rich_locator.href if rich_locator and rich_locator.href else None
+        primary_file = book.get('primaryFile') or {}
+        book_file_id = primary_file.get('id')
 
         payload_variants = []
-        if book_type == 'EPUB':
-            base_payload = {"bookId": book_id, "epubProgress": {"percentage": pct_display}}
-            if clear_reset:
-                # Booklore variants differ by version/build. Try common clear forms.
-                payload_variants = [
-                    ("null_cfi", {"bookId": book_id, "epubProgress": {"percentage": pct_display, "cfi": None}}),
-                    ("no_cfi", base_payload),
-                ]
-            else:
-                if cfi is not None:
-                    logger.debug(f"Booklore: Setting CFI: {cfi}")
+        if book_type in ('EPUB', 'PDF', 'CBX') and book_file_id is not None:
+            file_progress = {
+                "bookFileId": self._to_optional_int(book_file_id) or book_file_id,
+                "progressPercent": pct_display,
+            }
+            if cfi:
+                file_progress["positionData"] = cfi
+            if href:
+                file_progress["positionHref"] = href
+            payload_variants.append(("fileProgress", {"bookId": book_id, "fileProgress": file_progress}))
+
+        if not payload_variants:
+            if book_type == 'EPUB':
+                base_payload = {"bookId": book_id, "epubProgress": {"percentage": pct_display}}
+                if clear_reset:
                     payload_variants = [
-                        ("with_cfi", {"bookId": book_id, "epubProgress": {"percentage": pct_display, "cfi": cfi}}),
+                        ("null_cfi", {"bookId": book_id, "epubProgress": {"percentage": pct_display, "cfi": None}}),
                         ("no_cfi", base_payload),
                     ]
+                elif cfi is not None:
+                    cfi_write_disabled = str(book_id) in self._epub_cfi_write_disabled_for_books
+                    if cfi_write_disabled:
+                        logger.debug(
+                            "Booklore: skipping with_cfi variant for file=%s book_id=%s due to prior verified incompatibility",
+                            safe_filename,
+                            book_id,
+                        )
+                        payload_variants = [("no_cfi", base_payload)]
+                    else:
+                        logger.debug(f"Booklore: Setting CFI: {cfi}")
+                        payload_variants = [
+                            ("with_cfi", {"bookId": book_id, "epubProgress": {"percentage": pct_display, "cfi": cfi}}),
+                            ("no_cfi", base_payload),
+                        ]
                 else:
                     payload_variants = [("standard", base_payload)]
-        elif book_type == 'PDF':
-            payload_variants = [("standard", {"bookId": book_id, "pdfProgress": {"page": 1, "percentage": pct_display}})]
-        elif book_type == 'CBX':
-            payload_variants = [("standard", {"bookId": book_id, "cbxProgress": {"page": 1, "percentage": pct_display}})]
-        else:
-            logger.warning(f"Booklore: Unknown book type {book_type} for {sanitize_log_data(ebook_filename)}")
-            return False
+            elif book_type == 'PDF':
+                payload_variants = [("standard", {"bookId": book_id, "pdfProgress": {"page": 1, "percentage": pct_display}})]
+            elif book_type == 'CBX':
+                payload_variants = [("standard", {"bookId": book_id, "cbxProgress": {"page": 1, "percentage": pct_display}})]
+            else:
+                logger.warning(f"Booklore: Unknown book type {book_type} for {safe_filename}")
+                return False
+
+        logger.debug(
+            f"Booklore progress write start: file={safe_filename} book_id={book_id} type={book_type} "
+            f"target_pct={pct_display:.2f}% clear_reset={clear_reset} has_locator={bool(rich_locator)} "
+            f"has_cfi={cfi is not None} variants={[name for name, _ in payload_variants]}"
+        )
 
         last_status = "No response"
-        for variant_name, payload in payload_variants:
+        with_cfi_failed = False
+        for variant_idx, (variant_name, payload) in enumerate(payload_variants, start=1):
             if clear_reset:
                 logger.debug(f"Booklore: Clearing CFI for 0% reset (variant={variant_name})")
 
+            progress_payload = payload.get('fileProgress') or payload.get('epubProgress') or payload.get('pdfProgress') or payload.get('cbxProgress') or {}
+            payload_pct = progress_payload.get('progressPercent', progress_payload.get('percentage', 'n/a'))
+            has_payload_cfi = bool(progress_payload.get('positionData') or (isinstance(payload.get('epubProgress'), dict) and 'cfi' in payload.get('epubProgress', {})))
+            logger.debug(
+                f"Booklore progress write attempt {variant_idx}/{len(payload_variants)}: "
+                f"file={safe_filename} book_id={book_id} variant={variant_name} "
+                f"payload_pct={payload_pct} has_position_data={has_payload_cfi}"
+            )
+
             response = self._make_request("POST", "/api/v1/books/progress", payload)
+            logger.debug(
+                f"Booklore progress write response: file={safe_filename} book_id={book_id} "
+                f"variant={variant_name} status={response.status_code if response else 'no_response'}"
+            )
+            if response and response.status_code == 404:
+                self._evict_cached_book(
+                    book_id=book_id,
+                    filename=ebook_filename,
+                    reason="progress update returned 404",
+                )
+                last_status = 404
+                break
             if not response or response.status_code not in [200, 201, 204]:
+                logger.debug(
+                    f"Booklore progress write non-success: file={safe_filename} book_id={book_id} "
+                    f"variant={variant_name} status={response.status_code if response else 'no_response'} "
+                    f"body_preview={self._response_text_preview(response)!r}"
+                )
                 last_status = response.status_code if response else "No response"
                 continue
 
             # Verify EPUB writes to ensure the server actually persisted the target.
             if book_type == 'EPUB':
-                verified_pct, _ = self._get_progress_by_book_id(book_id)
+                verified_pct, verified_cfi = self._get_progress_by_book_id(book_id)
+                if verified_pct is not None:
+                    logger.debug(
+                        f"Booklore progress verify comparison: file={safe_filename} book_id={book_id} "
+                        f"variant={variant_name} expected={pct_display:.2f}% observed={verified_pct * 100:.2f}% "
+                        f"delta={abs(verified_pct - percentage) * 100:.2f}% clear_reset={clear_reset} "
+                        f"verified_has_cfi={bool(verified_cfi)}"
+                    )
+                else:
+                    logger.debug(
+                        f"Booklore progress verify unavailable: file={safe_filename} book_id={book_id} "
+                        f"variant={variant_name} expected={pct_display:.2f}%"
+                    )
                 if clear_reset:
                     if verified_pct is not None and verified_pct > 0.001:
                         logger.warning(
-                            f"Booklore clear did not persist for {sanitize_log_data(ebook_filename)} "
+                            f"Booklore clear did not persist for {safe_filename} "
                             f"(variant={variant_name}, observed={verified_pct * 100:.2f}%). Retrying..."
                         )
                         last_status = f"verify_failed:{verified_pct * 100:.2f}%"
                         continue
                 elif verified_pct is not None:
                     if abs(verified_pct - percentage) > 0.005:
+                        if variant_name == "with_cfi":
+                            with_cfi_failed = True
                         logger.warning(
-                            f"Booklore progress write mismatch for {sanitize_log_data(ebook_filename)} "
+                            f"Booklore progress write mismatch for {safe_filename} "
                             f"(variant={variant_name}, expected={pct_display:.2f}%, observed={verified_pct * 100:.2f}%). Retrying..."
                         )
                         last_status = f"verify_mismatch:{verified_pct * 100:.2f}%"
                         continue
 
-            logger.info(f"Booklore: {sanitize_log_data(ebook_filename)} -> {pct_display:.1f}%")
+            logger.info(f"Booklore: {safe_filename} -> {pct_display:.1f}%")
 
             # Update cache in-place instead of full library refresh
             try:
-                cached = self._book_id_cache.get(book_id)
-                if cached:
-                    if book_type == 'EPUB':
-                        if not cached.get('epubProgress'):
-                            cached['epubProgress'] = {}
-                        cached['epubProgress']['percentage'] = pct_display
-                        if clear_reset:
-                            cached['epubProgress']['cfi'] = ""
-                        elif 'cfi' in payload.get('epubProgress', {}):
-                            cached['epubProgress']['cfi'] = payload['epubProgress']['cfi']
-                    elif book_type == 'PDF':
-                        if not cached.get('pdfProgress'):
-                            cached['pdfProgress'] = {}
-                        cached['pdfProgress']['percentage'] = pct_display
-                    elif book_type == 'CBX':
-                        if not cached.get('cbxProgress'):
-                            cached['cbxProgress'] = {}
-                        cached['cbxProgress']['percentage'] = pct_display
-                    logger.debug(f"Booklore: Cache updated in-place for book {book_id}")
+                with self._cache_lock:
+                    cached = self._book_id_cache.get(book_id)
+                    if cached:
+                        if book_type == 'EPUB':
+                            if not cached.get('epubProgress'):
+                                cached['epubProgress'] = {}
+                            cached['epubProgress']['percentage'] = pct_display
+                            if clear_reset:
+                                cached['epubProgress']['cfi'] = ""
+                            elif 'cfi' in payload.get('epubProgress', {}):
+                                cached['epubProgress']['cfi'] = payload['epubProgress']['cfi']
+                        elif book_type == 'PDF':
+                            if not cached.get('pdfProgress'):
+                                cached['pdfProgress'] = {}
+                            cached['pdfProgress']['percentage'] = pct_display
+                        elif book_type == 'CBX':
+                            if not cached.get('cbxProgress'):
+                                cached['cbxProgress'] = {}
+                            cached['cbxProgress']['percentage'] = pct_display
+                        logger.debug(f"Booklore: Cache updated in-place for book {book_id}")
             except Exception:
                 logger.debug("Booklore: In-place cache update failed, will refresh on next read")
+            if variant_name == "no_cfi" and with_cfi_failed and cfi is not None and not clear_reset:
+                self._epub_cfi_write_disabled_for_books.add(str(book_id))
+                logger.info(
+                    "Booklore: disabling with_cfi retries for book_id=%s after verified no_cfi fallback success",
+                    book_id,
+                )
             return True
 
+        logger.debug(
+            f"Booklore progress write exhausted variants: file={safe_filename} book_id={book_id} "
+            f"type={book_type} target_pct={pct_display:.2f}% last_status={last_status}"
+        )
         logger.error(f"Booklore update failed: {last_status}")
         return False
 
     def get_recent_activity(self, min_progress=0.01):
-        if not self._book_cache and not self._is_refresh_on_cooldown(): self._refresh_book_cache()
+        if not self._has_cached_books() and not self._is_refresh_on_cooldown(): self._refresh_book_cache()
         results = []
-        for filename, book in list(self._book_cache.items()):
+        for filename, book in self._snapshot_book_cache_items():
             progress = 0
             if book.get('epubProgress'):
                 progress = (book['epubProgress'].get('percentage') or 0) / 100.0
@@ -842,8 +2042,10 @@ class BookloreClient:
                 logger.error("❌ Failed to get Booklore shelves")
                 return False
 
-            shelves = shelves_response.json()
-            target_shelf = next((s for s in shelves if s.get('name') == shelf_name), None)
+            shelves = self._parse_json_response(shelves_response, "Booklore shelves list")
+            if not isinstance(shelves, list):
+                return False
+            target_shelf = next((s for s in shelves if isinstance(s, dict) and s.get('name') == shelf_name), None)
 
             if not target_shelf:
                 # Create shelf
@@ -855,12 +2057,18 @@ class BookloreClient:
                 if not create_response or create_response.status_code != 201:
                     logger.error(f"❌ Failed to create Booklore shelf: {shelf_name}")
                     return False
-                target_shelf = create_response.json()
+                target_shelf = self._parse_json_response(create_response, f"Booklore create shelf {shelf_name}")
+                if not isinstance(target_shelf, dict):
+                    return False
+            shelf_id = target_shelf.get('id') if isinstance(target_shelf, dict) else None
+            if not shelf_id:
+                logger.error(f"âŒ Failed to resolve Booklore shelf id for '{shelf_name}'")
+                return False
 
             # Assign book to shelf
             assign_response = self._make_request("POST", "/api/v1/books/shelves", {
                 "bookIds": [book['id']],
-                "shelvesToAssign": [target_shelf['id']],
+                "shelvesToAssign": [shelf_id],
                 "shelvesToUnassign": []
             })
 
@@ -868,6 +2076,12 @@ class BookloreClient:
                 logger.info(f"🏷️ Added '{sanitize_log_data(ebook_filename)}' to Booklore Shelf: {shelf_name}")
                 return True
             else:
+                if assign_response and assign_response.status_code == 404:
+                    self._evict_cached_book(
+                        book_id=book.get('id'),
+                        filename=ebook_filename,
+                        reason="shelf assignment returned 404",
+                    )
                 logger.error(f"❌ Failed to assign book to shelf. Status: {assign_response.status_code if assign_response else 'No response'}")
                 return False
 
@@ -893,24 +2107,36 @@ class BookloreClient:
                 logger.error("❌ Failed to get Booklore shelves")
                 return False
 
-            shelves = shelves_response.json()
-            target_shelf = next((s for s in shelves if s.get('name') == shelf_name), None)
+            shelves = self._parse_json_response(shelves_response, "Booklore shelves list")
+            if not isinstance(shelves, list):
+                return False
+            target_shelf = next((s for s in shelves if isinstance(s, dict) and s.get('name') == shelf_name), None)
 
             if not target_shelf:
                 logger.warning(f"⚠️ Shelf '{shelf_name}' not found")
+                return False
+            shelf_id = target_shelf.get('id') if isinstance(target_shelf, dict) else None
+            if not shelf_id:
+                logger.error(f"âŒ Failed to resolve Booklore shelf id for '{shelf_name}'")
                 return False
 
             # Remove from shelf
             assign_response = self._make_request("POST", "/api/v1/books/shelves", {
                 "bookIds": [book['id']],
                 "shelvesToAssign": [],
-                "shelvesToUnassign": [target_shelf['id']]
+                "shelvesToUnassign": [shelf_id]
             })
 
             if assign_response and assign_response.status_code in [200, 201, 204]:
                 logger.info(f"🗑️ Removed '{sanitize_log_data(ebook_filename)}' from Booklore Shelf: {shelf_name}")
                 return True
             else:
+                if assign_response and assign_response.status_code == 404:
+                    self._evict_cached_book(
+                        book_id=book.get('id'),
+                        filename=ebook_filename,
+                        reason="shelf removal returned 404",
+                    )
                 logger.error(f"❌ Failed to remove book from shelf. Status: {assign_response.status_code if assign_response else 'No response'}")
                 return False
 

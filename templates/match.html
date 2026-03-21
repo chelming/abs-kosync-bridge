@@ -605,6 +605,94 @@
             background: rgba(156, 39, 176, 0.2);
             color: #ce93d8;
         }
+
+        .source-badge.transcript {
+            background: rgba(167, 139, 250, 0.2);
+            color: #a78bfa;
+        }
+
+        .modal-overlay {
+            position: fixed;
+            inset: 0;
+            display: none;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+            background: rgba(0, 0, 0, 0.72);
+            z-index: 1000;
+        }
+
+        .modal-overlay.open {
+            display: flex;
+        }
+
+        .modal-card {
+            width: min(560px, 100%);
+            background: #101010;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 16px;
+            padding: 24px;
+            box-shadow: 0 24px 80px rgba(0, 0, 0, 0.45);
+        }
+
+        .modal-card h3 {
+            font-size: 22px;
+            margin-bottom: 10px;
+        }
+
+        .modal-card p {
+            color: rgba(255, 255, 255, 0.68);
+            line-height: 1.5;
+            margin-bottom: 18px;
+        }
+
+        .modal-options {
+            display: grid;
+            gap: 12px;
+        }
+
+        .modal-option {
+            width: 100%;
+            text-align: left;
+            padding: 16px 18px;
+            border-radius: 12px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            background: rgba(255, 255, 255, 0.04);
+            color: #ffffff;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+
+        .modal-option:hover {
+            border-color: rgba(102, 126, 234, 0.45);
+            background: rgba(102, 126, 234, 0.12);
+            transform: translateY(-1px);
+        }
+
+        .modal-option strong {
+            display: block;
+            font-size: 15px;
+            margin-bottom: 6px;
+        }
+
+        .modal-option span {
+            display: block;
+            font-size: 13px;
+            color: rgba(255, 255, 255, 0.62);
+            line-height: 1.45;
+        }
+
+        .modal-actions {
+            display: flex;
+            justify-content: flex-end;
+            margin-top: 16px;
+        }
+
+        .modal-cancel {
+            background: transparent;
+            border: 1px solid rgba(255, 255, 255, 0.12);
+            color: rgba(255, 255, 255, 0.72);
+        }
     </style>
 </head>
 
@@ -638,7 +726,8 @@
                 {% endif %}
 
                 {% if shelfmark_url %}
-                <a href="/shelfmark" class="nav-icon-link" title="Shelfmark Tool">
+                <a href="/shelfmark" class="nav-icon-link" title="Shelfmark Tool" target="_blank"
+                    rel="noopener noreferrer">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round"
                         stroke-linejoin="round">
                         <path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"></path>
@@ -656,6 +745,7 @@
             <a href="/logs" class="btn">📊 Logs</a>
             <a href="/settings" class="btn">⚙️ Settings</a>
             <a href="/batch-match" class="btn">📋 Batch</a>
+            <a href="/suggestions" class="btn">💡 Suggestions</a>
         </div>
     </div>
 
@@ -680,20 +770,49 @@
             <input type="hidden" name="source_type" id="input_source_type">
             <input type="hidden" name="source_path" id="input_source_path">
             <input type="hidden" name="source_id" id="input_source_id">
+            <input type="hidden" name="audio_source" id="input_audio_source">
+            <input type="hidden" name="audio_source_id" id="input_audio_source_id">
+            <input type="hidden" name="audio_title" id="input_audio_title">
+            <input type="hidden" name="audio_duration" id="input_audio_duration">
+            <input type="hidden" name="audio_provider_book_id" id="input_audio_provider_book_id">
+            <input type="hidden" name="audio_provider_file_id" id="input_audio_provider_file_id">
+            <input type="hidden" name="audio_cover_url" id="input_audio_cover_url">
+            <input type="hidden" name="ebook_source" id="input_ebook_source">
+            <input type="hidden" name="ebook_source_id" id="input_ebook_source_id">
+            <input type="hidden" name="forge_stage_mode" id="input_forge_stage_mode">
 
             <div class="selection-container">
 
                 <!-- GRID COL 1: Audiobook -->
                 <div class="section">
-                    <h3><span class="section-number">1</span>Audiobook (Required)</h3>
+                    <h3><span class="section-number">1</span>Audiobook (Optional)</h3>
                     <div class="scrollable-content">
                         {% if audiobooks %}
                         <div class="media-grid">
                             {% set single_match = audiobooks|length == 1 %}
+                            <!-- None / Skip Option -->
+                            <label class="audiobook-option ab-option ghost-card {% if not single_match %}selected{% endif %}"
+                                onclick="selectItem(this, 'audiobook_id')">
+                                <input type="radio" name="audiobook_id" value="" {% if not single_match %}checked{% endif %}>
+                                <div class="audiobook-cover-container">
+                                    <div class="audiobook-cover-placeholder">⊘</div>
+                                </div>
+                                <div class="audiobook-info">
+                                    <div class="audiobook-title">None / Skip</div>
+                                </div>
+                            </label>
+
                             {% for ab in audiobooks %}
                             <label class="audiobook-option ab-option {% if single_match %}selected{% endif %}"
+                                data-audio-source="{{ ab.source }}"
+                                data-audio-source-id="{{ ab.source_id }}"
+                                data-audio-title="{{ ab.title }}"
+                                data-audio-duration="{{ ab.duration or '' }}"
+                                data-audio-provider-book-id="{{ ab.provider_book_id or ab.source_id }}"
+                                data-audio-provider-file-id="{{ ab.provider_file_id or '' }}"
+                                data-audio-cover-url="{{ ab.cover_url or '' }}"
                                 onclick="selectItem(this, 'audiobook_id')">
-                                <input type="radio" name="audiobook_id" value="{{ ab.id }}" required {% if single_match
+                                <input type="radio" name="audiobook_id" value="{% if ab.source == 'ABS' %}{{ ab.source_id }}{% endif %}" {% if single_match
                                     %}checked{% endif %}>
                                 <div class="audiobook-cover-container">
                                     {% if ab.cover_url %}
@@ -705,7 +824,8 @@
                                     {% endif %}
                                 </div>
                                 <div class="audiobook-info">
-                                    <div class="audiobook-title">{{ get_title(ab) }}</div>
+                                    <div class="audiobook-title">{{ ab.title }}</div>
+                                    <span class="source-badge {{ ab.source.lower().replace(' ', '') }}">{{ ab.source }}</span>
                                 </div>
                             </label>
                             {% endfor %}
@@ -749,6 +869,9 @@
                                 </div>
                                 {% if st.authors %}
                                 <div class="resource-subtitle">{{ st.authors|join(', ') }}</div>
+                                {% endif %}
+                                {% if st.has_transcript %}
+                                <span class="source-badge transcript">Transcript</span>
                                 {% endif %}
                             </label>
                             {% endfor %}
@@ -815,13 +938,55 @@
                     🔨 Forge & Match
                 </button>
                 <div id="validationMsg" style="margin-top: 10px; color: #ff6b6b; display: none;">
-                    Please select an Audiobook and a Text Source (Storyteller or Ebook)
+                    Please select a Text Source (Storyteller or Ebook)
                 </div>
             </div>
         </form>
     </div>
 
+    <div class="modal-overlay" id="forgeStageModal" aria-hidden="true">
+        <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="forgeStageTitle">
+            <h3 id="forgeStageTitle">Forge staging mode</h3>
+            <p>Choose what happens to the staged source files after Storyteller finishes processing.</p>
+            <div class="modal-options">
+                <button type="button" class="modal-option" onclick="chooseForgeStageMode('cleanup')">
+                    <strong>Delete staged sources</strong>
+                    <span>Default. Copy files into Storyteller, then remove the staged audio and EPUB after processing completes.</span>
+                </button>
+                <button type="button" class="modal-option" onclick="chooseForgeStageMode('hardlink')">
+                    <strong>Keep staged files / hardlink local</strong>
+                    <span>Use hardlinks for local files when possible and skip staged-source cleanup. Remote downloads still fall back to copied files.</span>
+                </button>
+            </div>
+            <div class="modal-actions">
+                <button type="button" class="btn modal-cancel" onclick="closeForgeStageModal()">Cancel</button>
+            </div>
+        </div>
+    </div>
+
     <script>
+        let pendingForgeStageSelection = null;
+        let allowForgeSubmit = false;
+
+        function openForgeStageModal(onSelect) {
+            pendingForgeStageSelection = onSelect;
+            document.getElementById('forgeStageModal').classList.add('open');
+            document.getElementById('input_forge_stage_mode').value = '';
+        }
+
+        function closeForgeStageModal() {
+            pendingForgeStageSelection = null;
+            document.getElementById('forgeStageModal').classList.remove('open');
+        }
+
+        function chooseForgeStageMode(mode) {
+            const callback = pendingForgeStageSelection;
+            closeForgeStageModal();
+            if (callback) {
+                callback(mode);
+            }
+        }
+
         function selectItem(element, groupName) {
             // Remove selected class from all options in this group
             let wrapperClass = '';
@@ -841,11 +1006,23 @@
             const radio = element.querySelector('input[type="radio"]');
             if (radio) radio.checked = true;
 
+            if (groupName === 'audiobook_id') {
+                document.getElementById('input_audio_source').value = element.dataset.audioSource || '';
+                document.getElementById('input_audio_source_id').value = element.dataset.audioSourceId || '';
+                document.getElementById('input_audio_title').value = element.dataset.audioTitle || '';
+                document.getElementById('input_audio_duration').value = element.dataset.audioDuration || '';
+                document.getElementById('input_audio_provider_book_id').value = element.dataset.audioProviderBookId || '';
+                document.getElementById('input_audio_provider_file_id').value = element.dataset.audioProviderFileId || '';
+                document.getElementById('input_audio_cover_url').value = element.dataset.audioCoverUrl || '';
+            }
+
             // If ebook option, populate hidden inputs for Forge
             if (groupName === 'ebook_filename') {
                 document.getElementById('input_source_type').value = element.dataset.sourceType || '';
                 document.getElementById('input_source_path').value = element.dataset.sourcePath || '';
                 document.getElementById('input_source_id').value = element.dataset.sourceId || '';
+                document.getElementById('input_ebook_source').value = element.dataset.sourceType || '';
+                document.getElementById('input_ebook_source_id').value = element.dataset.sourceId || '';
             }
 
             validateForm();
@@ -855,11 +1032,12 @@
             const ab = document.querySelector('input[name="audiobook_id"]:checked');
             const st = document.querySelector('input[name="storyteller_uuid"]:checked');
             const eb = document.querySelector('input[name="ebook_filename"]:checked');
+            const audioSource = document.getElementById('input_audio_source').value;
 
             const btn = document.getElementById('submitBtn');
             const msg = document.getElementById('validationMsg');
 
-            let hasAudio = !!ab;
+            let hasAudio = !!audioSource;
             // Valid text source if: 
             // 1. Storyteller UUID is selected AND NOT EMPTY
             // 2. OR Ebook Filename is selected
@@ -868,26 +1046,21 @@
 
             let hasText = (stVal !== "") || (ebVal !== "");
 
-            if (hasAudio && hasText) {
+            if (hasText) {
                 btn.disabled = false;
                 btn.style.opacity = "1";
                 msg.style.display = "none";
             } else {
                 btn.disabled = true;
                 btn.style.opacity = "0.5";
-                if (hasAudio && !hasText) {
-                    msg.textContent = "Please select a text source (Storyteller or Standard Ebook)";
-                    msg.style.display = "block";
-                } else if (!hasAudio) {
-                    msg.textContent = "Please select an Audiobook";
-                    msg.style.display = "block";
-                }
+                msg.textContent = "Please select a text source (Storyteller or Standard Ebook)";
+                msg.style.display = "block";
             }
 
             // Forge Validation
             const forgeBtn = document.getElementById('forgeBtn');
             // Forge requires Audio + Standard Ebook (NOT Storyteller)
-            if (hasAudio && (ebVal !== "")) {
+            if (hasAudio && (audioSource === 'ABS' || audioSource === 'BookLore') && (ebVal !== "")) {
                 forgeBtn.disabled = false;
                 forgeBtn.style.opacity = "1";
             } else {
@@ -898,6 +1071,42 @@
 
         // Initial check and setup
         document.addEventListener('DOMContentLoaded', () => {
+            const mappingForm = document.getElementById('mappingForm');
+            const forgeBtn = document.getElementById('forgeBtn');
+            const forgeStageModal = document.getElementById('forgeStageModal');
+
+            forgeStageModal.addEventListener('click', (event) => {
+                if (event.target === forgeStageModal) {
+                    closeForgeStageModal();
+                }
+            });
+
+            document.addEventListener('keydown', (event) => {
+                if (event.key === 'Escape' && forgeStageModal.classList.contains('open')) {
+                    closeForgeStageModal();
+                }
+            });
+
+            mappingForm.addEventListener('submit', (event) => {
+                if (event.submitter !== forgeBtn || allowForgeSubmit || forgeBtn.disabled) {
+                    return;
+                }
+
+                event.preventDefault();
+                openForgeStageModal((mode) => {
+                    document.getElementById('input_forge_stage_mode').value = mode;
+                    allowForgeSubmit = true;
+                    mappingForm.requestSubmit(forgeBtn);
+                });
+            });
+
+            const initialAb = document.querySelector('input[name="audiobook_id"]:checked');
+            if (initialAb) {
+                const label = initialAb.closest('.ab-option');
+                if (label) {
+                    selectItem(label, 'audiobook_id');
+                }
+            }
             const initialEb = document.querySelector('input[name="ebook_filename"]:checked');
             if (initialEb) {
                 const label = initialEb.closest('.eb-option');

@@ -6,6 +6,7 @@ import logging
 import requests
 from typing import Optional, Dict, Tuple
 from pathlib import Path
+from urllib.parse import unquote
 
 from src.utils.logging_utils import sanitize_log_data
 from src.sync_clients.sync_client_interface import LocatorResult
@@ -149,31 +150,155 @@ class StorytellerAPIClient:
                 return book_info
         return None
 
-    def get_position_details(self, book_uuid: str) -> Tuple[Optional[float], Optional[int], Optional[str], Optional[str]]:
-        """
-        Returns: (percentage, timestamp, href, fragment_id)
-        """
+    def _find_book_by_uuid(self, book_uuid: str) -> Optional[Dict]:
+        """Find a Storyteller book entry by UUID."""
+        if not book_uuid:
+            return None
+
+        response = self._make_request("GET", "/api/v2/books")
+        if not response or response.status_code != 200:
+            return None
+
+        for book in response.json():
+            candidate_uuid = book.get("uuid") or book.get("id")
+            if candidate_uuid == book_uuid:
+                return book
+
+        return None
+
+    def get_book_title_by_uuid(self, book_uuid: str) -> Optional[str]:
+        """Get Storyteller's internal title for a book by UUID."""
+        if not book_uuid:
+            return None
+
+        book = self._find_book_by_uuid(book_uuid)
+        if not book:
+            return None
+        return book.get("title")
+
+    def get_position_details_payload(self, book_uuid: str) -> Optional[dict]:
         response = self._make_request("GET", f"/api/v2/books/{book_uuid}/positions")
         if response and response.status_code == 200:
             data = response.json()
             locator = data.get('locator', {})
             locations = locator.get('locations', {})
+            chapter_progression = locations.get("progression")
+            if chapter_progression is not None:
+                try:
+                    chapter_progression = float(chapter_progression)
+                except (TypeError, ValueError):
+                    chapter_progression = None
+            fragments = locations.get("fragments")
+            if not isinstance(fragments, list):
+                fragments = []
+            position = locations.get("position")
+            try:
+                if position is not None:
+                    position = int(position)
+            except (TypeError, ValueError):
+                position = None
 
-            pct = float(locations.get('totalProgression', 0))
-            ts = int(data.get('timestamp', 0))
+            return {
+                "pct": float(locations.get('totalProgression', 0)),
+                "ts": int(data.get('timestamp', 0)),
+                "href": locator.get('href'),
+                "type": locator.get("type"),
+                "frag": fragments[0] if fragments else None,
+                "fragment": fragments[0] if fragments else None,
+                "fragments": fragments,
+                "chapter_progress": chapter_progression,
+                "position": position,
+                "match_index": position,
+                "cfi": locations.get("cfi"),
+                "css_selector": locations.get("cssSelector"),
+            }
 
-            # --- EXTRACT PRECISION DATA ---
-            href = locator.get('href') # e.g. "OEBPS/Text/part0000.html"
-            fragment = None
-            if locations.get('fragments') and len(locations['fragments']) > 0:
-                fragment = locations['fragments'][0] # e.g. "id628-sentence94"
+        return None
 
-            return pct, ts, href, fragment
+    def get_position_details_rich(
+        self, book_uuid: str
+    ) -> Tuple[Optional[float], Optional[int], Optional[str], Optional[str], Optional[float]]:
+        """
+        Returns: (percentage, timestamp, href, fragment_id, chapter_progression)
+        """
+        payload = self.get_position_details_payload(book_uuid)
+        if isinstance(payload, dict):
+            return (
+                payload.get("pct"),
+                payload.get("ts"),
+                payload.get("href"),
+                payload.get("fragment"),
+                payload.get("chapter_progress"),
+            )
 
-        return None, None, None, None
+        return None, None, None, None, None
+
+    def get_position_details(self, book_uuid: str) -> Tuple[Optional[float], Optional[int], Optional[str], Optional[str]]:
+        """
+        Returns: (percentage, timestamp, href, fragment_id)
+        """
+        pct, ts, href, fragment, _chapter_progress = self.get_position_details_rich(book_uuid)
+        return pct, ts, href, fragment
+
+    def get_readium_positions(self, book_uuid: str) -> list:
+        """Return Readium positions array for a book, or [] on failure."""
+        response = self._make_request("GET", f"/api/v2/books/{book_uuid}/read/~readium/positions.json")
+        if not response or response.status_code != 200:
+            return []
+        try:
+            data = response.json()
+        except Exception:
+            return []
+
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            positions = data.get("positions")
+            if isinstance(positions, list):
+                return positions
+        return []
+
+    def resolve_exact_position(self, book_uuid: str, href: str, chapter_progress: float) -> Optional[int]:
+        """Resolve the nearest Readium position index for a locator href + progression."""
+        try:
+            target_progress = float(chapter_progress)
+        except (TypeError, ValueError):
+            return None
+
+        target_href = unquote(href)
+        matches = []
+        for entry in self.get_readium_positions(book_uuid):
+            if not isinstance(entry, dict):
+                continue
+
+            entry_href = entry.get("href")
+            if not isinstance(entry_href, str):
+                continue
+            if unquote(entry_href) != target_href:
+                continue
+
+            locations = entry.get("locations")
+            if not isinstance(locations, dict):
+                continue
+
+            progression = locations.get("progression")
+            position = locations.get("position")
+            try:
+                progression = float(progression)
+                position = int(position)
+            except (TypeError, ValueError):
+                continue
+
+            matches.append((abs(progression - target_progress), position))
+
+        if not matches:
+            return None
+
+        matches.sort(key=lambda item: (item[0], item[1]))
+        return matches[0][1]
 
     def get_all_positions_bulk(self) -> dict:
-        """Fetch all book positions in one pass. Returns {title_lower: {pct, ts, href, frag, uuid}}"""
+        """Fetch all book positions in one pass. Returns {title_lower: {pct, ts, href, frag, chapter_progress, uuid}}"""
         if not self._book_cache:
             self._refresh_book_cache()
         
@@ -182,71 +307,154 @@ class StorytellerAPIClient:
             uuid = book.get('uuid')
             if not uuid:
                 continue
-            pct, ts, href, frag = self.get_position_details(uuid)
-            if pct is not None:
+            payload = self.get_position_details_payload(uuid)
+            if isinstance(payload, dict):
                 positions[title.lower()] = {
-                    'pct': pct, 'ts': ts, 'href': href, 'frag': frag, 'uuid': uuid
+                    'pct': payload.get('pct'),
+                    'ts': payload.get('ts'),
+                    'href': payload.get('href'),
+                    'frag': payload.get('fragment'),
+                    'fragment': payload.get('fragment'),
+                    'fragments': payload.get('fragments'),
+                    'chapter_progress': payload.get('chapter_progress'),
+                    'css_selector': payload.get('css_selector'),
+                    'position': payload.get('position'),
+                    'cfi': payload.get('cfi'),
+                    'uuid': uuid,
                 }
         return positions
 
-    def update_position(self, book_uuid: str, percentage: float, rich_locator: LocatorResult = None) -> bool:
-        new_ts = int(time.time() * 1000)
-        
-        # Base Payload with UUID (critical)
-        payload = {
-            "uuid": book_uuid,
-            "timestamp": new_ts,
-            "locator": {
-                "href": "",
-                "type": "application/xhtml+xml",
-                "locations": {
-                    "totalProgression": float(percentage)
-                }
-            }
+    @staticmethod
+    def _normalize_storyteller_href(href: Optional[str]) -> str:
+        if not isinstance(href, str):
+            return ""
+        return unquote(href)
+
+    @staticmethod
+    def _normalize_storyteller_fragments(rich_locator: Optional[LocatorResult]) -> Optional[list]:
+        if not rich_locator:
+            return None
+
+        if isinstance(rich_locator.fragments, list):
+            cleaned = [fragment for fragment in rich_locator.fragments if isinstance(fragment, str) and fragment]
+            if cleaned:
+                return cleaned
+
+        if isinstance(rich_locator.fragment, str) and rich_locator.fragment:
+            return [rich_locator.fragment]
+
+        return None
+
+    @staticmethod
+    def _normalize_locator_compare_value(value):
+        if value in ("", [], (), {}):
+            return None
+        return value
+
+    def _build_position_payload(
+        self,
+        book_uuid: str,
+        percentage: float,
+        rich_locator: Optional[LocatorResult],
+        previous_payload: Optional[dict] = None,
+    ) -> dict:
+        locator = {
+            "href": "",
+            "type": "application/xhtml+xml",
+            "locations": {
+                "totalProgression": float(percentage),
+            },
         }
 
+        if previous_payload:
+            previous_href = self._normalize_storyteller_href(previous_payload.get("href"))
+            if previous_href:
+                locator["href"] = previous_href
+            previous_type = previous_payload.get("type")
+            if isinstance(previous_type, str) and previous_type:
+                locator["type"] = previous_type
+
         if rich_locator:
-            # 1. Href
-            if rich_locator.href:
-                payload['locator']['href'] = rich_locator.href
-
-            # 2. CSS Selector
+            href = self._normalize_storyteller_href(rich_locator.href)
+            if href:
+                locator["href"] = href
             if rich_locator.css_selector:
-                payload['locator']['locations']['cssSelector'] = rich_locator.css_selector
-                
-            # 3. Fragments (List)
-            if rich_locator.fragment:
-                payload['locator']['locations']['fragments'] = [rich_locator.fragment]
-            elif rich_locator.fragments: # Check if list already populated (future proof)
-                payload['locator']['locations']['fragments'] = rich_locator.fragments
-                
-            # 4. Chapter Progress (Critical for Storyteller)
+                locator["locations"]["cssSelector"] = rich_locator.css_selector
+            fragments = self._normalize_storyteller_fragments(rich_locator)
+            if fragments:
+                locator["locations"]["fragments"] = fragments
             if rich_locator.chapter_progress is not None:
-                payload['locator']['locations']['progression'] = rich_locator.chapter_progress
-            else:
-                 # Fallback: if we don't have chapter progress, maybe default to 0 or omit?
-                 # Storyteller logs show it as distinct. 
-                 # If we omit, it might calculate it? 
-                 # For now, let's leave it out if None to avoid sending null.
-                 pass
-
-            # 5. Position (Global Integer)
-            if rich_locator.match_index is not None:
-                payload['locator']['locations']['position'] = rich_locator.match_index
-                
-            # 6. CFI
+                locator["locations"]["progression"] = rich_locator.chapter_progress
             if rich_locator.cfi:
-                payload['locator']['locations']['cfi'] = rich_locator.cfi
+                locator["locations"]["cfi"] = rich_locator.cfi
 
-        else:
-            # Fallback for simple percentage update (legacy)
+        return {
+            "uuid": book_uuid,
+            "timestamp": int(time.time() * 1000),
+            "locator": locator,
+        }
+
+    def _summarize_locator_payload(self, payload: dict) -> dict:
+        locator = payload.get("locator", {}) if isinstance(payload, dict) else {}
+        locations = locator.get("locations", {}) if isinstance(locator, dict) else {}
+        fragments = locations.get("fragments") if isinstance(locations.get("fragments"), list) else None
+        return {
+            "href": self._normalize_storyteller_href(locator.get("href")),
+            "type": locator.get("type"),
+            "fragments": fragments,
+            "chapter_progress": locations.get("progression"),
+            "total_progression": locations.get("totalProgression"),
+            "position": locations.get("position"),
+            "cfi": locations.get("cfi"),
+            "css_selector": locations.get("cssSelector"),
+        }
+
+    def _log_locator_diff(self, book_uuid: str, previous_payload: Optional[dict], outgoing_payload: dict) -> None:
+        if not logger.isEnabledFor(logging.DEBUG):
+            return
+
+        before = previous_payload or {}
+        after = self._summarize_locator_payload(outgoing_payload)
+        changes = {}
+        for key, next_value in after.items():
+            prev_value = before.get(key)
+            if self._normalize_locator_compare_value(prev_value) == self._normalize_locator_compare_value(next_value):
+                continue
+            changes[key] = {"from": prev_value, "to": next_value}
+
+        if changes:
+            logger.debug(
+                "Storyteller locator diff: book_uuid=%s changes=%s",
+                book_uuid[:8],
+                sanitize_log_data(changes),
+            )
+
+    def update_position(self, book_uuid: str, percentage: float, rich_locator: LocatorResult = None) -> bool:
+        previous_payload = None
+        if not rich_locator or logger.isEnabledFor(logging.DEBUG):
+            previous_payload = self.get_position_details_payload(book_uuid)
+
+        exact_position = None
+        if rich_locator and rich_locator.href and rich_locator.chapter_progress is not None:
             try:
-                r = self._make_request("GET", f"/api/v2/books/{book_uuid}/positions")
-                if r and r.status_code == 200:
-                    old = r.json().get('locator', {})
-                    if old.get('href'): payload['locator']['href'] = old['href']
-                    if old.get('type'): payload['locator']['type'] = old['type']
-            except Exception: pass
+                exact_position = self.resolve_exact_position(
+                    book_uuid, rich_locator.href, rich_locator.chapter_progress
+                )
+            except Exception:
+                exact_position = None
+
+        payload = self._build_position_payload(
+            book_uuid=book_uuid,
+            percentage=percentage,
+            rich_locator=rich_locator,
+            previous_payload=previous_payload,
+        )
+
+        if exact_position is not None:
+            payload["locator"]["locations"]["position"] = exact_position
+
+        new_ts = payload["timestamp"]
+        self._log_locator_diff(book_uuid, previous_payload, payload)
 
         response = self._make_request("POST", f"/api/v2/books/{book_uuid}/positions", payload)
         
@@ -371,6 +579,29 @@ class StorytellerAPIClient:
                 return True
 
         return False
+    def _has_transcript_on_disk(self, title: str, storyteller_uuid: str = None) -> bool:
+        """Check if a Storyteller book has transcription files in the assets directory."""
+        assets_dir_raw = os.environ.get("STORYTELLER_ASSETS_DIR", "").strip()
+        if not assets_dir_raw:
+            return False
+
+        lookup_title = title
+        if storyteller_uuid:
+            storyteller_title = self.get_book_title_by_uuid(storyteller_uuid)
+            if storyteller_title:
+                lookup_title = storyteller_title
+
+        transcriptions_dir = Path(assets_dir_raw) / "assets" / lookup_title / "transcriptions"
+        if transcriptions_dir.is_dir() and any(transcriptions_dir.glob("*.json")):
+            return True
+
+        if lookup_title != title:
+            fallback_dir = Path(assets_dir_raw) / "assets" / title / "transcriptions"
+            if fallback_dir.is_dir() and any(fallback_dir.glob("*.json")):
+                return True
+
+        return False
+
     def search_books(self, query: str) -> list:
         """Search for books in Storyteller."""
         response = self._make_request("GET", "/api/v2/books", None)
@@ -398,11 +629,13 @@ class StorytellerAPIClient:
                     matched = overlap >= min(len(query_set), len(searchable_tokens)) * 0.5
 
                 if matched:
+                    book_uuid = book.get('uuid') or book.get('id')
                     results.append({
-                        'uuid': book.get('uuid') or book.get('id'),
+                        'uuid': book_uuid,
                         'title': title,
                         'authors': [a.get('name') for a in book.get('authors', [])],
-                        'cover_url': f"/api/v2/books/{book.get('uuid') or book.get('id')}/cover"
+                        'cover_url': f"/api/v2/books/{book_uuid}/cover",
+                        'has_transcript': self._has_transcript_on_disk(title, book_uuid),
                     })
             return results
         return []
@@ -481,6 +714,9 @@ class StorytellerAPIClient:
         except Exception as e:
             log_fn = logger.debug if polling else logger.warning
             log_fn(f"⚠️ API download raised exception: {e}")
+
+        if polling:
+            return False
 
         # Fallback: Local File Copy
         try:

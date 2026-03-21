@@ -25,10 +25,13 @@ from src.services.alignment_service import AlignmentService # [NEW]
 from src.services.library_service import LibraryService # [NEW]
 from src.services.migration_service import MigrationService # [NEW]
 from src.services.forge_service import ForgeService
+from src.services.koreader_device_sync_service import KOReaderDeviceSyncService
+from src.services.audio_source_adapters import ABSAudioSourceAdapter, BookLoreAudioSourceAdapter
 from src.sync_clients.abs_sync_client import ABSSyncClient
 from src.sync_clients.kosync_sync_client import KoSyncSyncClient
 from src.sync_clients.storyteller_sync_client import StorytellerSyncClient
 from src.sync_clients.booklore_sync_client import BookloreSyncClient
+from src.sync_clients.booklore_audio_sync_client import BookLoreAudioSyncClient
 from src.sync_clients.abs_ebook_sync_client import ABSEbookSyncClient
 from src.sync_clients.hardcover_sync_client import HardcoverSyncClient
 from src.sync_manager import SyncManager
@@ -86,6 +89,7 @@ class Container(containers.DeclarativeContainer):
         BookloreClient,
         database_service=database_service
     )
+    kavita_client = providers.Object(None)
 
     hardcover_client = providers.Singleton(HardcoverClient)
 
@@ -124,6 +128,17 @@ class Container(containers.DeclarativeContainer):
         cwa_client=cwa_client,
         abs_client=abs_client,
         epub_cache_dir=epub_cache_dir
+    )
+
+    koreader_device_sync_service = providers.Singleton(
+        KOReaderDeviceSyncService,
+        database_service=database_service,
+        ebook_parser=ebook_parser,
+        abs_client=abs_client,
+        booklore_client=booklore_client,
+        cwa_client=cwa_client,
+        kavita_client=kavita_client,
+        epub_cache_dir=epub_cache_dir,
     )
 
     migration_service = providers.Singleton(
@@ -186,6 +201,13 @@ class Container(containers.DeclarativeContainer):
         ebook_parser
     )
 
+    booklore_audio_sync_client = providers.Singleton(
+        BookLoreAudioSyncClient,
+        booklore_client,
+        ebook_parser,
+        alignment_service=alignment_service,
+    )
+
     abs_ebook_sync_client = providers.Singleton(
         ABSEbookSyncClient,
         abs_client,
@@ -200,6 +222,22 @@ class Container(containers.DeclarativeContainer):
         database_service
     )
 
+    abs_audio_source_adapter = providers.Singleton(
+        ABSAudioSourceAdapter,
+        abs_client=abs_client,
+    )
+
+    booklore_audio_source_adapter = providers.Singleton(
+        BookLoreAudioSourceAdapter,
+        booklore_client=booklore_client,
+        data_dir=data_dir,
+    )
+
+    audio_source_adapters = providers.Dict(
+        ABS=abs_audio_source_adapter,
+        BookLore=booklore_audio_source_adapter,
+    )
+
     # Sync clients dictionary for reuse
     sync_clients = providers.Dict(
         ABS=abs_sync_client,
@@ -207,6 +245,7 @@ class Container(containers.DeclarativeContainer):
         KoSync=kosync_sync_client,
         Storyteller=storyteller_sync_client,
         BookLore=booklore_sync_client,
+        BookLoreAudio=booklore_audio_sync_client,
         Hardcover=hardcover_sync_client
     )
 
@@ -226,6 +265,7 @@ class Container(containers.DeclarativeContainer):
         alignment_service=alignment_service,
         library_service=library_service,
         migration_service=migration_service,
+        audio_source_adapters=audio_source_adapters,
 
         epub_cache_dir=epub_cache_dir,
         data_dir=data_dir,

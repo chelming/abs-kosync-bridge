@@ -5,6 +5,7 @@ Verifies compatibility with kosync-dotnet behavior.
 import unittest
 import time
 from datetime import datetime, timedelta
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 import os
 import shutil
@@ -256,6 +257,120 @@ class TestKosyncEndpoints(unittest.TestCase):
         self.assertEqual(data['device'], 'TestKindle')
         self.assertEqual(data['device_id'], 'KINDLE456')
         self.assertIn('timestamp', data)
+
+    def test_get_progress_returns_502_when_direct_hash_has_pct_but_empty_progress(self):
+        self.client.put(
+            '/syncs/progress',
+            headers=self.auth_headers,
+            json={
+                'document': 'p' * 32,
+                'progress': '   ',
+                'percentage': 0.55,
+                'device': 'TestKindle',
+                'device_id': 'KINDLE456'
+            }
+        )
+
+        response = self.client.get(
+            '/syncs/progress/' + 'p' * 32,
+            headers=self.auth_headers
+        )
+
+        self.assertEqual(response.status_code, 502)
+
+    def test_get_progress_returns_502_when_state_has_pct_but_empty_locator(self):
+        from src import web_server
+
+        book = Book(
+            abs_id='test-empty-state-book',
+            abs_title='Empty State Test Book',
+            kosync_doc_id='q' * 32,
+            ebook_filename='empty_state.epub',
+            status='active',
+            sync_mode='ebook_only'
+        )
+        web_server.database_service.save_book(book)
+        web_server.database_service.save_state(
+            State(
+                abs_id='test-empty-state-book',
+                client_name='storyteller',
+                last_updated=time.time(),
+                percentage=0.4,
+                xpath='',
+                cfi=''
+            )
+        )
+
+        response = self.client.get(
+            '/syncs/progress/' + 'q' * 32,
+            headers=self.auth_headers
+        )
+
+        self.assertEqual(response.status_code, 502)
+
+    def test_device_sync_manifest_requires_auth(self):
+        response = self.client.get('/koreader/device-sync/manifest')
+        self.assertEqual(response.status_code, 401)
+
+    def test_device_sync_manifest_returns_service_payload(self):
+        from src.api import kosync_server
+
+        service = MagicMock()
+        service.build_manifest.return_value = {
+            "generated_at": 1,
+            "revision": "abc",
+            "delete_mode": "mirror",
+            "books": [
+                {
+                    "abs_id": "abs-1",
+                    "title": "Dragon's Justice",
+                    "filename": "Dragon's Justice.epub",
+                    "content_hash": "hash-1",
+                    "download_path": "/koreader/device-sync/books/abs-1/download",
+                    "size": 4,
+                }
+            ],
+        }
+        container = MagicMock()
+        container.koreader_device_sync_service.return_value = service
+
+        with patch.object(kosync_server, '_container', container):
+            response = self.client.get('/koreader/device-sync/manifest', headers=self.auth_headers)
+
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertEqual(data["revision"], "abc")
+        self.assertEqual(data["books"][0]["filename"], "Dragon's Justice.epub")
+
+    def test_device_sync_download_returns_file_attachment(self):
+        from src.api import kosync_server
+
+        download_path = Path(TEST_DIR) / "dragon.epub"
+        download_path.write_bytes(b"epub")
+
+        service = MagicMock()
+        service.resolve_download.return_value = {
+            "path": download_path,
+            "filename": "Dragon's Justice.epub",
+            "content_hash": "hash-1",
+            "mime_type": "application/epub+zip",
+        }
+        container = MagicMock()
+        container.koreader_device_sync_service.return_value = service
+
+        with patch.object(kosync_server, '_container', container):
+            response = self.client.get(
+                '/koreader/device-sync/books/abs-1/download',
+                headers=self.auth_headers,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers.get("ETag"), '"hash-1"')
+        self.assertIn(
+            'attachment; filename="Dragon\'s Justice.epub"',
+            response.headers.get("Content-Disposition", ""),
+        )
+        self.assertEqual(response.data, b"epub")
 
     def test_furthest_wins_rejects_backwards(self):
         """Test that backwards progress is rejected when KOSYNC_FURTHEST_WINS=true."""
@@ -511,6 +626,49 @@ class TestKosyncEndpoints(unittest.TestCase):
         # Clean up
         with web_server.database_service.get_session() as session:
             session.query(Book).filter(Book.abs_id == 'test-filename-book').delete()
+
+    def test_try_find_epub_by_hash_uses_in_memory_booklore_cache_when_db_cache_empty(self):
+        from src.api import kosync_server
+
+        db = MagicMock()
+        db.get_kosync_document.return_value = None
+        db.get_all_booklore_books.return_value = []
+        db.get_kosync_doc_by_booklore_id.return_value = None
+
+        target_hash = 'm' * 32
+        booklore_client = MagicMock()
+        booklore_client.is_configured.return_value = True
+        booklore_client.get_all_books.return_value = [
+            {'id': 'bl-1', 'title': 'Target Book', 'fileName': None, '_needs_detail': True}
+        ]
+        booklore_client._fetch_and_cache_detail.return_value = {
+            'id': 'bl-1',
+            'title': 'Target Book',
+            'fileName': 'target-book.epub',
+        }
+        booklore_client.download_book.return_value = b'epub-bytes'
+
+        ebook_parser = MagicMock()
+        ebook_parser.get_kosync_id_from_bytes.return_value = target_hash
+
+        container = MagicMock()
+        container.booklore_client.return_value = booklore_client
+        container.ebook_parser.return_value = ebook_parser
+        container.data_dir.return_value = Path(TEST_DIR)
+
+        with patch.object(kosync_server, '_database_service', db), \
+             patch.object(kosync_server, '_container', container), \
+             patch.object(kosync_server, '_ebook_dir', None):
+            result = kosync_server._try_find_epub_by_hash(target_hash)
+
+        self.assertEqual(result, 'target-book.epub')
+        booklore_client.get_all_books.assert_called()
+        booklore_client._fetch_and_cache_detail.assert_called_with('bl-1')
+        booklore_client.download_book.assert_called_once_with('bl-1')
+        db.save_kosync_document.assert_called_once()
+        saved_doc = db.save_kosync_document.call_args[0][0]
+        self.assertEqual(saved_doc.filename, 'target-book.epub')
+        self.assertEqual(saved_doc.booklore_id, 'bl-1')
 
 
 if __name__ == '__main__':

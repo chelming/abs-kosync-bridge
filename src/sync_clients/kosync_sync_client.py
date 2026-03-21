@@ -35,12 +35,15 @@ class KoSyncSyncClient(SyncClient):
     def get_service_state(self, book: Book, prev_state: Optional[State], title_snip: str = "", bulk_context: dict = None) -> Optional[ServiceState]:
         ko_id = book.kosync_doc_id
         ko_pct, ko_xpath = self.kosync_client.get_progress(ko_id)
-        if ko_xpath is None:
-            logger.warning(f"⚠️ '{title_snip}' KoSync xpath is None - will use fallback text extraction")
-
+        book_label = f"'{title_snip}' " if title_snip else ""
         if ko_pct is None:
-            logger.warning("⚠️ KoSync percentage is None - returning None for service state")
+            if ko_xpath is None:
+                logger.debug(f"{book_label}KoSync state missing xpath and percentage; returning None")
+            else:
+                logger.debug("KoSync percentage is None - returning None for service state")
             return None
+        if ko_xpath is None:
+            logger.debug(f"{book_label}KoSync xpath is None - using fallback text extraction")
 
         # Get previous KoSync state
         prev_kosync_pct = prev_state.percentage if prev_state else 0
@@ -60,7 +63,7 @@ class KoSyncSyncClient(SyncClient):
     def get_text_from_current_state(self, book: Book, state: ServiceState) -> Optional[str]:
         ko_xpath = state.current.get('xpath')
         ko_pct = state.current.get('pct')
-        epub = getattr(book, "ebook_filename", None)
+        epub = getattr(book, "original_ebook_filename", None) or getattr(book, "ebook_filename", None)
         if ko_xpath and epub:
             txt = self.ebook_parser.resolve_xpath(epub, ko_xpath)
             if txt:
@@ -103,23 +106,26 @@ class KoSyncSyncClient(SyncClient):
 
     def update_progress(self, book: Book, request: UpdateProgressRequest) -> SyncResult:
         pct = request.locator_result.percentage
-        locator = request.locator_result
         ko_id = book.kosync_doc_id if book else None
-        # use perfect_ko_xpath if available
-        xpath = locator.perfect_ko_xpath if locator and locator.perfect_ko_xpath else locator.xpath
-        safe_xpath = self._sanitize_kosync_xpath(xpath, pct)
 
-        if safe_xpath is None and book and book.ebook_filename and pct is not None and pct > 0:
-            regenerated_xpath = self.ebook_parser.get_sentence_level_ko_xpath(book.ebook_filename, pct)
-            safe_xpath = self._sanitize_kosync_xpath(regenerated_xpath, pct)
-            if safe_xpath:
-                logger.info(f"Recovered malformed KoSync XPath using sentence-level fallback for '{book.abs_title}'")
+        epub = (
+            (getattr(book, "original_ebook_filename", None) or getattr(book, "ebook_filename", None))
+            if book
+            else None
+        )
+        # Always use sentence-level XPaths for KOSync.
+        # Character-level offsets don't survive cross-engine rendering differences
+        # between our parser and KOReader's CREngine.
+        safe_xpath = None
+        if epub and pct is not None and pct > 0:
+            sentence_xpath = self.ebook_parser.get_sentence_level_ko_xpath(epub, pct)
+            safe_xpath = self._sanitize_kosync_xpath(sentence_xpath, pct)
 
         if safe_xpath is None and pct is not None and pct <= 0:
             safe_xpath = ""
 
         if safe_xpath is None and pct is not None and pct > 0:
-            logger.warning(f"Skipping KoSync update due to malformed XPath for '{book.abs_title if book else 'unknown'}'")
+            logger.warning(f"Skipping KoSync update due to unresolvable XPath for '{book.abs_title if book else 'unknown'}'")
             return SyncResult(
                 location=pct,
                 success=False,
@@ -132,4 +138,3 @@ class KoSyncSyncClient(SyncClient):
             'xpath': safe_xpath
         }
         return SyncResult(pct, success, updated_state)
-

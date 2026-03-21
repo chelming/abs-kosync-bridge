@@ -1,15 +1,17 @@
 # KoSync Server - Extracted from web_server.py for clean code separation
 # Implements KOSync protocol compatible with kosync-dotnet
 import logging
+import mimetypes
 import os
 import threading
 import time
 from datetime import datetime
 from functools import wraps
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Optional
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify, request, send_file
 
 from src.utils.kosync_headers import hash_kosync_key
 
@@ -42,6 +44,16 @@ def init_kosync_server(database_service, container, manager, ebook_dir=None):
     _container = container
     _manager = manager
     _ebook_dir = ebook_dir
+
+
+def _get_koreader_device_sync_service():
+    if not _container:
+        return None
+    try:
+        return _container.koreader_device_sync_service()
+    except Exception as e:
+        logger.warning(f"KOReader device-sync service unavailable: {e}")
+        return None
 
 
 def _record_kosync_event(abs_id: str, title: str) -> None:
@@ -185,7 +197,7 @@ def kosync_get_progress(doc_id):
       3. Sibling hash resolution (same book, different epub hash)
       4. Background auto-discovery for completely unknown hashes
     """
-    logger.info(f"KOSync: GET progress for doc {doc_id[:8]}... from {request.remote_addr}")
+    logger.info(f"KOSync: GET progress for doc {doc_id} from {request.remote_addr}")
 
     # Step 1: Direct hash lookup
     kosync_doc = _database_service.get_kosync_document(doc_id)
@@ -200,6 +212,13 @@ def kosync_get_progress(doc_id):
 
         has_progress = kosync_doc.percentage and float(kosync_doc.percentage) > 0
         if has_progress:
+            poison_pill = _suppress_empty_progress_response(
+                doc_id,
+                float(kosync_doc.percentage),
+                kosync_doc.progress,
+            )
+            if poison_pill is not None:
+                return poison_pill
             return jsonify({
                 "device": kosync_doc.device or "",
                 "device_id": kosync_doc.device_id or "",
@@ -229,10 +248,10 @@ def kosync_get_progress(doc_id):
         from src.db.models import KosyncDocument as KD
         stub = KD(document_hash=doc_id)
         _database_service.save_kosync_document(stub)
-        logger.info(f"🔍 KOSync: Created stub for unknown hash {doc_id[:8]}..., starting background discovery")
+        logger.info(f"🔍 KOSync: Created stub for unknown hash {doc_id}, starting background discovery")
         threading.Thread(target=_run_get_auto_discovery, args=(doc_id,), daemon=True).start()
 
-    logger.warning(f"⚠️ KOSync: Document not found: {doc_id[:8]}... (GET from {request.remote_addr})")
+    logger.warning(f"⚠️ KOSync: Document not found: {doc_id} (GET from {request.remote_addr})")
     return jsonify({"message": "Document not found on server"}), 502
 
 
@@ -257,7 +276,7 @@ def kosync_put_progress():
         logger.warning(f"KOSync: PUT progress with no document ID from {request.remote_addr}")
         return jsonify({"error": "Missing document ID"}), 400
 
-    logger.info(f"KOSync: PUT progress request for doc {doc_hash[:8]}... from {request.remote_addr} (device: {data.get('device', 'unknown')})")
+    logger.info(f"KOSync: PUT progress request for doc {doc_hash} from {request.remote_addr} (device: {data.get('device', 'unknown')})")
 
     percentage = data.get('percentage', 0)
     progress = data.get('progress', '')
@@ -284,7 +303,7 @@ def kosync_put_progress():
         new_pct = float(percentage)
 
         if new_pct < existing_pct - 0.0001:
-            logger.info(f"KOSync: Ignored progress from '{device}' for doc {doc_hash[:8]}... (server has higher: {existing_pct:.2f}% vs new {new_pct:.2f}%)")
+            logger.info(f"KOSync: Ignored progress from '{device}' for doc {doc_hash} (server has higher: {existing_pct:.2f}% vs new {new_pct:.2f}%)")
             return jsonify({
                 "document": doc_hash,
                 "timestamp": int(kosync_doc.timestamp.timestamp()) if kosync_doc.timestamp else int(now.timestamp())
@@ -299,10 +318,10 @@ def kosync_put_progress():
             device_id=device_id,
             timestamp=now
         )
-        logger.info(f"KOSync: New document tracked: {doc_hash[:8]}... from device '{device}'")
+        logger.info(f"KOSync: New document tracked: {doc_hash} from device '{device}'")
     else:
         logger.info(
-            f"KOSync: Received progress from '{device}' for doc {doc_hash[:8]}... -> "
+            f"KOSync: Received progress from '{device}' for doc {doc_hash} -> "
             f"{float(percentage):.2%} (Updated from {float(kosync_doc.percentage) if kosync_doc.percentage else 0:.2%})"
         )
         kosync_doc.progress = progress
@@ -335,11 +354,11 @@ def kosync_put_progress():
                         from src.db.models import PendingSuggestion
                         import json
                         
-                        logger.info(f"🔍 KOSync: Scheduled auto-discovery for unmapped document {doc_hash_val[:8]}...")
+                        logger.info(f"🔍 KOSync: Scheduled auto-discovery for unmapped document {doc_hash_val}")
                         epub_filename = _try_find_epub_by_hash(doc_hash_val)
 
                         if not epub_filename:
-                            logger.debug(f"Could not auto-match EPUB for KOSync document '{doc_hash_val[:8]}'")
+                            logger.debug(f"Could not auto-match EPUB for KOSync document '{doc_hash_val}'")
                             return
                         
                         title = Path(epub_filename).stem
@@ -478,6 +497,49 @@ def kosync_put_progress():
     }), 200
 
 
+@kosync_sync_bp.route('/device-sync/manifest', methods=['GET'])
+@kosync_sync_bp.route('/koreader/device-sync/manifest', methods=['GET'])
+@kosync_auth_required
+def koreader_device_sync_manifest():
+    """Return the optional KOReader managed-folder sync manifest."""
+    service = _get_koreader_device_sync_service()
+    if not service:
+        return jsonify({"error": "Device sync service unavailable"}), 503
+    return jsonify(service.build_manifest()), 200
+
+
+@kosync_sync_bp.route('/device-sync/books/<path:abs_id>/download', methods=['GET'])
+@kosync_sync_bp.route('/koreader/device-sync/books/<path:abs_id>/download', methods=['GET'])
+@kosync_auth_required
+def koreader_device_sync_download(abs_id):
+    """Download the original ebook for a bridge-managed KOReader sync item."""
+    service = _get_koreader_device_sync_service()
+    if not service:
+        return jsonify({"error": "Device sync service unavailable"}), 503
+
+    resolved = service.resolve_download(abs_id)
+    if not resolved:
+        return jsonify({"error": "Book not available"}), 404
+
+    path = resolved["path"]
+    filename = resolved["filename"]
+    content_hash = resolved["content_hash"]
+    mime_type = resolved.get("mime_type") or mimetypes.guess_type(filename)[0] or "application/octet-stream"
+
+    response = send_file(
+        path,
+        mimetype=mime_type,
+        as_attachment=True,
+        download_name=filename,
+        conditional=True,
+        etag=False,
+        max_age=0,
+    )
+    response.set_etag(content_hash)
+    response.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+    return response
+
+
 # ---------------- Helper Functions ----------------
 
 def _upsert_kosync_metadata(document_hash, filename, source, mtime=None, booklore_id=None):
@@ -530,7 +592,7 @@ def _try_find_epub_by_hash(doc_hash: str) -> Optional[str]:
 
         # Check filesystem
         if _ebook_dir and _ebook_dir.exists():
-            logger.info(f"🔎 Starting filesystem search in {_ebook_dir} for hash {doc_hash[:8]}...")
+            logger.info(f"🔎 Starting filesystem search in {_ebook_dir} for hash {doc_hash}...")
             count = 0
             for epub_path in _ebook_dir.rglob("*.epub"):
                 count += 1
@@ -575,46 +637,63 @@ def _try_find_epub_by_hash(doc_hash: str) -> Optional[str]:
             try:
                 # Query BookloreBook cache in DB first
                 books = _database_service.get_all_booklore_books()
+                scan_source = "Booklore DB cache"
                 if not books:
-                    # If DB cache empty, fetch from API
-                    raw_books = _container.booklore_client().get_all_books()
-                    # (Note: LibraryService syncs this, but we'll do a quick check here if needed)
-                    # For now, let's just assume they might be in the BookloreBook table already if synced.
-                    logger.info("Booklore cache in DB is empty. Consider running a library sync.")
-                    # Fallback to direct API call for scan
-                    from src.services.library_service import LibraryService
-                    lib_service = LibraryService(_database_service, _container.booklore_client())
-                    lib_service.sync_library_books()
-                    books = _database_service.get_all_booklore_books()
+                    books = _container.booklore_client().get_all_books() or []
+                    scan_source = "Booklore in-memory cache"
 
-                logger.info(f"Scanning {len(books)} books from Booklore DB cache...")
+                logger.info(f"Scanning {len(books)} books from {scan_source}...")
 
                 for book in books:
-                    book_id = str(book.raw_metadata_dict.get('id')) if hasattr(book, 'raw_metadata_dict') else None
-                    # Fallback to parsing raw_metadata if needed
-                    if not book_id:
-                        import json
-                        try:
-                            meta = json.loads(book.raw_metadata)
-                            book_id = str(meta.get('id'))
-                        except (json.JSONDecodeError, AttributeError) as e:
-                            logger.debug(f"Failed to parse raw_metadata JSON: {e}")
-                            continue
+                    if hasattr(book, 'raw_metadata_dict'):
+                        raw_id = book.raw_metadata_dict.get('id')
+                        book_id = str(raw_id) if raw_id is not None else None
+                        filename = book.filename
+                        book_title = getattr(book, 'title', None)
+
+                        # Fallback to parsing raw_metadata if needed
+                        if not book_id:
+                            import json
+                            try:
+                                meta = json.loads(book.raw_metadata)
+                                raw_id = meta.get('id')
+                                book_id = str(raw_id) if raw_id is not None else None
+                            except (json.JSONDecodeError, AttributeError) as e:
+                                logger.debug(f"Failed to parse raw_metadata JSON: {e}")
+                                continue
+                    else:
+                        raw_id = book.get('id')
+                        book_id = str(raw_id) if raw_id is not None else None
+                        filename = book.get('fileName')
+                        book_title = book.get('title')
+
+                        if book_id and not filename:
+                            hydrated = _container.booklore_client()._fetch_and_cache_detail(raw_id)
+                            if hydrated:
+                                book = hydrated
+                                filename = hydrated.get('fileName')
+                                book_title = hydrated.get('title')
+
+                    if not book_id or not filename:
+                        logger.debug("Skipping Booklore candidate without both id and filename")
+                        continue
+                    if not hasattr(book, 'raw_metadata_dict'):
+                        book = SimpleNamespace(filename=filename, title=book_title)
 
                     # Check if we have a KosyncDocument for this Booklore ID
                     cached_doc = _database_service.get_kosync_doc_by_booklore_id(book_id)
                     if cached_doc:
                         if cached_doc.document_hash == doc_hash:
                             logger.info(f"📚 Matched EPUB via Booklore ID in DB: {book.filename}")
-                            return book.filename
+                            return filename
 
                     try:
                         book_content = _container.booklore_client().download_book(book_id)
                         if book_content:
-                            computed_hash = _container.ebook_parser().get_kosync_id_from_bytes(book.filename, book_content)
+                            computed_hash = _container.ebook_parser().get_kosync_id_from_bytes(filename, book_content)
 
                             if computed_hash == doc_hash:
-                                safe_title = book.filename
+                                safe_title = filename
                                 cache_dir = _container.data_dir() / "epub_cache"
                                 cache_dir.mkdir(parents=True, exist_ok=True)
                                 cache_path = cache_dir / safe_title
@@ -660,7 +739,10 @@ def _respond_from_book_states(doc_id, book):
     docs_with_progress = [d for d in sibling_docs if d.percentage and float(d.percentage) > 0]
     if docs_with_progress:
         best_doc = max(docs_with_progress, key=lambda d: float(d.percentage))
-        logger.info(f"KOSync: Resolved {doc_id[:8]}... to '{book.abs_title}' via sibling hash {best_doc.document_hash[:8]}... ({float(best_doc.percentage):.2%})")
+        logger.info(f"KOSync: Resolved {doc_id} to '{book.abs_title}' via sibling hash {best_doc.document_hash} ({float(best_doc.percentage):.2%})")
+        poison_pill = _suppress_empty_progress_response(doc_id, float(best_doc.percentage), best_doc.progress)
+        if poison_pill is not None:
+            return poison_pill
         return jsonify({
             "device": best_doc.device or "abs-kosync-bridge",
             "device_id": best_doc.device_id or "abs-kosync-bridge",
@@ -675,13 +757,18 @@ def _respond_from_book_states(doc_id, book):
 
     kosync_state = next((s for s in states if s.client_name.lower() == 'kosync'), None)
     latest_state = kosync_state or max(states, key=lambda s: s.last_updated if s.last_updated else 0)
+    latest_progress = (latest_state.xpath or latest_state.cfi or "") if hasattr(latest_state, 'xpath') else ""
+    latest_pct = float(latest_state.percentage) if latest_state.percentage else 0
+    poison_pill = _suppress_empty_progress_response(doc_id, latest_pct, latest_progress)
+    if poison_pill is not None:
+        return poison_pill
 
     return jsonify({
         "device": "abs-kosync-bridge",
         "device_id": "abs-kosync-bridge",
         "document": doc_id,
-        "percentage": float(latest_state.percentage) if latest_state.percentage else 0,
-        "progress": (latest_state.xpath or latest_state.cfi) if hasattr(latest_state, 'xpath') else "",
+        "percentage": latest_pct,
+        "progress": latest_progress,
         "timestamp": int(latest_state.last_updated) if latest_state.last_updated else 0
     }), 200
 
@@ -699,13 +786,13 @@ def _resolve_book_by_sibling_hash(doc_id: str, existing_doc=None):
         if sibling and sibling.linked_abs_id and sibling.document_hash != doc_id:
             book = _database_service.get_book(sibling.linked_abs_id)
             if book:
-                logger.info(f"🔗 KOSync: Resolved {doc_id[:8]}... to '{book.abs_title}' via filename sibling")
+                logger.info(f"🔗 KOSync: Resolved {doc_id} to '{book.abs_title}' via filename sibling")
                 return book
 
         # Check if the filename matches a book's ebook_filename directly
         book = _database_service.get_book_by_ebook_filename(doc.filename)
         if book:
-            logger.info(f"🔗 KOSync: Resolved {doc_id[:8]}... to '{book.abs_title}' via ebook filename match")
+            logger.info(f"🔗 KOSync: Resolved {doc_id} to '{book.abs_title}' via ebook filename match")
             return book
 
     return None
@@ -719,22 +806,22 @@ def _register_hash_for_book(doc_id: str, book):
     if existing:
         if not existing.linked_abs_id:
             _database_service.link_kosync_document(doc_id, book.abs_id)
-            logger.info(f"🔗 KOSync: Linked existing document {doc_id[:8]}... to '{book.abs_title}'")
+            logger.info(f"🔗 KOSync: Linked existing document {doc_id} to '{book.abs_title}'")
     else:
         doc = KD(document_hash=doc_id, linked_abs_id=book.abs_id)
         _database_service.save_kosync_document(doc)
-        logger.info(f"🔗 KOSync: Created and linked new document {doc_id[:8]}... to '{book.abs_title}'")
+        logger.info(f"🔗 KOSync: Created and linked new document {doc_id} to '{book.abs_title}'")
 
 
 def _run_get_auto_discovery(doc_id: str):
     """Background auto-discovery triggered by GET for an unknown hash.
     Finds the matching epub and links the hash to an existing book."""
     try:
-        logger.info(f"🔍 KOSync: Background discovery (GET) for {doc_id[:8]}...")
+        logger.info(f"🔍 KOSync: Background discovery (GET) for {doc_id}...")
         epub_filename = _try_find_epub_by_hash(doc_id)
 
         if not epub_filename:
-            logger.info(f"🔍 KOSync: GET-discovery found no epub for {doc_id[:8]}...")
+            logger.info(f"🔍 KOSync: GET-discovery found no epub for {doc_id}...")
             return
 
         # Update stub with filename
@@ -747,7 +834,7 @@ def _run_get_auto_discovery(doc_id: str):
         book = _database_service.get_book_by_ebook_filename(epub_filename)
         if book:
             _database_service.link_kosync_document(doc_id, book.abs_id)
-            logger.info(f"✅ KOSync: GET-discovery linked {doc_id[:8]}... to '{book.abs_title}'")
+            logger.info(f"✅ KOSync: GET-discovery linked {doc_id} to '{book.abs_title}'")
             return
 
         logger.info(f"🔍 KOSync: GET-discovery found epub '{epub_filename}' but no matching book")
@@ -758,6 +845,17 @@ def _run_get_auto_discovery(doc_id: str):
 
 
 # ---------------- KOSync Document Management API ----------------
+
+def _suppress_empty_progress_response(doc_id: str, percentage: float, progress: Optional[str]):
+    safe_progress = progress.strip() if isinstance(progress, str) else ""
+    if percentage > 0 and not safe_progress:
+        logger.warning(
+            "KOSync: Suppressing response for %s - percentage %.2f%% but no locator available. Returning 502 to prevent page-0 reset.",
+            doc_id,
+            percentage * 100.0,
+        )
+        return jsonify({"message": "Document not found on server"}), 502
+    return None
 
 @kosync_admin_bp.route('/api/kosync-documents', methods=['GET'])
 def api_get_kosync_documents():

@@ -37,6 +37,9 @@ class ABSSyncClient(SyncClient):
         """ABS audiobook client only syncs audiobooks."""
         return {'audiobook'}
 
+    def supports_book(self, book: Book) -> bool:
+        return (getattr(book, "audio_source", None) or "ABS") == "ABS"
+
     def get_service_state(self, book: Book, prev_state: Optional[State], title_snip: str = "", bulk_context: dict = None) -> Optional[ServiceState]:
         abs_id = book.abs_id
 
@@ -238,10 +241,11 @@ class ABSSyncClient(SyncClient):
             time_listened = 0
 
         logger.debug(f"   ⏱️ time_listened: {time_listened:.1f}s (prev: {prev_abs_ts:.1f}s → new: {adjusted_ts:.1f}s)")
-        try:
-            from src.services.write_tracker import record_write
-            record_write('ABS', abs_id)
-        except ImportError:
-            pass
         abs_ok = self.abs_client.update_progress(abs_id, adjusted_ts, time_listened)
+        if isinstance(abs_ok, dict) and abs_ok.get("success"):
+            try:
+                from src.services.write_tracker import record_write
+                record_write('ABS', abs_id)
+            except ImportError:
+                pass
         return abs_ok, adjusted_ts

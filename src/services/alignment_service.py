@@ -532,40 +532,106 @@ def _normalize_title_key(title: str) -> str:
     return re.sub(r"\s+", " ", collapsed).strip()
 
 
+def _strip_storyteller_instance_suffix(name: str) -> str:
+    stripped = str(name or "").strip()
+    return re.sub(r"\s+\[[^\[\]]+\]\s*$", "", stripped).strip()
+
+
+def _storyteller_dir_has_transcriptions(title_dir: Path) -> bool:
+    transcriptions_dir = Path(title_dir) / "transcriptions"
+    return transcriptions_dir.is_dir() and any(transcriptions_dir.glob("*.json"))
+
+
+def _iter_storyteller_title_dir_candidates(assets_dir: Path, target_title: str) -> list[Path]:
+    target_key = _normalize_title_key(target_title)
+    if not target_key:
+        return []
+
+    candidates = []
+    for child in assets_dir.iterdir():
+        if not child.is_dir():
+            continue
+        child_key = _normalize_title_key(child.name)
+        base_key = _normalize_title_key(_strip_storyteller_instance_suffix(child.name))
+        if child.name == target_title or child_key == target_key or base_key == target_key:
+            candidates.append(child)
+    return candidates
+
+
 def _storyteller_filename_for_abs_chapter(chapter_index: int, prefix: str = "00000") -> str:
-    """Map ABS chapter index N (0-based) to Storyteller filename N+1 (1-based)."""
+    """
+    Build the bridge-managed canonical chapter filename for ABS chapter index N (0-based).
+
+    This helper is for destination naming only (managed transcript store), not for
+    source layout detection inside Storyteller asset folders.
+    """
     return f"{prefix}-{chapter_index + 1:05d}.json"
 
 
-def _resolve_storyteller_title_dir(assets_root: Path, abs_title: str) -> Optional[Path]:
+def _resolve_storyteller_title_dir(
+    assets_root: Path,
+    abs_title: str,
+    storyteller_title: str = None,
+) -> Optional[Path]:
     """
-    Resolve the Storyteller title directory using exact match first,
-    then normalized exact match (must be unique).
+    Resolve the Storyteller title directory, preferring transcript-ready
+    directories and supporting Storyteller's `Title [id]` suffix pattern.
     """
     assets_dir = assets_root / "assets"
     if not assets_dir.exists() or not assets_dir.is_dir():
         return None
 
-    exact_dir = assets_dir / abs_title
-    if exact_dir.exists() and exact_dir.is_dir():
-        return exact_dir
+    candidates: list[Path] = []
+    seen = set()
+    raw_titles = []
+    if storyteller_title:
+        raw_titles.append(storyteller_title)
+    if abs_title and abs_title not in raw_titles:
+        raw_titles.append(abs_title)
 
-    target_key = _normalize_title_key(abs_title)
-    if not target_key:
+    for target_title in raw_titles:
+        for candidate in _iter_storyteller_title_dir_candidates(assets_dir, target_title):
+            resolved = str(candidate.resolve())
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            candidates.append(candidate)
+
+    if not candidates:
         return None
 
-    candidates = []
-    for child in assets_dir.iterdir():
-        if child.is_dir() and _normalize_title_key(child.name) == target_key:
-            candidates.append(child)
+    transcript_ready = [candidate for candidate in candidates if _storyteller_dir_has_transcriptions(candidate)]
+    if transcript_ready:
+        ignored = [candidate for candidate in candidates if candidate not in transcript_ready]
+        for candidate in ignored:
+            logger.info(
+                "Storyteller transcript resolver: ignoring stale non-transcription dir '%s'",
+                candidate,
+            )
+        candidates = transcript_ready
 
     if len(candidates) == 1:
-        return candidates[0]
+        selected = candidates[0]
+        if _strip_storyteller_instance_suffix(selected.name) != selected.name:
+            logger.info(
+                "Storyteller transcript resolver: selected suffixed assets dir '%s' for '%s'",
+                selected,
+                _sanitize_log_data(storyteller_title or abs_title),
+            )
+        return selected
+
+    for target_title in [storyteller_title, abs_title]:
+        if not target_title:
+            continue
+        exact_matches = [candidate for candidate in candidates if candidate.name == target_title]
+        if len(exact_matches) == 1:
+            return exact_matches[0]
 
     if len(candidates) > 1:
         logger.warning(
-            f"Storyteller assets match is ambiguous for '{_sanitize_log_data(abs_title)}' "
-            f"({len(candidates)} directories)"
+            "Storyteller transcript resolver: ambiguous transcript-ready matches for '%s' (%d directories)",
+            _sanitize_log_data(storyteller_title or abs_title),
+            len(candidates),
         )
     return None
 
@@ -588,7 +654,11 @@ def _validate_storyteller_chapters(
 ) -> tuple[bool, list[str], list[str]]:
     """
     Validate Storyteller chapter files by expected naming and exact count.
-    Accept both known prefixes: 00000-XXXXX.json and 00001-XXXXX.json.
+    Accept known source layouts:
+      1) 00000-00001 ... 00000-N
+      2) 00001-00001 ... 00001-N
+      3) 00000-00001, 00001-00001 ... (N-1)-00001
+      4) 00001-00001, 00002-00001 ... N-00001
     Returns (is_valid, source_filenames, destination_filenames).
     """
     if expected_count <= 0:
@@ -598,19 +668,24 @@ def _validate_storyteller_chapters(
         return False, [], []
 
     expected_files = [_storyteller_filename_for_abs_chapter(i, "00000") for i in range(expected_count)]
-    present = [
-        p.name
-        for p in transcriptions_dir.glob("*.json")
-        if re.match(r"^0000[01]-\d{5}\.json$", p.name)
-    ]
-    if len(present) != expected_count:
+    pattern = re.compile(r"^(\d{5})-(\d{5})\.json$")
+    numeric_matches = []
+    for p in transcriptions_dir.glob("*.json"):
+        match = pattern.match(p.name)
+        if match:
+            numeric_matches.append((p.name, int(match.group(1)), int(match.group(2))))
+
+    if len(numeric_matches) != expected_count:
         all_json = sorted([p.name for p in transcriptions_dir.glob("*.json")])
+        numeric_names = sorted(name for name, _, _ in numeric_matches)
+        first_slot_values = [first for _, first, _ in numeric_matches]
+        second_slot_values = [second for _, _, second in numeric_matches]
         logger.info(
             "Storyteller validation failed at '%s': expected %d chapter files, found %d matching "
-            "pattern '^0000[01]-\\d{5}\\.json$' (total json=%d)",
+            "pattern '^\\d{5}-\\d{5}\\.json$' (total json=%d)",
             transcriptions_dir,
             expected_count,
-            len(present),
+            len(numeric_matches),
             len(all_json),
         )
         if all_json:
@@ -621,98 +696,244 @@ def _validate_storyteller_chapters(
                 sample,
                 " ..." if len(all_json) > 10 else "",
             )
+        if numeric_names:
+            numeric_sample = ", ".join(numeric_names[:10])
+            logger.info(
+                "Storyteller validation numeric sample at '%s': %s%s",
+                transcriptions_dir,
+                numeric_sample,
+                " ..." if len(numeric_names) > 10 else "",
+            )
+            logger.info(
+                "Storyteller validation slot ranges at '%s': first_slot=%d..%d second_slot=%d..%d",
+                transcriptions_dir,
+                min(first_slot_values),
+                max(first_slot_values),
+                min(second_slot_values),
+                max(second_slot_values),
+            )
         return False, [], []
 
-    for prefix in ("00000", "00001"):
-        source_files = [_storyteller_filename_for_abs_chapter(i, prefix) for i in range(expected_count)]
-        if all((transcriptions_dir / name).exists() for name in source_files):
-            invalid_files = [
-                name for name in source_files
-                if not _is_storyteller_wordtimeline_chapter(transcriptions_dir / name)
-            ]
-            if not invalid_files:
-                return True, source_files, expected_files
-            logger.info(
-                "Storyteller validation failed at '%s': %d chapter file(s) are not storyteller timeline format "
-                "(expected 'wordTimeline' or 'timeline'); first invalid='%s'",
-                transcriptions_dir,
-                len(invalid_files),
-                invalid_files[0],
-            )
-            return False, [], []
-
-    source_files = []
-    for i in range(expected_count):
-        canonical = _storyteller_filename_for_abs_chapter(i, "00000")
-        alt = _storyteller_filename_for_abs_chapter(i, "00001")
-        has_canonical = (transcriptions_dir / canonical).exists()
-        has_alt = (transcriptions_dir / alt).exists()
-        if has_canonical and not has_alt:
-            source_files.append(canonical)
-        elif has_alt and not has_canonical:
-            source_files.append(alt)
-        else:
-            logger.info(
-                "Storyteller validation failed at '%s': chapter index %d missing unique file "
-                "(canonical='%s' exists=%s, alt='%s' exists=%s)",
-                transcriptions_dir,
-                i,
-                canonical,
-                has_canonical,
-                alt,
-                has_alt,
-            )
-            return False, [], []
-
-    invalid_files = [
-        name for name in source_files
-        if not _is_storyteller_wordtimeline_chapter(transcriptions_dir / name)
+    candidate_layouts: list[tuple[str, list[str]]] = [
+        (
+            "prefix_00000",
+            [f"00000-{i + 1:05d}.json" for i in range(expected_count)],
+        ),
+        (
+            "prefix_00001",
+            [f"00001-{i + 1:05d}.json" for i in range(expected_count)],
+        ),
+        (
+            "chapter_first_zero_based",
+            [f"{i:05d}-00001.json" for i in range(expected_count)],
+        ),
+        (
+            "chapter_first_one_based",
+            [f"{i + 1:05d}-00001.json" for i in range(expected_count)],
+        ),
     ]
-    if not invalid_files:
-        return True, source_files, expected_files
+
+    for layout_name, source_files in candidate_layouts:
+        if not all((transcriptions_dir / name).exists() for name in source_files):
+            continue
+        invalid_files = [
+            name for name in source_files
+            if not _is_storyteller_wordtimeline_chapter(transcriptions_dir / name)
+        ]
+        if not invalid_files:
+            return True, source_files, expected_files
+        logger.info(
+            "Storyteller validation failed at '%s': layout '%s' has %d chapter file(s) without storyteller "
+            "timeline format ('wordTimeline' or 'timeline'); first invalid='%s'",
+            transcriptions_dir,
+            layout_name,
+            len(invalid_files),
+            invalid_files[0],
+        )
+        return False, [], []
+
+    all_json = sorted([p.name for p in transcriptions_dir.glob("*.json")])
+    first_slot_values = [first for _, first, _ in numeric_matches]
+    second_slot_values = [second for _, _, second in numeric_matches]
     logger.info(
-        "Storyteller validation failed at '%s': mixed-prefix chapter set has %d file(s) without storyteller "
-        "timeline format ('wordTimeline' or 'timeline'); first invalid='%s'",
+        "Storyteller validation failed at '%s': no supported filename layout matched expected_count=%d",
         transcriptions_dir,
-        len(invalid_files),
-        invalid_files[0],
+        expected_count,
     )
+    if all_json:
+        sample = ", ".join(all_json[:10])
+        logger.info(
+            "Storyteller validation file sample at '%s': %s%s",
+            transcriptions_dir,
+            sample,
+            " ..." if len(all_json) > 10 else "",
+        )
+    if numeric_matches:
+        logger.info(
+            "Storyteller validation slot ranges at '%s': first_slot=%d..%d second_slot=%d..%d",
+            transcriptions_dir,
+            min(first_slot_values),
+            max(first_slot_values),
+            min(second_slot_values),
+            max(second_slot_values),
+        )
     return False, [], []
 
 
-def ingest_storyteller_transcripts(abs_id: str, abs_title: str, chapters: list) -> Optional[str]:
+def _read_storyteller_chapter_metrics(chapter_file_path: Path) -> tuple[int, int, float]:
+    """Return transcript lengths and chapter-local duration for a storyteller chapter file."""
+    text_len = 0
+    text_len_utf16 = 0
+    local_duration = 0.0
+
+    if not chapter_file_path.exists():
+        return text_len, text_len_utf16, local_duration
+
+    try:
+        with open(chapter_file_path, "r", encoding="utf-8") as chapter_file:
+            chapter_data = json.load(chapter_file)
+        if not isinstance(chapter_data, dict):
+            return text_len, text_len_utf16, local_duration
+
+        chapter_text = chapter_data.get("transcript", "")
+        text_len = len(chapter_text)
+        text_len_utf16 = len(chapter_text.encode("utf-16-le")) // 2
+
+        timeline = chapter_data.get("wordTimeline")
+        if not isinstance(timeline, list):
+            timeline = chapter_data.get("timeline")
+        if isinstance(timeline, list):
+            for row in timeline:
+                if not isinstance(row, dict):
+                    continue
+                try:
+                    end_time = float(row.get("endTime", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    end_time = 0.0
+                if end_time > local_duration:
+                    local_duration = end_time
+    except Exception:
+        return 0, 0, 0.0
+
+    return text_len, text_len_utf16, local_duration
+
+
+def probe_storyteller_transcripts(
+    abs_title: str,
+    chapters: list,
+    storyteller_title: str = None,
+) -> dict:
+    """
+    Non-mutating readiness probe for Storyteller transcript assets.
+    """
+    result = {
+        "ready": False,
+        "reason": "unknown",
+        "transcriptions_dir": None,
+        "expected_count": 0,
+        "found_count": 0,
+        "source_files": [],
+        "expected_files": [],
+        "chapterless_mode": False,
+    }
+
+    assets_dir_raw = os.environ.get("STORYTELLER_ASSETS_DIR", "").strip()
+    if not assets_dir_raw:
+        result["ready"] = True
+        result["reason"] = "assets_not_configured"
+        return result
+
+    chapter_list = chapters if isinstance(chapters, list) else []
+    assets_root = Path(assets_dir_raw)
+    title_dir = _resolve_storyteller_title_dir(
+        assets_root,
+        abs_title or "",
+        storyteller_title=storyteller_title,
+    )
+    if not title_dir:
+        result["reason"] = "title_dir_missing"
+        return result
+
+    transcriptions_dir = title_dir / "transcriptions"
+    result["transcriptions_dir"] = transcriptions_dir
+    if not transcriptions_dir.exists() or not transcriptions_dir.is_dir():
+        result["reason"] = "transcriptions_dir_missing"
+        return result
+
+    numeric_pattern = re.compile(r"^\d{5}-\d{5}\.json$")
+    numeric_files = [p.name for p in transcriptions_dir.glob("*.json") if numeric_pattern.match(p.name)]
+    result["found_count"] = len(numeric_files)
+
+    expected_count = len(chapter_list)
+    chapterless_mode = expected_count <= 0
+    result["chapterless_mode"] = chapterless_mode
+    if chapterless_mode:
+        expected_count = len(numeric_files)
+        if expected_count <= 0:
+            result["reason"] = "chapter_set_incomplete"
+            return result
+
+    result["expected_count"] = expected_count
+
+    is_valid, source_files, expected_files = _validate_storyteller_chapters(
+        transcriptions_dir, expected_count
+    )
+    result["source_files"] = source_files
+    result["expected_files"] = expected_files
+    if not is_valid:
+        result["reason"] = "chapter_set_incomplete"
+        return result
+
+    result["ready"] = True
+    result["reason"] = "validated"
+    return result
+
+
+def ingest_storyteller_transcripts(
+    abs_id: str,
+    abs_title: str,
+    chapters: list,
+    storyteller_title: str = None,
+) -> Optional[str]:
     """
     Copy Storyteller chapter JSON files into bridge-managed data storage and write a manifest.
     Returns manifest path on success.
     """
-    assets_dir_raw = os.environ.get("STORYTELLER_ASSETS_DIR", "").strip()
-    if not assets_dir_raw:
+    probe = probe_storyteller_transcripts(
+        abs_title,
+        chapters,
+        storyteller_title=storyteller_title,
+    )
+    if probe["reason"] == "assets_not_configured":
         return None
-
-    chapter_list = chapters if isinstance(chapters, list) else []
-    expected_count = len(chapter_list)
-    if expected_count <= 0:
-        logger.info(f"Storyteller ingest skipped for '{abs_id}': no ABS chapters available")
-        return None
-
-    assets_root = Path(assets_dir_raw)
-    title_dir = _resolve_storyteller_title_dir(assets_root, abs_title or "")
-    if not title_dir:
+    if probe["reason"] == "title_dir_missing":
         logger.info(f"Storyteller transcripts not found for '{abs_id}' (title='{_sanitize_log_data(abs_title)}')")
         return None
-
-    transcriptions_dir = title_dir / "transcriptions"
-    if not transcriptions_dir.exists() or not transcriptions_dir.is_dir():
+    if probe["reason"] == "transcriptions_dir_missing":
+        transcriptions_dir = probe["transcriptions_dir"]
         logger.info(f"Storyteller transcriptions directory missing for '{abs_id}' at '{transcriptions_dir}'")
         return None
-
-    is_valid, source_files, expected_files = _validate_storyteller_chapters(transcriptions_dir, expected_count)
-    if not is_valid:
+    if not probe["ready"]:
+        transcriptions_dir = probe["transcriptions_dir"]
+        expected_count = probe["expected_count"]
         logger.info(
             f"Storyteller transcripts rejected for '{abs_id}': expected {expected_count} chapter files at "
             f"'{transcriptions_dir}'"
         )
         return None
+
+    chapter_list = chapters if isinstance(chapters, list) else []
+    transcriptions_dir = probe["transcriptions_dir"]
+    expected_count = probe["expected_count"]
+    source_files = probe["source_files"]
+    expected_files = probe["expected_files"]
+    chapterless_mode = probe["chapterless_mode"]
+
+    if chapterless_mode:
+        logger.info(
+            f"Storyteller ingest chapterless mode for '{abs_id}': deriving {expected_count} chapters from "
+            f"'{transcriptions_dir}'"
+        )
 
     data_dir = Path(os.environ.get("DATA_DIR", "/data"))
     target_dir = data_dir / "transcripts" / "storyteller" / abs_id
@@ -728,6 +949,18 @@ def ingest_storyteller_transcripts(abs_id: str, abs_title: str, chapters: list) 
     if existing_valid:
         logger.info(f"Storyteller ingest reuse for '{abs_id}' from '{target_dir}' ({len(expected_files)} files)")
     else:
+        # Ensure stale canonical files are not mixed with a newly copied set.
+        for stale_file in target_dir.glob("*.json"):
+            if re.match(r"^00000-\d{5}\.json$", stale_file.name):
+                try:
+                    stale_file.unlink()
+                except Exception as delete_err:
+                    logger.warning(
+                        "Storyteller ingest could not remove stale transcript '%s' for '%s': %s",
+                        stale_file,
+                        abs_id,
+                        delete_err,
+                    )
         copied_count = 0
         for source_name, target_name in zip(source_files, expected_files):
             shutil.copy2(transcriptions_dir / source_name, target_dir / target_name)
@@ -738,31 +971,37 @@ def ingest_storyteller_transcripts(abs_id: str, abs_title: str, chapters: list) 
         )
 
     chapter_entries = []
-    for idx, chapter in enumerate(chapter_list):
-        start = float(chapter.get("start", 0.0) or 0.0)
-        end = float(chapter.get("end", 0.0) or 0.0)
-        chapter_file_name = _storyteller_filename_for_abs_chapter(idx)
-        text_len = 0
-        text_len_utf16 = 0
-        chapter_file_path = target_dir / chapter_file_name
-        if chapter_file_path.exists():
-            try:
-                with open(chapter_file_path, "r", encoding="utf-8") as chapter_file:
-                    chapter_data = json.load(chapter_file)
-                chapter_text = chapter_data.get("transcript", "") if isinstance(chapter_data, dict) else ""
-                text_len = len(chapter_text)
-                text_len_utf16 = len(chapter_text.encode("utf-16-le")) // 2
-            except Exception:
-                text_len = 0
-                text_len_utf16 = 0
-        chapter_entries.append({
-            "index": idx,
-            "file": chapter_file_name,
-            "start": start,
-            "end": end,
-            "text_len": text_len,
-            "text_len_utf16": text_len_utf16,
-        })
+    if chapterless_mode:
+        cumulative_start = 0.0
+        for idx, chapter_file_name in enumerate(expected_files):
+            chapter_file_path = target_dir / chapter_file_name
+            text_len, text_len_utf16, local_duration = _read_storyteller_chapter_metrics(chapter_file_path)
+            start = cumulative_start
+            end = cumulative_start + max(0.0, float(local_duration))
+            cumulative_start = end
+            chapter_entries.append({
+                "index": idx,
+                "file": chapter_file_name,
+                "start": start,
+                "end": end,
+                "text_len": text_len,
+                "text_len_utf16": text_len_utf16,
+            })
+    else:
+        for idx, chapter in enumerate(chapter_list):
+            start = float(chapter.get("start", 0.0) or 0.0)
+            end = float(chapter.get("end", 0.0) or 0.0)
+            chapter_file_name = _storyteller_filename_for_abs_chapter(idx)
+            chapter_file_path = target_dir / chapter_file_name
+            text_len, text_len_utf16, _local_duration = _read_storyteller_chapter_metrics(chapter_file_path)
+            chapter_entries.append({
+                "index": idx,
+                "file": chapter_file_name,
+                "start": start,
+                "end": end,
+                "text_len": text_len,
+                "text_len_utf16": text_len_utf16,
+            })
 
     duration = 0.0
     if chapter_entries:
