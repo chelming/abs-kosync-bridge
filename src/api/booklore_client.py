@@ -1782,12 +1782,6 @@ class BookloreClient:
         return False
 
     def update_progress(self, ebook_filename, percentage, rich_locator: Optional[LocatorResult] = None):
-        # TODO: Grimmory deprecated epubProgress/pdfProgress/cbxProgress/audiobookProgress
-        # in ReadProgressRequest. Migrate to:
-        #   fileProgress = { bookFileId: primaryFile.id, positionData: cfi,
-        #                    positionHref: href, progressPercent: pct*100 }
-        # _process_book_detail() already caches primaryFile, so book['primaryFile']['id']
-        # is available. Switch when Grimmory removes the deprecated fields.
         book = self.find_book_by_filename(ebook_filename)
         if not book:
             logger.debug(f"Booklore: Book not found: {ebook_filename}")
@@ -1806,19 +1800,32 @@ class BookloreClient:
 
         clear_reset = book_type == 'EPUB' and percentage <= 0
         cfi = rich_locator.cfi if rich_locator and rich_locator.cfi else None
-        cfi_write_disabled = str(book_id) in self._epub_cfi_write_disabled_for_books
+        href = rich_locator.href if rich_locator and rich_locator.href else None
+        primary_file = book.get('primaryFile') or {}
+        book_file_id = primary_file.get('id')
 
         payload_variants = []
-        if book_type == 'EPUB':
-            base_payload = {"bookId": book_id, "epubProgress": {"percentage": pct_display}}
-            if clear_reset:
-                # Booklore variants differ by version/build. Try common clear forms.
-                payload_variants = [
-                    ("null_cfi", {"bookId": book_id, "epubProgress": {"percentage": pct_display, "cfi": None}}),
-                    ("no_cfi", base_payload),
-                ]
-            else:
-                if cfi is not None:
+        if book_type in ('EPUB', 'PDF', 'CBX') and book_file_id is not None:
+            file_progress = {
+                "bookFileId": self._to_optional_int(book_file_id) or book_file_id,
+                "progressPercent": pct_display,
+            }
+            if cfi:
+                file_progress["positionData"] = cfi
+            if href:
+                file_progress["positionHref"] = href
+            payload_variants.append(("fileProgress", {"bookId": book_id, "fileProgress": file_progress}))
+
+        if not payload_variants:
+            if book_type == 'EPUB':
+                base_payload = {"bookId": book_id, "epubProgress": {"percentage": pct_display}}
+                if clear_reset:
+                    payload_variants = [
+                        ("null_cfi", {"bookId": book_id, "epubProgress": {"percentage": pct_display, "cfi": None}}),
+                        ("no_cfi", base_payload),
+                    ]
+                elif cfi is not None:
+                    cfi_write_disabled = str(book_id) in self._epub_cfi_write_disabled_for_books
                     if cfi_write_disabled:
                         logger.debug(
                             "Booklore: skipping with_cfi variant for file=%s book_id=%s due to prior verified incompatibility",
@@ -1834,13 +1841,13 @@ class BookloreClient:
                         ]
                 else:
                     payload_variants = [("standard", base_payload)]
-        elif book_type == 'PDF':
-            payload_variants = [("standard", {"bookId": book_id, "pdfProgress": {"page": 1, "percentage": pct_display}})]
-        elif book_type == 'CBX':
-            payload_variants = [("standard", {"bookId": book_id, "cbxProgress": {"page": 1, "percentage": pct_display}})]
-        else:
-            logger.warning(f"Booklore: Unknown book type {book_type} for {safe_filename}")
-            return False
+            elif book_type == 'PDF':
+                payload_variants = [("standard", {"bookId": book_id, "pdfProgress": {"page": 1, "percentage": pct_display}})]
+            elif book_type == 'CBX':
+                payload_variants = [("standard", {"bookId": book_id, "cbxProgress": {"page": 1, "percentage": pct_display}})]
+            else:
+                logger.warning(f"Booklore: Unknown book type {book_type} for {safe_filename}")
+                return False
 
         logger.debug(
             f"Booklore progress write start: file={safe_filename} book_id={book_id} type={book_type} "
@@ -1854,14 +1861,13 @@ class BookloreClient:
             if clear_reset:
                 logger.debug(f"Booklore: Clearing CFI for 0% reset (variant={variant_name})")
 
-            progress_payload = payload.get('epubProgress') or payload.get('pdfProgress') or payload.get('cbxProgress') or {}
-            has_payload_cfi = isinstance(payload.get('epubProgress'), dict) and ('cfi' in payload.get('epubProgress', {}))
-            payload_cfi_value = payload.get('epubProgress', {}).get('cfi') if has_payload_cfi else None
+            progress_payload = payload.get('fileProgress') or payload.get('epubProgress') or payload.get('pdfProgress') or payload.get('cbxProgress') or {}
+            payload_pct = progress_payload.get('progressPercent', progress_payload.get('percentage', 'n/a'))
+            has_payload_cfi = bool(progress_payload.get('positionData') or (isinstance(payload.get('epubProgress'), dict) and 'cfi' in payload.get('epubProgress', {})))
             logger.debug(
                 f"Booklore progress write attempt {variant_idx}/{len(payload_variants)}: "
                 f"file={safe_filename} book_id={book_id} variant={variant_name} "
-                f"payload_pct={progress_payload.get('percentage', 'n/a')} has_cfi={has_payload_cfi} "
-                f"cfi_len={len(str(payload_cfi_value)) if payload_cfi_value is not None else 0}"
+                f"payload_pct={payload_pct} has_position_data={has_payload_cfi}"
             )
 
             response = self._make_request("POST", "/api/v1/books/progress", payload)
