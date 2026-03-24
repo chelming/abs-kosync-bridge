@@ -1573,12 +1573,22 @@ def index():
     # Fetch pending suggestions
     suggestions_raw = database_service.get_all_pending_suggestions()
 
-    # Filter suggestions: Hide those with 0 matches
+    # Filter suggestions: Hide those with 0 matches or >70% progress (finished books)
     suggestions = []
+    abs_client = container.abs_client()
+    abs_progress_map = abs_client.get_all_progress_raw() if abs_client and abs_client.is_configured() else {}
 
     for s in suggestions_raw:
         if len(s.matches) == 0:
             continue
+        # Hide suggestions for books that are now mostly finished
+        progress_entry = abs_progress_map.get(s.source_id)
+        if progress_entry:
+            duration = progress_entry.get('duration', 0)
+            if duration > 0 and progress_entry.get('currentTime', 0) / duration > 0.70:
+                continue
+            if progress_entry.get('isFinished'):
+                continue
         suggestions.append(s)
 
     # [OPTIMIZATION] Fetch all hardcover details at once
