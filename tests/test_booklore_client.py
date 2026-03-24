@@ -1308,3 +1308,158 @@ def test_process_book_detail_removes_stale_filename_aliases_for_same_id(booklore
     assert old_name not in booklore_client._book_cache
     assert new_name in booklore_client._book_cache
     booklore_client.db.delete_booklore_book.assert_called_with(old_name)
+
+
+# ── Reading Session Tests ──
+
+class TestCreateReadingSession:
+    """Tests for BookloreClient.create_reading_session()."""
+
+    def test_successful_session_recording(self, booklore_client):
+        """202 Accepted response returns True with correct payload."""
+        booklore_client._get_fresh_token = MagicMock(return_value="fake-token")
+        mock_resp = MockResponse({}, status_code=202)
+        booklore_client.session.post = MagicMock(return_value=mock_resp)
+
+        result = booklore_client.create_reading_session(
+            book_id=42,
+            start_time=1700000000.0,
+            end_time=1700001800.0,
+            start_progress=0.10,
+            end_progress=0.15,
+            book_type="EPUB",
+        )
+
+        assert result is True
+        call_kwargs = booklore_client.session.post.call_args
+        payload = call_kwargs.kwargs.get('json') or call_kwargs[1].get('json')
+        assert payload["bookId"] == 42
+        assert payload["durationSeconds"] == 1800
+        assert payload["startProgress"] == 10.0
+        assert payload["endProgress"] == 15.0
+        assert payload["progressDelta"] == 5.0
+        assert payload["bookType"] == "EPUB"
+        assert "startTime" in payload
+        assert "endTime" in payload
+        assert "durationFormatted" in payload
+
+    def test_zero_duration_skipped(self, booklore_client):
+        """Session with zero duration returns False without API call."""
+        booklore_client._make_request = MagicMock()
+
+        result = booklore_client.create_reading_session(
+            book_id=42,
+            start_time=100.0,
+            end_time=100.0,
+            start_progress=0.10,
+            end_progress=0.10,
+        )
+
+        assert result is False
+        booklore_client._make_request.assert_not_called()
+
+    def test_negative_duration_skipped(self, booklore_client):
+        """Session with negative duration returns False without API call."""
+        booklore_client._make_request = MagicMock()
+
+        result = booklore_client.create_reading_session(
+            book_id=42,
+            start_time=200.0,
+            end_time=100.0,
+            start_progress=0.10,
+            end_progress=0.15,
+        )
+
+        assert result is False
+        booklore_client._make_request.assert_not_called()
+
+    def test_duration_capped_at_4_hours(self, booklore_client):
+        """Duration exceeding 4 hours is capped at 14400s."""
+        booklore_client._get_fresh_token = MagicMock(return_value="fake-token")
+        mock_resp = MockResponse({}, status_code=202)
+        booklore_client.session.post = MagicMock(return_value=mock_resp)
+
+        result = booklore_client.create_reading_session(
+            book_id=42,
+            start_time=1700000000.0,
+            end_time=1700000000.0 + 20000,
+            start_progress=0.10,
+            end_progress=0.50,
+        )
+
+        assert result is True
+        call_kwargs = booklore_client.session.post.call_args
+        payload = call_kwargs.kwargs.get('json') or call_kwargs[1].get('json')
+        assert payload["durationSeconds"] == 14400
+
+    def test_api_failure_returns_false(self, booklore_client):
+        """Non-success status code returns False without raising."""
+        booklore_client._get_fresh_token = MagicMock(return_value="fake-token")
+        mock_resp = MockResponse({}, status_code=500)
+        booklore_client.session.post = MagicMock(return_value=mock_resp)
+
+        result = booklore_client.create_reading_session(
+            book_id=42,
+            start_time=1700000000.0,
+            end_time=1700001800.0,
+            start_progress=0.10,
+            end_progress=0.15,
+        )
+
+        assert result is False
+
+    def test_exception_returns_false(self, booklore_client):
+        """Network exception returns False without raising."""
+        booklore_client._get_fresh_token = MagicMock(return_value="fake-token")
+        booklore_client.session.post = MagicMock(side_effect=Exception("connection refused"))
+
+        result = booklore_client.create_reading_session(
+            book_id=42,
+            start_time=1700000000.0,
+            end_time=1700001800.0,
+            start_progress=0.10,
+            end_progress=0.15,
+        )
+
+        assert result is False
+
+    def test_optional_fields_omitted_when_none(self, booklore_client):
+        """Optional fields like bookType and locations are excluded when None."""
+        booklore_client._get_fresh_token = MagicMock(return_value="fake-token")
+        mock_resp = MockResponse({}, status_code=202)
+        booklore_client.session.post = MagicMock(return_value=mock_resp)
+
+        booklore_client.create_reading_session(
+            book_id=42,
+            start_time=1700000000.0,
+            end_time=1700001800.0,
+            start_progress=0.10,
+            end_progress=0.15,
+        )
+
+        call_kwargs = booklore_client.session.post.call_args
+        payload = call_kwargs.kwargs.get('json') or call_kwargs[1].get('json')
+        assert "bookType" not in payload
+        assert "startLocation" not in payload
+        assert "endLocation" not in payload
+
+    def test_location_fields_included_when_provided(self, booklore_client):
+        """Location fields are included in payload when provided."""
+        booklore_client._get_fresh_token = MagicMock(return_value="fake-token")
+        mock_resp = MockResponse({}, status_code=202)
+        booklore_client.session.post = MagicMock(return_value=mock_resp)
+
+        booklore_client.create_reading_session(
+            book_id=42,
+            start_time=1700000000.0,
+            end_time=1700001800.0,
+            start_progress=0.10,
+            end_progress=0.15,
+            start_location="/6/4[chap01]!/4/2/1:0",
+            end_location="/6/4[chap01]!/4/2/3:50",
+        )
+
+        call_kwargs = booklore_client.session.post.call_args
+        payload = call_kwargs.kwargs.get('json') or call_kwargs[1].get('json')
+        assert payload["startLocation"] == "/6/4[chap01]!/4/2/1:0"
+        assert payload["endLocation"] == "/6/4[chap01]!/4/2/3:50"

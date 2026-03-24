@@ -709,6 +709,11 @@
                         <div class="help-text">Restricts sync to a specific library (e.g., 1). Leave empty to sync all.
                         </div>
                     </div>
+                    <div class="checkbox-wrapper full-width">
+                        <input type="checkbox" id="grimmory_sessions" name="GRIMMORY_READING_SESSIONS"
+                            {% if get_bool('GRIMMORY_READING_SESSIONS') %}checked{% endif %}>
+                        <label for="grimmory_sessions">Record Reading Sessions</label>
+                    </div>
                 </div>
             </div>
 
