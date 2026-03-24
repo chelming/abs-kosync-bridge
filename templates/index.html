@@ -89,7 +89,7 @@
                 {% if integrations.bookloreaudio and mapping.audio_source == 'BookLore' and mapping.audio_url %}
                 <a href="{{ mapping.audio_url }}" target="_blank" rel="noopener noreferrer" class="service-item"
                     title="Open Grimmory audiobook">
-                    <img src="/static/grimmory.png" alt="GRA" class="service-icon">
+                    <img src="/static/grimmory.webp" alt="GRA" class="service-icon">
                     <span class="service-name">GR Audio</span>
                     {% if mapping.states.bookloreaudio is defined %}
                     <span class="service-value">{{ '%.1f' | format(mapping.states.bookloreaudio.percentage|default(0)) }}%</span>
@@ -162,7 +162,7 @@
                 {% if integrations.booklore and (mapping.states.booklore is defined or mapping.booklore_id) %}
                 <a href="{{ mapping.booklore_url|default('#') }}" target="_blank" rel="noopener noreferrer"
                     class="service-item" title="Open in Grimmory">
-                    <img src="/static/grimmory.png" alt="BL" class="service-icon">
+                    <img src="/static/grimmory.webp" alt="BL" class="service-icon">
                     <span class="service-name">Grimmory</span>
                     <span class="service-value">
                         {% if mapping.states.booklore is defined %}

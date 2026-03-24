@@ -2,6 +2,7 @@ import os
 import time
 import logging
 import threading
+from datetime import datetime, timezone
 from typing import Optional
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -2023,6 +2024,99 @@ class BookloreClient:
                     "source": "BOOKLORE"
                 })
         return results
+
+    def create_reading_session(
+        self,
+        book_id: int,
+        start_time: float,
+        end_time: float,
+        start_progress: float,
+        end_progress: float,
+        book_type: Optional[str] = None,
+        start_location: Optional[str] = None,
+        end_location: Optional[str] = None,
+    ) -> bool:
+        """
+        Record a reading session in Grimmory.
+
+        Args:
+            book_id: Grimmory book ID (numeric).
+            start_time: Unix timestamp for session start.
+            end_time: Unix timestamp for session end.
+            start_progress: Starting progress as 0-1 fraction.
+            end_progress: Ending progress as 0-1 fraction.
+            book_type: Optional book type ("EPUB", "PDF", "CBX", "AUDIOBOOK").
+            start_location: Optional locator string at session start.
+            end_location: Optional locator string at session end.
+
+        Returns:
+            True if the session was recorded successfully.
+        """
+        duration_seconds = int(end_time - start_time)
+        if duration_seconds <= 0:
+            logger.debug("Grimmory: Skipping reading session with non-positive duration")
+            return False
+
+        # Cap at 4 hours to filter unreasonable durations
+        max_duration = 14400
+        if duration_seconds > max_duration:
+            logger.debug(
+                "Grimmory: Capping session duration from %ds to %ds",
+                duration_seconds, max_duration,
+            )
+            duration_seconds = max_duration
+
+        # Convert progress from 0-1 fraction to 0-100 scale
+        start_pct = round(float(start_progress) * 100, 2)
+        end_pct = round(float(end_progress) * 100, 2)
+        progress_delta = round(end_pct - start_pct, 2)
+
+        # Format duration as human-readable
+        hours, remainder = divmod(duration_seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        if hours > 0:
+            duration_formatted = f"{hours}h {minutes}m"
+        elif minutes > 0:
+            duration_formatted = f"{minutes}m {seconds}s"
+        else:
+            duration_formatted = f"{seconds}s"
+
+        # Convert Unix timestamps to ISO 8601
+        start_iso = datetime.fromtimestamp(start_time, tz=timezone.utc).isoformat()
+        end_iso = datetime.fromtimestamp(end_time, tz=timezone.utc).isoformat()
+
+        payload = {
+            "bookId": int(book_id),
+            "startTime": start_iso,
+            "endTime": end_iso,
+            "durationSeconds": duration_seconds,
+            "durationFormatted": duration_formatted,
+            "startProgress": start_pct,
+            "endProgress": end_pct,
+            "progressDelta": progress_delta,
+        }
+
+        if book_type:
+            payload["bookType"] = book_type
+        if start_location:
+            payload["startLocation"] = str(start_location)
+        if end_location:
+            payload["endLocation"] = str(end_location)
+
+        try:
+            response = self._make_request("POST", "/api/v1/reading-sessions", payload)
+            if response and response.status_code in (200, 201, 202):
+                logger.debug(
+                    "Grimmory: Recorded reading session for book %s (%s, %.1f%% -> %.1f%%)",
+                    book_id, duration_formatted, start_pct, end_pct,
+                )
+                return True
+            status = response.status_code if response else "no response"
+            logger.debug("Grimmory: Failed to record reading session for book %s: %s", book_id, status)
+            return False
+        except Exception as e:
+            logger.debug("Grimmory: Reading session error for book %s: %s", book_id, e)
+            return False
 
     def add_to_shelf(self, ebook_filename, shelf_name=None):
         """Add a book to a shelf, creating the shelf if it doesn't exist."""

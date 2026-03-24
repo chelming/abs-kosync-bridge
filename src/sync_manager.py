@@ -2090,6 +2090,20 @@ class SyncManager:
 
                 logger.info(f"💾 '{abs_id}' '{title_snip}' States saved to database")
 
+                # ── Grimmory Reading Session Recording ──
+                if (
+                    os.environ.get("GRIMMORY_READING_SESSIONS", "true").lower() == "true"
+                    and self.booklore_client
+                    and self.booklore_client.is_configured()
+                    and leader_pct != leader_state.previous_pct
+                ):
+                    try:
+                        self._record_grimmory_reading_session(
+                            book, leader, leader_state, prev_states_by_client, current_time
+                        )
+                    except Exception:
+                        pass  # Non-blocking: never prevent sync
+
                 # Debugging crash: Flush logs to ensure we see this before any potential hard crash
                 for handler in logger.handlers:
                     handler.flush()
@@ -2102,6 +2116,89 @@ class SyncManager:
                 logger.error(f"❌ Sync error: {e}")
 
         logger.debug("End of sync cycle for active books")
+
+    def _record_grimmory_reading_session(
+        self,
+        book,
+        leader: str,
+        leader_state,
+        prev_states_by_client: dict,
+        current_time: float,
+    ) -> None:
+        """Record a reading session to Grimmory when progress changes on a tracked book."""
+        leader_pct = leader_state.current.get('pct', 0)
+        prev_pct = leader_state.previous_pct or 0.0
+
+        # Determine session start time from the leader's previous state timestamp
+        prev_state = prev_states_by_client.get(leader.lower())
+        start_time = (
+            prev_state.last_updated
+            if prev_state and prev_state.last_updated
+            else current_time - 60
+        )
+
+        # Path 1: Ebook reading session (fires for any leader)
+        ebook_grimmory_id = self._resolve_grimmory_ebook_id(book)
+        if ebook_grimmory_id:
+            book_type = None
+            ebook_filename = getattr(book, 'ebook_filename', '') or ''
+            if ebook_filename.lower().endswith('.epub'):
+                book_type = "EPUB"
+            elif ebook_filename.lower().endswith('.pdf'):
+                book_type = "PDF"
+
+            cfi = leader_state.current.get('cfi')
+            self.booklore_client.create_reading_session(
+                book_id=ebook_grimmory_id,
+                start_time=start_time,
+                end_time=current_time,
+                start_progress=prev_pct,
+                end_progress=leader_pct,
+                book_type=book_type,
+                end_location=cfi,
+            )
+
+        # Path 2: Audiobook session (only when BookLoreAudio leads)
+        if leader == "BookLoreAudio" and getattr(book, 'audio_source', None) == "BookLore":
+            audio_grimmory_id = (
+                getattr(book, 'audio_provider_book_id', None)
+                or getattr(book, 'audio_source_id', None)
+            )
+            if audio_grimmory_id:
+                try:
+                    self.booklore_client.create_reading_session(
+                        book_id=int(audio_grimmory_id),
+                        start_time=start_time,
+                        end_time=current_time,
+                        start_progress=prev_pct,
+                        end_progress=leader_pct,
+                        book_type="AUDIOBOOK",
+                    )
+                except (TypeError, ValueError):
+                    pass
+
+    def _resolve_grimmory_ebook_id(self, book):
+        """Resolve the Grimmory book ID for a book's ebook. Returns int or None."""
+        # Fast path: book explicitly sourced from Grimmory
+        if getattr(book, 'ebook_source', None) == "BookLore" and getattr(book, 'ebook_source_id', None):
+            try:
+                return int(book.ebook_source_id)
+            except (TypeError, ValueError):
+                pass
+
+        # Slow path: filename lookup (no cache refresh to avoid blocking sync)
+        epub = getattr(book, 'original_ebook_filename', None) or getattr(book, 'ebook_filename', None)
+        if not epub:
+            return None
+
+        bl_book = self.booklore_client.find_book_by_filename(epub, allow_refresh=False)
+        if bl_book and bl_book.get('id'):
+            try:
+                return int(bl_book['id'])
+            except (TypeError, ValueError):
+                pass
+
+        return None
 
     def clear_progress(self, abs_id):
         """
