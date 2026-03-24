@@ -149,3 +149,11 @@ You can start in either of these ways:
 5. Click **Create Mapping**.
 
 That is enough to get syncing started. The normal background cycle runs every 5 minutes by default, and instant sync can react faster when supported by the source.
+
+---
+
+## Optional: KOReader Plugin
+
+If you want KOReader to download and manage bridge-provided books for you, you can also install the optional **Bridge Sync** KOReader plugin from the project's GitHub Releases page.
+
+This is optional. The bridge works without it.
