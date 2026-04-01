@@ -17,6 +17,7 @@ All notable changes to ABS-KoSync Enhanced will be documented in this file.
 ### Changed
 
 - The **Whisper Model** field in Settings now accepts custom values instead of only the built-in preset list.
+- The **Bridge Sync** KOReader plugin now keeps its settings submenu open while you make multiple configuration changes, and the **Managed Folder** setting now uses a folder picker instead of manual path entry.
 - Storyteller Forge now uploads staged EPUB and audio files directly to Storyteller over the REST/TUS API instead of relying on watched-library folder hand-offs.
 - Storyteller direct-upload settings now expose `STORYTELLER_UPLOAD_CHUNK_SIZE` for tuning TUS PATCH chunk size when needed.
 - Grimmory compatibility was broadened across search, cache refresh, downloads, and progress/session handling so newer Grimmory installs work more reliably as both ebook and audiobook sources.

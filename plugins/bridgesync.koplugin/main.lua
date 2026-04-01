@@ -14,6 +14,13 @@ local FFIUtil = require("ffi/util")
 local buffer = require("string.buffer")
 local socket = require("socket")
 local APIClient = require("bridge_api_client")
+local PathChooser
+do
+    local ok, mod = pcall(require, "ui/widget/pathchooser")
+    if ok then
+        PathChooser = mod
+    end
+end
 local DirChooser
 do
     local ok, mod = pcall(require, "ui/widget/dirchooser")
@@ -200,10 +207,85 @@ function BridgeSync:_currentFileManagerPath()
     return self:_normalizePath(current_path)
 end
 
-function BridgeSync:_showManagedFolderChooser()
+function BridgeSync:_refreshMenu(touchmenu_instance)
+    if touchmenu_instance and touchmenu_instance.updateItems then
+        touchmenu_instance:updateItems()
+    end
+end
+
+function BridgeSync:_refreshCollectionsUI()
+    local ok_read, ReadCollection = pcall(require, "readcollection")
+    if not ok_read or not ReadCollection then
+        return
+    end
+
+    local seen = {}
+    local instances = {}
+    local function addInstance(ui)
+        if ui and not seen[ui] then
+            seen[ui] = true
+            table.insert(instances, ui)
+        end
+    end
+
+    local ok_fm, FileManager = pcall(require, "apps/filemanager/filemanager")
+    if ok_fm and FileManager and FileManager.instance then
+        addInstance(FileManager.instance)
+    end
+
+    local ok_reader, ReaderUI = pcall(require, "apps/reader/readerui")
+    if ok_reader and ReaderUI and ReaderUI.instance then
+        addInstance(ReaderUI.instance)
+    end
+
+    for _, ui in ipairs(instances) do
+        local collections = ui.collections
+        if collections then
+            if collections.coll_list and collections.updateCollListItemTable then
+                collections:updateCollListItemTable(true)
+            end
+            if collections.booklist_menu and collections.updateItemTable then
+                local current_collection = collections.booklist_menu.path
+                if ReadCollection.coll and ReadCollection.coll[current_collection] then
+                    collections:updateItemTable()
+                elseif collections.booklist_menu.close_callback then
+                    collections.booklist_menu.close_callback()
+                end
+            end
+            if collections.coll_folder_list and collections.updateCollFolderListItemTable then
+                collections:updateCollFolderListItemTable()
+            end
+        end
+    end
+end
+
+function BridgeSync:_showManagedFolderChooser(touchmenu_instance)
     local start_path = self.download_dir
     if lfs.attributes(start_path, "mode") ~= "directory" then
         start_path = self:_detectDefaultDownloadDir()
+    end
+
+    if PathChooser then
+        local chooser
+        chooser = PathChooser:new{
+            select_directory = true,
+            select_file = false,
+            show_files = false,
+            path = start_path,
+            title = _("Managed Folder"),
+            onConfirm = function(path)
+                local selected = self:_normalizePath(path)
+                if selected == "" then
+                    return
+                end
+                self.download_dir = selected
+                self:_saveSettings()
+                self:_refreshMenu(touchmenu_instance)
+                self:_showMessage(T(_("Managed Folder set to %1"), self.download_dir), 3)
+            end,
+        }
+        UIManager:show(chooser)
+        return
     end
 
     if DirChooser then
@@ -218,6 +300,7 @@ function BridgeSync:_showManagedFolderChooser()
                 end
                 self.download_dir = selected
                 self:_saveSettings()
+                self:_refreshMenu(touchmenu_instance)
                 self:_showMessage(T(_("Managed Folder set to %1"), self.download_dir), 3)
             end,
         }
@@ -225,19 +308,7 @@ function BridgeSync:_showManagedFolderChooser()
         return
     end
 
-    self:_promptForSetting(
-        _("Managed Folder"),
-        self.download_dir,
-        _("Enter managed folder path"),
-        function(value)
-            local selected = self:_normalizePath(value)
-            if selected == "" then
-                return
-            end
-            self.download_dir = selected
-            self:_saveSettings()
-        end
-    )
+    self:_showMessage(_("Managed Folder picker is not available on this KOReader build"), 4)
 end
 
 function BridgeSync:_runInSubprocess(task)
@@ -313,7 +384,7 @@ function BridgeSync:_runInSubprocess(task)
     return true
 end
 
-function BridgeSync:_promptForSetting(title, current_value, hint, setter, is_password)
+function BridgeSync:_promptForSetting(title, current_value, hint, setter, is_password, after_save)
     local dialog
     dialog = InputDialog:new{
         title = title,
@@ -334,6 +405,9 @@ function BridgeSync:_promptForSetting(title, current_value, hint, setter, is_pas
                     callback = function()
                         setter(dialog:getInputText() or "")
                         UIManager:close(dialog)
+                        if after_save then
+                            after_save()
+                        end
                     end,
                 },
             },
@@ -771,16 +845,20 @@ function BridgeSync:_runSync()
 end
 
 function BridgeSync:_updateCollections(items)
-    local collection_path = DataStorage:getSettingsDir() .. "/collection.lua"
-    local ok_open, collections = pcall(LuaSettings.open, LuaSettings, collection_path)
-    if not ok_open or not collections then
-        self:logWarn("Could not open collection.lua for writing")
+    local ok_read, ReadCollection = pcall(require, "readcollection")
+    if not ok_read or not ReadCollection then
+        self:logWarn("Could not load readcollection for Bridge Sync collections")
         return
     end
 
-    local prev_managed = self.settings:readSetting("managed_collections") or {}
-    for _, name in ipairs(prev_managed) do
-        collections:delSetting(name)
+    local ok_reload, reload_err = pcall(function()
+        if ReadCollection._read then
+            ReadCollection:_read()
+        end
+    end)
+    if not ok_reload then
+        self:logWarn("Could not reload KOReader collections:", tostring(reload_err or "unknown error"))
+        return
     end
 
     local shelf_books = {}
@@ -788,26 +866,52 @@ function BridgeSync:_updateCollections(items)
         if entry.shelves and type(entry.shelves) == "table" and entry.local_path and self:_fileExists(entry.local_path) then
             for _, shelf_name in ipairs(entry.shelves) do
                 if not shelf_books[shelf_name] then
-                    shelf_books[shelf_name] = {}
+                    shelf_books[shelf_name] = {
+                        files = {},
+                        seen = {},
+                    }
                 end
-                table.insert(shelf_books[shelf_name], entry.local_path)
+                if not shelf_books[shelf_name].seen[entry.local_path] then
+                    shelf_books[shelf_name].seen[entry.local_path] = true
+                    table.insert(shelf_books[shelf_name].files, entry.local_path)
+                end
             end
         end
     end
 
+    local prev_managed = self.settings:readSetting("managed_collections") or {}
     local new_managed = {}
-    for shelf_name, files in pairs(shelf_books) do
-        local data = { settings = { order = 1 } }
-        for i, file_path in ipairs(files) do
-            table.insert(data, { file = file_path, order = i })
+    local ok_update, update_err = pcall(function()
+        for _, name in ipairs(prev_managed) do
+            if ReadCollection.removeCollection then
+                ReadCollection:removeCollection(name)
+            end
         end
-        collections:saveSetting(shelf_name, data)
-        table.insert(new_managed, shelf_name)
+
+        for shelf_name, shelf_data in pairs(shelf_books) do
+            if ReadCollection.removeCollection then
+                ReadCollection:removeCollection(shelf_name)
+            end
+            ReadCollection:addCollection(shelf_name)
+            if ReadCollection.coll_settings and ReadCollection.coll_settings[shelf_name] then
+                ReadCollection.coll_settings[shelf_name].order = 1
+            end
+            for _, file_path in ipairs(shelf_data.files) do
+                ReadCollection:addItem(file_path, shelf_name)
+            end
+            table.insert(new_managed, shelf_name)
+        end
+
+        ReadCollection:write()
+    end)
+    if not ok_update then
+        self:logWarn("Could not update KOReader collections:", tostring(update_err or "unknown error"))
+        return
     end
 
-    collections:flush()
     self.settings:saveSetting("managed_collections", new_managed)
     self.settings:flush()
+    self:_refreshCollectionsUI()
 
     if #new_managed > 0 then
         self:logInfo("Updated", #new_managed, "KOReader collection(s) from shelf data")
@@ -1140,12 +1244,14 @@ function BridgeSync:addToMainMenu(menu_items)
         sub_item_table = {
             {
                 text = _("Enable Sync"),
+                keep_menu_open = true,
                 checked_func = function()
                     return self.is_enabled
                 end,
-                callback = function()
+                callback = function(touchmenu_instance)
                     self.is_enabled = not self.is_enabled
                     self:_saveSettings()
+                    self:_refreshMenu(touchmenu_instance)
                     self:_showMessage(
                         self.is_enabled and _("Bridge Sync enabled") or _("Bridge Sync disabled"),
                         2
@@ -1162,62 +1268,74 @@ function BridgeSync:addToMainMenu(menu_items)
             },
             {
                 text = _("Manual Only"),
+                keep_menu_open = true,
                 checked_func = function()
                     return self.manual_only
                 end,
-                callback = function()
+                callback = function(touchmenu_instance)
                     self.manual_only = not self.manual_only
                     self:_saveSettings()
+                    self:_refreshMenu(touchmenu_instance)
                 end,
             },
             {
                 text = _("Auto-Sync on Wake"),
+                keep_menu_open = true,
                 checked_func = function()
                     return self.auto_sync_on_resume
                 end,
-                callback = function()
+                callback = function(touchmenu_instance)
                     self.auto_sync_on_resume = not self.auto_sync_on_resume
                     self:_saveSettings()
+                    self:_refreshMenu(touchmenu_instance)
                 end,
             },
             {
                 text = _("Auto-Sync on Network"),
+                keep_menu_open = true,
                 checked_func = function()
                     return self.auto_sync_on_network
                 end,
-                callback = function()
+                callback = function(touchmenu_instance)
                     self.auto_sync_on_network = not self.auto_sync_on_network
                     self:_saveSettings()
+                    self:_refreshMenu(touchmenu_instance)
                 end,
             },
             {
                 text = _("Do Not Sync While Reading"),
+                keep_menu_open = true,
                 checked_func = function()
                     return self.do_not_sync_while_book_open
                 end,
-                callback = function()
+                callback = function(touchmenu_instance)
                     self.do_not_sync_while_book_open = not self.do_not_sync_while_book_open
                     self:_saveSettings()
+                    self:_refreshMenu(touchmenu_instance)
                 end,
             },
             {
                 text = _("Delete Removed Books"),
+                keep_menu_open = true,
                 checked_func = function()
                     return self.delete_removed_books
                 end,
-                callback = function()
+                callback = function(touchmenu_instance)
                     self.delete_removed_books = not self.delete_removed_books
                     self:_saveSettings()
+                    self:_refreshMenu(touchmenu_instance)
                 end,
             },
             {
                 text = _("Track Reading Sessions"),
+                keep_menu_open = true,
                 checked_func = function()
                     return self.session_tracking_enabled
                 end,
-                callback = function()
+                callback = function(touchmenu_instance)
                     self.session_tracking_enabled = not self.session_tracking_enabled
                     self:_saveSettings()
+                    self:_refreshMenu(touchmenu_instance)
                 end,
             },
             {
@@ -1240,7 +1358,8 @@ function BridgeSync:addToMainMenu(menu_items)
                 text_func = function()
                     return T(_("Server URL: %1"), self.server_url ~= "" and self.server_url or _("Not set"))
                 end,
-                callback = function()
+                keep_menu_open = true,
+                callback = function(touchmenu_instance)
                     self:_promptForSetting(
                         _("Bridge Server URL"),
                         self.server_url,
@@ -1248,6 +1367,10 @@ function BridgeSync:addToMainMenu(menu_items)
                         function(value)
                             self.server_url = value
                             self:_saveSettings()
+                        end,
+                        nil,
+                        function()
+                            self:_refreshMenu(touchmenu_instance)
                         end
                     )
                 end,
@@ -1256,7 +1379,8 @@ function BridgeSync:addToMainMenu(menu_items)
                 text_func = function()
                     return T(_("Username: %1"), self.username ~= "" and self.username or _("Not set"))
                 end,
-                callback = function()
+                keep_menu_open = true,
+                callback = function(touchmenu_instance)
                     self:_promptForSetting(
                         _("Bridge Username"),
                         self.username,
@@ -1264,13 +1388,18 @@ function BridgeSync:addToMainMenu(menu_items)
                         function(value)
                             self.username = value
                             self:_saveSettings()
+                        end,
+                        nil,
+                        function()
+                            self:_refreshMenu(touchmenu_instance)
                         end
                     )
                 end,
             },
             {
                 text = _("Configure Key"),
-                callback = function()
+                keep_menu_open = true,
+                callback = function(touchmenu_instance)
                     self:_promptForSetting(
                         _("Bridge Key"),
                         self.key,
@@ -1279,7 +1408,10 @@ function BridgeSync:addToMainMenu(menu_items)
                             self.key = value
                             self:_saveSettings()
                         end,
-                        true
+                        true,
+                        function()
+                            self:_refreshMenu(touchmenu_instance)
+                        end
                     )
                 end,
             },
@@ -1287,7 +1419,8 @@ function BridgeSync:addToMainMenu(menu_items)
                 text_func = function()
                     return T(_("Wake Sync Delay: %1s"), self.wake_sync_delay_seconds)
                 end,
-                callback = function()
+                keep_menu_open = true,
+                callback = function(touchmenu_instance)
                     self:_promptForSetting(
                         _("Wake Sync Delay"),
                         tostring(self.wake_sync_delay_seconds),
@@ -1300,6 +1433,10 @@ function BridgeSync:addToMainMenu(menu_items)
                             else
                                 self:_showMessage(_("Wake Sync Delay must be at least 5 seconds"), 3)
                             end
+                        end,
+                        nil,
+                        function()
+                            self:_refreshMenu(touchmenu_instance)
                         end
                     )
                 end,
@@ -1308,8 +1445,9 @@ function BridgeSync:addToMainMenu(menu_items)
                 text_func = function()
                     return T(_("Managed Folder: %1"), self.download_dir)
                 end,
-                callback = function()
-                    self:_showManagedFolderChooser()
+                keep_menu_open = true,
+                callback = function(touchmenu_instance)
+                    self:_showManagedFolderChooser(touchmenu_instance)
                 end,
             },
             {

@@ -43,6 +43,7 @@ Output is written to `dist/plugins/`.
 ## Configure
 
 All settings are in KOReader under **Tools > Bridge Sync**.
+The settings menu stays open while you adjust configuration values so you can make several changes in one pass.
 
 ### Connection
 
@@ -64,7 +65,7 @@ All settings are in KOReader under **Tools > Bridge Sync**.
 | Auto-Sync on Network       | Off     | Syncs when WiFi reconnects                                                  |
 | Do Not Sync While Reading  | On      | Skips automatic sync if a book is currently open                            |
 | Wake Sync Delay            | 30s     | Seconds to wait after wake before syncing (minimum 5s)                      |
-| Managed Folder             | Auto    | Local directory where books are downloaded (auto-detected per device)        |
+| Managed Folder             | Auto    | Local directory where books are downloaded (chosen with the KOReader folder picker) |
 | Delete Removed Books       | Off     | Deletes local files that are no longer in the bridge manifest               |
 
 ### Reading Sessions
