@@ -4,7 +4,7 @@ For the full history of changes, please refer to the **[GitHub Releases](https:/
 
 ---
 
-## [Unreleased]
+## [6.4.0] - 2026-04-04
 
 ### Added
 

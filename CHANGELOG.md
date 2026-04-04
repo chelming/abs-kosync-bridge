@@ -4,7 +4,7 @@
 
 All notable changes to ABS-KoSync Enhanced will be documented in this file.
 
-## [Unreleased]
+## [6.4.0] - 2026-04-04
 
 ### Added
 
@@ -460,7 +460,6 @@ If you see "Using Storyteller SQLite fallback", check your credentials.
 
 <details>
 <summary>Archived legacy reference</summary>
-
 
 <!-- markdownlint-disable MD060 -->
 
