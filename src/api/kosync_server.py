@@ -188,6 +188,14 @@ def _get_kosync_session_type(book) -> str:
 
 
 def _persist_grouped_kosync_session(session_data: dict) -> None:
+    if not _supports_estimated_kosync_sessions(session_data["device"], session_data["device_id"]):
+        logger.debug(
+            "KOSync estimated session skipped for '%s' (device '%s' classified as plugin/ignored)",
+            session_data["title"],
+            session_data["device"] or "unknown",
+        )
+        return
+
     duration_seconds = int(session_data["last_time"] - session_data["start_time"])
     if duration_seconds < _KOSYNC_SESSION_MIN_SECONDS or duration_seconds > _KOSYNC_SESSION_MAX_SECONDS:
         return
@@ -240,7 +248,32 @@ def _discard_open_kosync_session(document_hash: str | None, device: str | None, 
         return False
     session_key = _get_kosync_session_key(document_hash, device, device_id)
     with _kosync_open_sessions_lock:
-        return _kosync_open_sessions.pop(session_key, None) is not None
+        removed = _kosync_open_sessions.pop(session_key, None) is not None
+    logger.debug(
+        "_discard_open_kosync_session: key='%s' found=%s",
+        session_key,
+        removed,
+    )
+    return removed
+
+
+def _discard_open_kosync_sessions_for_book(abs_id: str) -> list[dict]:
+    """Remove and return all open estimated sessions for a given book, matched by abs_id.
+
+    Used as a fallback when the document-hash/device key-based discard cannot resolve
+    the session key (e.g. because the KosyncDocument has no device info populated).
+    """
+    with _kosync_open_sessions_lock:
+        keys = [k for k, v in _kosync_open_sessions.items() if v.get("abs_id") == abs_id]
+        removed = [_kosync_open_sessions.pop(k) for k in keys]
+    if removed:
+        logger.debug(
+            "_discard_open_kosync_sessions_for_book: abs_id='%s' discarded %d session(s): %s",
+            abs_id,
+            len(removed),
+            [s.get("device") or "unknown" for s in removed],
+        )
+    return removed
 
 
 def _flush_stale_kosync_sessions(now_ts: float | None = None) -> None:
@@ -859,6 +892,51 @@ def koreader_device_sync_download(abs_id):
     return response
 
 
+@kosync_sync_bp.route('/device-sync/statistics', methods=['POST'])
+@kosync_sync_bp.route('/koreader/device-sync/statistics', methods=['POST'])
+@kosync_auth_required
+def koreader_upload_statistics():
+    """Receive incremental KOReader reading statistics uploads."""
+    data = request.json
+    if not data or not isinstance(data, dict):
+        return jsonify({"error": "Expected JSON object"}), 400
+
+    books = data.get("books")
+    page_stats = data.get("page_stats")
+    if not isinstance(books, list) or not isinstance(page_stats, list):
+        return jsonify({"error": "Expected 'books' and 'page_stats' arrays"}), 400
+
+    device = str(data.get("device") or "").strip()
+    device_id = str(data.get("device_id") or "").strip()
+    device_key = (device_id or device).strip()
+    if not device_key:
+        return jsonify({"error": "Missing device identity"}), 400
+
+    if not _database_service:
+        return jsonify({"error": "Database service unavailable"}), 503
+
+    try:
+        accepted_books = _database_service.upsert_koreader_book_stats(
+            device=device,
+            device_id=device_id,
+            books=books,
+        )
+        page_insert_result = _database_service.bulk_insert_koreader_page_stats(
+            device=device,
+            device_id=device_id,
+            page_stats=page_stats,
+        )
+    except Exception as e:
+        logger.error("KOReader statistics upload failed for device '%s': %s", device_key, e)
+        return jsonify({"error": "Failed to persist statistics upload"}), 500
+
+    return jsonify({
+        "accepted_books": int(accepted_books or 0),
+        "accepted_page_stats": int(page_insert_result.get("accepted") or 0),
+        "duplicate_page_stats": int(page_insert_result.get("duplicates") or 0),
+    }), 200
+
+
 @kosync_sync_bp.route('/device-sync/sessions', methods=['POST'])
 @kosync_sync_bp.route('/koreader/device-sync/sessions', methods=['POST'])
 @kosync_auth_required
@@ -971,6 +1049,47 @@ def kosync_upload_sessions():
                     )
                 except Exception as e:
                     logger.warning(f"Session upload: failed to classify plugin-backed device for '{abs_id}': {e}")
+
+        # Fallback: discard any remaining open estimated sessions for this book by abs_id.
+        # Handles the case where kosync_doc had no device info and the key-based discard above was
+        # skipped entirely — e.g. when the plugin's document_hash maps to a stub KosyncDocument
+        # with no device fields (common when the plugin file hash differs from the KOSync PUT hash).
+        # Also classify those devices as plugin-backed so future PUT requests don't re-open sessions.
+        fallback_discarded = _discard_open_kosync_sessions_for_book(abs_id)
+        if fallback_discarded:
+            logger.info(
+                "Session upload: fallback-discarded %d open estimated session(s) for book '%s'",
+                len(fallback_discarded),
+                abs_id,
+            )
+            fallback_seen_time = None
+            try:
+                fallback_seen_time = datetime.utcfromtimestamp(float(end_time)) if end_time is not None else None
+            except (TypeError, ValueError, OSError):
+                pass
+            for est_session in fallback_discarded:
+                est_device = est_session.get("device")
+                est_device_id = est_session.get("device_id")
+                if (est_device or est_device_id) and not _is_internal_kosync_device(est_device, est_device_id):
+                    try:
+                        _upsert_kosync_device_session_entry(
+                            device=est_device,
+                            device_id=est_device_id,
+                            mode="plugin",
+                            source="plugin_session_auto",
+                            last_document_hash=doc_hash,
+                            seen_time=fallback_seen_time,
+                        )
+                        logger.info(
+                            "Session upload: classified device '%s' (%s) as plugin-backed via open session fallback",
+                            est_device or "unknown",
+                            est_device_id or "no-device-id",
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "Session upload: failed to classify device from open session for '%s': %s",
+                            abs_id, e,
+                        )
 
         # Forward to Grimmory if configured
         if (
