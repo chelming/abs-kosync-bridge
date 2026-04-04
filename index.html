@@ -825,7 +825,7 @@
 
 <hr />
 <h2 id="what-is-it">What is it?</h2>
-<p><strong>ABS-KoSync Enhanced</strong> is a self-hosted sync engine for audiobooks and ebooks. It keeps your reading and listening position aligned across multiple apps, whether the source is Audiobookshelf, Booklore, KOReader, or Storyteller.</p>
+<p><strong>ABS-KoSync Enhanced</strong> is a self-hosted sync engine for audiobooks and ebooks. It keeps your reading and listening position aligned across multiple apps, whether the source is Audiobookshelf, Grimmory, KOReader, or Storyteller.</p>
 <h3 id="five-way-synchronization">Five-Way Synchronization</h3>
 <table>
 <thead>
@@ -852,7 +852,7 @@
 <td style="text-align: left;">Full read/write sync</td>
 </tr>
 <tr>
-<td style="text-align: left;"><strong>Booklore</strong></td>
+<td style="text-align: left;"><strong>Grimmory</strong></td>
 <td style="text-align: left;">Ebooks + audiobooks</td>
 <td style="text-align: left;">Full read/write sync</td>
 </tr>
@@ -867,8 +867,8 @@
 <h2 id="features">Features</h2>
 <h3 id="core-sync-engine">Core Sync Engine</h3>
 <ul>
-<li><strong>Five-way sync</strong> across Audiobookshelf, KOReader, Storyteller, Booklore, and Hardcover.</li>
-<li><strong>Flexible source support</strong>: use Audiobookshelf or Booklore as the audio source, or create ebook-only links when no audiobook is needed.</li>
+<li><strong>Five-way sync</strong> across Audiobookshelf, KOReader, Storyteller, Grimmory, and Hardcover.</li>
+<li><strong>Flexible source support</strong>: use Audiobookshelf or Grimmory as the audio source, or create ebook-only links when no audiobook is needed.</li>
 <li><strong>Split-port security</strong> so the KOSync endpoint can be exposed separately from the dashboard.</li>
 <li><strong>Smart conflict handling</strong> with anti-regression guardrails and a deadband to avoid tiny cross-format bounce-backs.</li>
 <li><strong>Rich locators</strong> using timestamps, href/fragment data, XPath, and EPUB CFI where available.</li>
@@ -877,19 +877,21 @@
 </ul>
 <h3 id="management-web-ui">Management Web UI</h3>
 <ul>
-<li><strong>Dashboard</strong> for live sync status, direct service links, and source badges.</li>
-<li><strong>Add Book</strong> for ABS, Booklore, Storyteller, or ebook-only matching flows.</li>
+<li><strong>Dashboard</strong> for live sync status, reading session details, direct service links, and source badges.</li>
+<li><strong>Add Book</strong> for ABS, Grimmory, Storyteller, or ebook-only matching flows.</li>
 <li><strong>Batch Match</strong> for queue-based review and bulk linking.</li>
 <li><strong>Library Suggestions</strong> for background scanning, review, and queue building.</li>
 <li><strong>Forge</strong> for Storyteller read-along preparation.</li>
-<li><strong>Dynamic Settings</strong> with automatic restart after saving.</li>
+<li><strong>Dynamic Settings</strong> with live connection tests and automatic restart after saving.</li>
+<li><strong>Flexible setup</strong> including an intentional Audiobookshelf-off mode for ebook-only or maintenance-focused use.</li>
+<li><strong>Optional Bridge Sync plugin support</strong> for turning Grimmory shelves into KOReader collections.</li>
 </ul>
 <h3 id="automation-and-reliability">Automation and Reliability</h3>
 <ul>
 <li><strong>Background daemon</strong> with configurable polling.</li>
 <li><strong>Instant sync</strong> from ABS playback events and KOReader pushes when enabled.</li>
-<li><strong>Per-client polling</strong> for Storyteller and Booklore.</li>
-<li><strong>Booklore cache refresh</strong> and Storyteller backfill maintenance tools.</li>
+<li><strong>Per-client polling</strong> for Storyteller and Grimmory.</li>
+<li><strong>Grimmory cache refresh</strong> and Storyteller backfill maintenance tools.</li>
 </ul>
 <hr />
 <h2 id="how-it-works">How It Works</h2>
@@ -920,8 +922,8 @@
     L --&gt; A
 </code></pre></div>
 <div class="admonition note">
-<p class="admonition-title">Storyteller and Booklore</p>
-<p>Storyteller transcript assets improve locator quality, and Booklore can now act as either an ebook target or the audiobook source for a mapping.</p>
+<p class="admonition-title">Storyteller and Grimmory</p>
+<p>Storyteller transcript assets improve locator quality, and Grimmory can now act as either an ebook target or the audiobook source for a mapping.</p>
 </div>
 
 

@@ -580,15 +580,15 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
-  <a href="#633-2026-03-08" class="md-nav__link">
+  <a href="#640-2026-04-04" class="md-nav__link">
     <span class="md-ellipsis">
       
-        [6.3.3] - 2026-03-08
+        [6.4.0] - 2026-04-04
       
     </span>
   </a>
   
-    <nav class="md-nav" aria-label="[6.3.3] - 2026-03-08">
+    <nav class="md-nav" aria-label="[6.4.0] - 2026-04-04">
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
@@ -615,6 +615,56 @@
         
           <li class="md-nav__item">
   <a href="#fixed" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Fixed
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#633-2026-03-08" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        [6.3.3] - 2026-03-08
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="[6.3.3] - 2026-03-08">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#added_1" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Added
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#changed_1" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Changed
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#fixed_1" class="md-nav__link">
     <span class="md-ellipsis">
       
         Fixed
@@ -714,15 +764,15 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
-  <a href="#633-2026-03-08" class="md-nav__link">
+  <a href="#640-2026-04-04" class="md-nav__link">
     <span class="md-ellipsis">
       
-        [6.3.3] - 2026-03-08
+        [6.4.0] - 2026-04-04
       
     </span>
   </a>
   
-    <nav class="md-nav" aria-label="[6.3.3] - 2026-03-08">
+    <nav class="md-nav" aria-label="[6.4.0] - 2026-04-04">
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
@@ -749,6 +799,56 @@
         
           <li class="md-nav__item">
   <a href="#fixed" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Fixed
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#633-2026-03-08" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        [6.3.3] - 2026-03-08
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="[6.3.3] - 2026-03-08">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#added_1" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Added
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#changed_1" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Changed
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#fixed_1" class="md-nav__link">
     <span class="md-ellipsis">
       
         Fixed
@@ -836,32 +936,65 @@
 <h1 id="changelog">Changelog</h1>
 <p>For the full history of changes, please refer to the <strong><a href="https://github.com/cporcellijr/abs-kosync-bridge/releases">GitHub Releases</a></strong> page.</p>
 <hr />
-<h2 id="633-2026-03-08">[6.3.3] - 2026-03-08</h2>
+<h2 id="640-2026-04-04">[6.4.0] - 2026-04-04</h2>
 <h3 id="added">Added</h3>
 <ul>
-<li>Added a dedicated <strong>Library Suggestions</strong> workspace with background scans, cached repeat scans, and a <strong>Full Refresh</strong> option.</li>
-<li>Added <strong>Booklore audiobook</strong> support across Match, Batch Match, Suggestions, Forge, and the dashboard.</li>
-<li>Added more flexible linking flows, including ebook-only links, Storyteller-only links, and a <strong>Refresh Booklore Cache</strong> action in Settings.</li>
+<li>Added an optional <strong>Bridge Sync</strong> KOReader plugin for pulling bridge-managed books into a device folder.</li>
+<li>Added <strong>Find IDs</strong> helpers for Audiobookshelf and Grimmory library ID settings, with dropdown pickers after lookup.</li>
+<li>Added an intentional <strong>ABS disabled</strong> mode for ebook-only or maintenance-focused deployments.</li>
+<li>Added Grimmory shelf and magic shelf support for <strong>Bridge Sync</strong> plugin collection syncing.</li>
+<li>Added a Grimmory shelf picker in Settings to make Bridge Sync collection setup easier.</li>
 </ul>
 <h3 id="changed">Changed</h3>
+<ul>
+<li>The <strong>Whisper Model</strong> setting now accepts custom values instead of only a fixed preset list.</li>
+<li>Forge now uploads EPUB and audio inputs directly to Storyteller through the REST/TUS API instead of depending on a watched library hand-off.</li>
+<li>Added documentation for <code>STORYTELLER_UPLOAD_CHUNK_SIZE</code> so direct-upload chunk size can be tuned when needed.</li>
+<li>Grimmory compatibility and session handling were expanded so newer Grimmory installs behave more reliably as both ebook and audiobook sources.</li>
+<li>Settings now test the values currently in the form and show a restart page after saving.</li>
+<li>Dashboard cards now show reading session details.</li>
+<li>Match, Batch Match, Suggestions, and Forge now show clearer working feedback when you start an action.</li>
+<li>Built-in KOSync testing in Settings now works with the values currently in the form.</li>
+</ul>
+<h3 id="fixed">Fixed</h3>
+<ul>
+<li>Fixed Grimmory session writes so reading and listening sessions stay in the format Grimmory expects.</li>
+<li>Fixed Storyteller direct-upload metadata formatting so Forge no longer fails with <code>400 Invalid upload-metadata</code> on Storyteller <code>web-v2.9.3</code>.</li>
+<li>Fixed Storyteller direct-upload metadata and readiness issues that could break Forge imports.</li>
+<li>Fixed deadband rollback behavior so tiny audiobook-vs-ebook gaps still avoid leader flapping without pushing older ABS progress back onto newer high-confidence ebook locators.</li>
+<li>Fixed Grimmory progress, cache, and download edge cases that could break matching or syncing.</li>
+<li>Fixed several sync stability issues around finished-book suggestions, KOReader locators, and replayed instant-sync events.</li>
+<li>Fixed Grimmory session reporting so reading and listening sessions are recorded more reliably.</li>
+<li>Fixed dashboard sync warnings so old inactive states do not create misleading out-of-sync messages.</li>
+<li>Fixed the built-in KOSync Test button so it no longer requires saving first.</li>
+</ul>
+<hr />
+<h2 id="633-2026-03-08">[6.3.3] - 2026-03-08</h2>
+<h3 id="added_1">Added</h3>
+<ul>
+<li>Added a dedicated <strong>Library Suggestions</strong> workspace with background scans, cached repeat scans, and a <strong>Full Refresh</strong> option.</li>
+<li>Added <strong>Grimmory audiobook</strong> support across Match, Batch Match, Suggestions, Forge, and the dashboard.</li>
+<li>Added more flexible linking flows, including ebook-only links, Storyteller-only links, and a <strong>Refresh Grimmory Cache</strong> action in Settings.</li>
+</ul>
+<h3 id="changed_1">Changed</h3>
 <ul>
 <li>Match and dashboard views now show clearer source badges and audio-source details.</li>
 <li>Storyteller transcript ingest now accepts more real-world layouts while staying the preferred timing source when available.</li>
 </ul>
-<h3 id="fixed">Fixed</h3>
+<h3 id="fixed_1">Fixed</h3>
 <ul>
 <li>Fixed cross-format drift cases that could cause bounce-backs or bad resets.</li>
 <li>Fixed ebook-only links getting stuck in processing.</li>
-<li>Fixed edge cases where Storyteller-only links or stale Booklore data could break matching or syncing.</li>
+<li>Fixed edge cases where Storyteller-only links or stale Grimmory data could break matching or syncing.</li>
 </ul>
 <hr />
 <h2 id="630-2026-02-18">[6.3.0] - 2026-02-18</h2>
 <h3 id="features">🚀 Features</h3>
 <ul>
 <li><strong>Tri-Link Architecture</strong>: Maintain a three-way link between ABS audiobook, KOReader ebook, and Storyteller entries.</li>
-<li><strong>Auto-Forge Pipeline</strong>: Automated downloading, staging, and hand-off to Storyteller for processing. Triggered from the Matcher — automatically creates the sync mapping after Storyteller finishes.</li>
+<li><strong>Auto-Forge Pipeline</strong>: Automated downloading, staging, and upload to Storyteller for processing. Triggered from the Matcher — automatically creates the sync mapping after Storyteller finishes.</li>
 <li><strong>Hardcover.app Audiobook Support</strong>: Link specific editions and sync listening progress (in seconds).</li>
-<li><strong>Booklore &amp; CWA (OPDS) Integration</strong>: Fetch ebooks from Booklore and OPDS sources.</li>
+<li><strong>Grimmory &amp; CWA (OPDS) Integration</strong>: Fetch ebooks from Grimmory and OPDS sources.</li>
 <li><strong>Split-Port Security Mode</strong>: Run sync and admin UI on separate ports.</li>
 <li><strong>New Transcription Providers</strong>: Support for Whisper.cpp Server, Deepgram API, and CUDA GPU acceleration.</li>
 <li><strong>Progress Suggestions</strong>: Smart auto-discovery and suggestions for potential matches.</li>
