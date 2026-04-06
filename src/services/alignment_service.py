@@ -650,7 +650,7 @@ def _is_storyteller_wordtimeline_chapter(chapter_path: Path) -> bool:
 
 
 def _validate_storyteller_chapters(
-    transcriptions_dir: Path, expected_count: int
+    transcriptions_dir: Path,
 ) -> tuple[bool, list[str], list[str]]:
     """
     Validate Storyteller chapter files by naming pattern and structural validity.
@@ -659,16 +659,9 @@ def _validate_storyteller_chapters(
       2) 00001-00001 ... 00001-N
       3) 00000-00001, 00001-00001 ... (N-1)-00001
       4) 00001-00001, 00002-00001 ... N-00001
-    Works with whatever matching files are present; does not require the file
-    count to equal expected_count.
+    Works with whatever valid files are present — no count expectation.
     Returns (is_valid, source_filenames, destination_filenames).
     """
-    if expected_count <= 0:
-        logger.info(
-            f"Storyteller validation failed at '{transcriptions_dir}': expected_count={expected_count} (must be > 0)"
-        )
-        return False, [], []
-
     pattern = re.compile(r"^(\d{5})-(\d{5})\.json$")
     numeric_matches = []
     for p in transcriptions_dir.glob("*.json"):
@@ -694,14 +687,6 @@ def _validate_storyteller_chapters(
                 " ..." if len(all_json) > 10 else "",
             )
         return False, [], []
-
-    if actual_count != expected_count:
-        logger.info(
-            "Storyteller validation at '%s': found %d files, expected %d — proceeding with found count",
-            transcriptions_dir,
-            actual_count,
-            expected_count,
-        )
 
     dest_files = [_storyteller_filename_for_abs_chapter(i, "00000") for i in range(actual_count)]
 
@@ -884,20 +869,15 @@ def probe_storyteller_transcripts(
     numeric_files = [p.name for p in transcriptions_dir.glob("*.json") if numeric_pattern.match(p.name)]
     result["found_count"] = len(numeric_files)
 
-    expected_count = len(chapter_list)
-    chapterless_mode = expected_count <= 0
+    chapterless_mode = len(chapter_list) <= 0
     result["chapterless_mode"] = chapterless_mode
-    if chapterless_mode:
-        expected_count = len(numeric_files)
-        if expected_count <= 0:
-            result["reason"] = "chapter_set_incomplete"
-            return result
+    if chapterless_mode and len(numeric_files) <= 0:
+        result["reason"] = "chapter_set_incomplete"
+        return result
 
-    result["expected_count"] = expected_count
+    result["expected_count"] = len(chapter_list) if not chapterless_mode else len(numeric_files)
 
-    is_valid, source_files, expected_files = _validate_storyteller_chapters(
-        transcriptions_dir, expected_count
-    )
+    is_valid, source_files, expected_files = _validate_storyteller_chapters(transcriptions_dir)
     result["source_files"] = source_files
     result["expected_files"] = expected_files
     if not is_valid:
@@ -906,7 +886,7 @@ def probe_storyteller_transcripts(
 
     result["ready"] = True
     result["reason"] = "validated"
-    if len(source_files) != expected_count:
+    if not chapterless_mode and len(source_files) != len(chapter_list):
         result["audio_aligned"] = True
     return result
 
