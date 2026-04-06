@@ -610,12 +610,6 @@ class TestForgeService(unittest.TestCase):
                             return_value=ingest_manifest,
                         )
                     )
-                stack.enter_context(
-                    patch(
-                        "src.services.forge_service.probe_storyteller_transcripts",
-                        return_value={"ready": True, "reason": "assets_not_configured"},
-                    )
-                )
                 self.service._auto_forge_background_task(
                     abs_id="abs-1",
                     text_item=text_item,
@@ -756,19 +750,15 @@ class TestForgeService(unittest.TestCase):
                 "readaloud": {"filepath": "/storyteller/output/readaloud.epub"}
             }
 
-            with patch(
-                "src.services.forge_service.probe_storyteller_transcripts",
-                return_value={"ready": True, "reason": "assets_not_configured"},
-            ):
-                result = self.service._poll_auto_forge_completion(
-                    st_client=st_client,
-                    book_uuid="uuid-1",
-                    title="Auto Book",
-                    chapters=[],
-                    epub_cache=epub_cache,
-                    processing_triggered=True,
-                    poll_count=1,
-                )
+            result = self.service._poll_auto_forge_completion(
+                st_client=st_client,
+                book_uuid="uuid-1",
+                title="Auto Book",
+                chapters=[],
+                epub_cache=epub_cache,
+                processing_triggered=True,
+                poll_count=1,
+            )
 
             self.assertIsNone(result["completion_method"])
             self.assertIsNone(result["readaloud_status"])
@@ -787,19 +777,15 @@ class TestForgeService(unittest.TestCase):
                 "ebook": {"filepath": "/storyteller/library/Auto Book/Auto Book.epub", "missing": 0}
             }
 
-            with patch(
-                "src.services.forge_service.probe_storyteller_transcripts",
-                return_value={"ready": True, "reason": "assets_not_configured"},
-            ):
-                result = self.service._poll_auto_forge_completion(
-                    st_client=st_client,
-                    book_uuid="uuid-1",
-                    title="Auto Book",
-                    chapters=[],
-                    epub_cache=epub_cache,
-                    processing_triggered=False,
-                    poll_count=4,
-                )
+            result = self.service._poll_auto_forge_completion(
+                st_client=st_client,
+                book_uuid="uuid-1",
+                title="Auto Book",
+                chapters=[],
+                epub_cache=epub_cache,
+                processing_triggered=False,
+                poll_count=4,
+            )
 
             st_client.trigger_processing.assert_not_called()
             self.assertFalse(result["processing_triggered"])
@@ -817,19 +803,15 @@ class TestForgeService(unittest.TestCase):
                 "audiobook": {"filepath": "/storyteller/library/Auto Book", "missing": 0},
             }
 
-            with patch(
-                "src.services.forge_service.probe_storyteller_transcripts",
-                return_value={"ready": True, "reason": "assets_not_configured"},
-            ):
-                result = self.service._poll_auto_forge_completion(
-                    st_client=st_client,
-                    book_uuid="uuid-1",
-                    title="Auto Book",
-                    chapters=[],
-                    epub_cache=epub_cache,
-                    processing_triggered=False,
-                    poll_count=4,
-                )
+            result = self.service._poll_auto_forge_completion(
+                st_client=st_client,
+                book_uuid="uuid-1",
+                title="Auto Book",
+                chapters=[],
+                epub_cache=epub_cache,
+                processing_triggered=False,
+                poll_count=4,
+            )
 
             st_client.trigger_processing.assert_called_once_with("uuid-1")
             self.assertTrue(result["processing_triggered"])
@@ -854,19 +836,15 @@ class TestForgeService(unittest.TestCase):
                 "alignedAt": "2026-03-25T17:28:56.000Z",
             }
 
-            with patch(
-                "src.services.forge_service.probe_storyteller_transcripts",
-                return_value={"ready": False, "reason": "chapter_set_incomplete"},
-            ):
-                result = self.service._poll_auto_forge_completion(
-                    st_client=st_client,
-                    book_uuid="uuid-1",
-                    title="Auto Book",
-                    chapters=[],
-                    epub_cache=epub_cache,
-                    processing_triggered=True,
-                    poll_count=4,
-                )
+            result = self.service._poll_auto_forge_completion(
+                st_client=st_client,
+                book_uuid="uuid-1",
+                title="Auto Book",
+                chapters=[],
+                epub_cache=epub_cache,
+                processing_triggered=True,
+                poll_count=4,
+            )
 
             self.assertEqual(result["completion_method"], "storyteller_aligned")
             self.assertEqual(result["readaloud_status"], "ALIGNED")
@@ -891,19 +869,15 @@ class TestForgeService(unittest.TestCase):
                 },
             }
 
-            with patch(
-                "src.services.forge_service.probe_storyteller_transcripts",
-                return_value={"ready": True, "reason": "validated"},
-            ):
-                result = self.service._poll_auto_forge_completion(
-                    st_client=st_client,
-                    book_uuid="uuid-1",
-                    title="Auto Book",
-                    chapters=[],
-                    epub_cache=epub_cache,
-                    processing_triggered=True,
-                    poll_count=4,
-                )
+            result = self.service._poll_auto_forge_completion(
+                st_client=st_client,
+                book_uuid="uuid-1",
+                title="Auto Book",
+                chapters=[],
+                epub_cache=epub_cache,
+                processing_triggered=True,
+                poll_count=4,
+            )
 
             self.assertIsNone(result["completion_method"])
             self.assertEqual(result["readaloud_status"], "ALIGNED")
@@ -928,19 +902,15 @@ class TestForgeService(unittest.TestCase):
                 },
             }
 
-            with patch(
-                "src.services.forge_service.probe_storyteller_transcripts",
-                return_value={"ready": False, "reason": "chapter_set_incomplete"},
-            ):
-                result = self.service._poll_auto_forge_completion(
-                    st_client=st_client,
-                    book_uuid="uuid-1",
-                    title="Auto Book",
-                    chapters=[],
-                    epub_cache=epub_cache,
-                    processing_triggered=True,
-                    poll_count=4,
-                )
+            result = self.service._poll_auto_forge_completion(
+                st_client=st_client,
+                book_uuid="uuid-1",
+                title="Auto Book",
+                chapters=[],
+                epub_cache=epub_cache,
+                processing_triggered=True,
+                poll_count=4,
+            )
 
             self.assertIsNone(result["completion_method"])
             self.assertEqual(result["readaloud_status"], "ERROR")
@@ -966,19 +936,15 @@ class TestForgeService(unittest.TestCase):
                 "alignedAt": "2026-03-25T17:28:56.000Z",
             }
 
-            with patch(
-                "src.services.forge_service.probe_storyteller_transcripts",
-                return_value={"ready": False, "reason": "chapter_set_incomplete"},
-            ):
-                result = self.service._poll_auto_forge_completion(
-                    st_client=st_client,
-                    book_uuid="uuid-1",
-                    title="Auto Book",
-                    chapters=[],
-                    epub_cache=epub_cache,
-                    processing_triggered=True,
-                    poll_count=4,
-                )
+            result = self.service._poll_auto_forge_completion(
+                st_client=st_client,
+                book_uuid="uuid-1",
+                title="Auto Book",
+                chapters=[],
+                epub_cache=epub_cache,
+                processing_triggered=True,
+                poll_count=4,
+            )
 
             self.assertIsNone(result["completion_method"])
             self.assertEqual(result["readaloud_status"], "PROCESSING")
@@ -1040,7 +1006,6 @@ class TestForgeService(unittest.TestCase):
             return_value={
                 "processing_triggered": True,
                 "completion_method": None,
-                "transcript_probe": {"ready": False, "reason": "chapter_set_incomplete"},
                 "readaloud_status": "PROCESSING",
                 "aligned_at": None,
                 "terminal_error": False,
@@ -1070,7 +1035,6 @@ class TestForgeService(unittest.TestCase):
             return_value={
                 "processing_triggered": True,
                 "completion_method": None,
-                "transcript_probe": {"ready": False, "reason": "chapter_set_incomplete"},
                 "readaloud_status": "ERROR",
                 "aligned_at": None,
                 "terminal_error": True,

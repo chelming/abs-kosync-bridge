@@ -11,7 +11,7 @@ from pathlib import Path
 from urllib.parse import urljoin
 import requests
 
-from src.services.alignment_service import ingest_storyteller_transcripts, probe_storyteller_transcripts
+from src.services.alignment_service import ingest_storyteller_transcripts
 from src.utils.storyteller_transcript import StorytellerTranscript
 
 logger = logging.getLogger(__name__)
@@ -314,12 +314,6 @@ class ForgeService:
             st_client, book_uuid
         )
         readaloud_state = self._normalize_storyteller_readaloud_state(details)
-        transcript_probe = probe_storyteller_transcripts(
-            title,
-            chapters,
-            storyteller_title=details.get("title") if isinstance(details, dict) else None,
-        )
-        transcripts_ready = bool(transcript_probe.get("ready"))
 
         if not processing_triggered and processing_ready:
             try:
@@ -331,12 +325,6 @@ class ForgeService:
             logger.debug(
                 f"Auto-Forge: delaying processing trigger for {book_uuid} "
                 f"(Storyteller state={processing_state})"
-            )
-
-        if not transcripts_ready and transcript_probe.get("reason") != "assets_not_configured" and poll_count % 4 == 0:
-            logger.info(
-                "Auto-Forge: Transcript assets not ready yet (reason=%s)",
-                transcript_probe.get("reason"),
             )
 
         if readaloud_state["errored"]:
@@ -352,19 +340,17 @@ class ForgeService:
         elif poll_count % 4 == 0:
             logger.info(
                 "Auto-Forge: waiting for Storyteller alignment for %s "
-                "(status=%s stage=%s progress=%s alignedAt=%s transcript_reason=%s)",
+                "(status=%s stage=%s progress=%s alignedAt=%s)",
                 book_uuid,
                 readaloud_state["status"],
                 readaloud_state["current_stage"],
                 readaloud_state["stage_progress"],
                 readaloud_state["aligned_at"],
-                transcript_probe.get("reason"),
             )
 
         return {
             "processing_triggered": processing_triggered,
             "completion_method": completion_method,
-            "transcript_probe": transcript_probe,
             "readaloud_status": readaloud_state["status"],
             "aligned_at": readaloud_state["aligned_at"],
             "terminal_error": readaloud_state["errored"],
@@ -1163,7 +1149,6 @@ class ForgeService:
             elapsed = 0
             poll_count = 0
             completion_method = None
-            transcript_probe = probe_storyteller_transcripts(title, chapters)
             last_readaloud_status = None
             last_aligned_at = None
             storyteller_title = None
@@ -1187,7 +1172,6 @@ class ForgeService:
                     poll_count=poll_count,
                 )
                 processing_triggered = poll_result["processing_triggered"]
-                transcript_probe = poll_result["transcript_probe"]
                 completion_method = poll_result["completion_method"]
                 last_readaloud_status = poll_result["readaloud_status"]
                 last_aligned_at = poll_result["aligned_at"]
@@ -1215,8 +1199,6 @@ class ForgeService:
                     timeout_reason.append(f"readaloud_{last_readaloud_status}")
                 else:
                     timeout_reason.append("readaloud_unknown")
-                if transcript_probe and not transcript_probe.get("ready"):
-                    timeout_reason.append(f"transcripts_{transcript_probe.get('reason')}")
                 reason_str = ",".join(timeout_reason) if timeout_reason else "unknown"
 
                 logger.warning(
@@ -1248,7 +1230,6 @@ class ForgeService:
                         poll_count=poll_count,
                     )
                     processing_triggered = poll_result["processing_triggered"]
-                    transcript_probe = poll_result["transcript_probe"]
                     completion_method = poll_result["completion_method"]
                     last_readaloud_status = poll_result["readaloud_status"]
                     last_aligned_at = poll_result["aligned_at"]
@@ -1275,18 +1256,7 @@ class ForgeService:
                     )
                     return
 
-            completion_msg = f"Auto-Forge: Completion confirmed via {completion_method}"
-            if transcript_probe.get("reason") == "validated":
-                completion_msg += " + validated_transcripts"
-            logger.info(completion_msg)
-            if transcript_probe and not transcript_probe.get("ready"):
-                logger.warning(
-                    "Auto-Forge: proceeding without validated Storyteller transcript assets "
-                    "(reason=%s expected=%s found=%s)",
-                    transcript_probe.get("reason"),
-                    transcript_probe.get("expected_count"),
-                    transcript_probe.get("found_count"),
-                )
+            logger.info("Auto-Forge: Completion confirmed via %s", completion_method)
 
             # Grace wait before download to let Storyteller finish internal writes.
             if self.storyteller_cleanup_grace_seconds > 0:
