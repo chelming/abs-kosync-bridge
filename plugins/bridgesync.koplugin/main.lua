@@ -1,3 +1,4 @@
+local ConfirmBox = require("ui/widget/confirmbox")
 local DataStorage = require("datastorage")
 local InfoMessage = require("ui/widget/infomessage")
 local InputDialog = require("ui/widget/inputdialog")
@@ -601,17 +602,31 @@ function BridgeSync:_buildHashIndex()
         return index
     end
 
+    local hash_cache = self.state:readSetting("hash_cache") or {}
+    local new_cache = {}
+
     for entry in lfs.dir(self.download_dir) do
         if entry ~= "." and entry ~= ".." and not entry:match("%.part$") then
             local path = self.download_dir .. "/" .. entry
-            if lfs.attributes(path, "mode") == "file" then
-                local hash = self:_calculateBookHash(path)
-                if hash and not index[hash] then
-                    index[hash] = path
+            local attrs = lfs.attributes(path)
+            if attrs and attrs.mode == "file" then
+                local cache_key = path .. ":" .. tostring(attrs.modification) .. ":" .. tostring(attrs.size)
+                local hash = hash_cache[cache_key]
+                if not hash then
+                    hash = self:_calculateBookHash(path)
+                end
+                if hash then
+                    new_cache[cache_key] = hash
+                    if not index[hash] then
+                        index[hash] = path
+                    end
                 end
             end
         end
     end
+
+    self.state:saveSetting("hash_cache", new_cache)
+    self.state:flush()
     return index
 end
 
@@ -721,7 +736,13 @@ function BridgeSync:_runSync()
     local remote_books = manifest.books or {}
     local remote_by_abs = {}
     local items = self:_loadStateItems()
-    local hash_index = self:_buildHashIndex()
+    local hash_index = nil
+    local function getHashIndex()
+        if not hash_index then
+            hash_index = self:_buildHashIndex()
+        end
+        return hash_index
+    end
     local downloaded, skipped, renamed, deleted, deferred, errors = 0, 0, 0, 0, 0, 0
 
     for _, book in ipairs(remote_books) do
@@ -746,7 +767,7 @@ function BridgeSync:_runSync()
         end
 
         if not reused_path then
-            local indexed_path = hash_index[book.content_hash]
+            local indexed_path = getHashIndex()[book.content_hash]
             if indexed_path and self:_fileExists(indexed_path) then
                 local tracked_abs_id = self:_findTrackedAbsIdByPath(items, indexed_path)
                 if not tracked_abs_id or tracked_abs_id == book.abs_id then
@@ -774,7 +795,7 @@ function BridgeSync:_runSync()
                     content_hash = book.content_hash,
                     shelves = book.shelves,
                 }
-                hash_index[book.content_hash] = target_path
+                if hash_index then hash_index[book.content_hash] = target_path end
             end
         else
             local temp_path = target_path .. ".part"
@@ -812,7 +833,7 @@ function BridgeSync:_runSync()
                             content_hash = book.content_hash,
                             shelves = book.shelves,
                         }
-                        hash_index[book.content_hash] = target_path
+                        if hash_index then hash_index[book.content_hash] = target_path end
                     end
                 end
             end
@@ -1557,6 +1578,117 @@ function BridgeSync:onSuspend()
     return false
 end
 
+function BridgeSync:checkForPluginUpdate()
+    if not self.server_url or self.server_url == "" then
+        self:_showMessage(_("Server URL is not configured"), 2)
+        return
+    end
+    local network_ok, network_err = self:_preflightNetwork()
+    if not network_ok then
+        self:logWarn(network_err)
+        self:_showMessage(network_err, 4)
+        return
+    end
+
+    local info_msg = InfoMessage:new{
+        text = _("Checking for plugin update..."),
+        timeout = 0,
+    }
+    UIManager:show(info_msg)
+    UIManager:forceRePaint()
+
+    local subprocess_ok, ok, result = self:_runInSubprocess(function()
+        return self.api:getPluginVersion()
+    end)
+
+    UIManager:close(info_msg)
+
+    if not subprocess_ok then
+        self:logErr("Plugin version check subprocess failed", ok or "")
+        self:_showMessage(T(_("Plugin version check failed: %1"), tostring(ok or "Subprocess failed")), 5)
+        return
+    end
+
+    if not ok then
+        self:logWarn(result or "Version check failed")
+        self:_showMessage(result or _("Version check failed"), 4)
+        return
+    end
+
+    local remote_version = type(result) == "table" and result.version or nil
+    if not remote_version then
+        self:_showMessage(_("Invalid version response from server"), 4)
+        return
+    end
+
+    local local_version = "unknown"
+    local chunk = loadfile(self.path .. "/_meta.lua")
+    if chunk then
+        local meta_ok, meta_table = pcall(chunk)
+        if meta_ok and type(meta_table) == "table" and meta_table.version then
+            local_version = meta_table.version
+        end
+    end
+
+    if local_version == remote_version then
+        self:_showMessage(T(_("Plugin is up to date (v%1)"), local_version), 3)
+        return
+    end
+
+    UIManager:show(ConfirmBox:new{
+        text = T(
+            _("Update plugin from v%1 to v%2?\nKOReader will need to restart."),
+            local_version,
+            remote_version
+        ),
+        ok_text = _("Update"),
+        cancel_text = _("Cancel"),
+        ok_callback = function()
+            Trapper:wrap(function()
+                self:_downloadAndInstallPlugin(remote_version)
+            end)
+        end,
+    })
+end
+
+function BridgeSync:_downloadAndInstallPlugin(version)
+    local temp_path = DataStorage:getSettingsDir() .. "/bridgesync-update.zip"
+
+    local info_msg = InfoMessage:new{
+        text = T(_("Downloading plugin v%1..."), version),
+        timeout = 0,
+    }
+    UIManager:show(info_msg)
+    UIManager:forceRePaint()
+
+    local subprocess_ok, ok, err = self:_runInSubprocess(function()
+        return self.api:downloadPluginZip(temp_path)
+    end)
+
+    UIManager:close(info_msg)
+
+    if not subprocess_ok then
+        self:logErr("Plugin download subprocess failed", ok or "")
+        self:_showMessage(T(_("Plugin download failed: %1"), tostring(ok or "Subprocess failed")), 5)
+        return
+    end
+
+    if not ok then
+        self:logWarn(err or "Download failed")
+        self:_showMessage(err or _("Plugin download failed"), 4)
+        return
+    end
+
+    -- Extract zip into the plugins directory (one level above self.path)
+    local plugins_dir = self.path:match("^(.+)/[^/]+$") or self.path
+    local cmd = "unzip -o '" .. temp_path .. "' -d '" .. plugins_dir .. "' 2>&1"
+    local handle = io.popen(cmd, "r")
+    if handle then handle:close() end
+    os.remove(temp_path)
+
+    self:_showMessage(T(_("Plugin updated to v%1. Please restart KOReader."), version), 8)
+end
+
 function BridgeSync:addToMainMenu(menu_items)
     menu_items.bridge_sync = {
         text = _("Bridge Sync"),
@@ -1783,6 +1915,14 @@ function BridgeSync:addToMainMenu(menu_items)
                 callback = function()
                     Trapper:wrap(function()
                         self:testConnection()
+                    end)
+                end,
+            },
+            {
+                text = _("Check for Plugin Update"),
+                callback = function()
+                    Trapper:wrap(function()
+                        self:checkForPluginUpdate()
                     end)
                 end,
             },

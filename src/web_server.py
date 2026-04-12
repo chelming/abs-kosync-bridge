@@ -26,7 +26,7 @@ from src.utils.config_loader import ConfigLoader
 from src.utils.logging_utils import memory_log_handler, LOG_PATH
 from src.utils.logging_utils import sanitize_log_data
 from src.api.api_clients import ABS_DISABLED_SENTINEL, is_abs_disabled_value
-from src.api.kosync_server import kosync_sync_bp, kosync_admin_bp, init_kosync_server
+from src.api.kosync_server import kosync_sync_bp, kosync_admin_bp, init_kosync_server, signal_manifest_rebuild
 from src.api.hardcover_routes import hardcover_bp, init_hardcover_routes
 from src.version import APP_VERSION, get_update_status
 from src.db.models import State
@@ -306,6 +306,7 @@ def setup_dependencies(app, test_container=None):
 
     # Register KoSync Blueprint and initialize with dependencies
     init_kosync_server(database_service, container, manager, EBOOK_DIR)
+    manager.register_post_cycle_callback(signal_manifest_rebuild)
     app.register_blueprint(kosync_sync_bp)
     app.register_blueprint(kosync_admin_bp)
 
@@ -1341,6 +1342,7 @@ def settings():
             'BOOKLORE_ENABLED',
             'GRIMMORY_READING_SESSIONS',
             'CWA_ENABLED',
+            'CWA_SYNC_ENABLED',
             'HARDCOVER_ENABLED',
             'TELEGRAM_ENABLED',
             'SUGGESTIONS_ENABLED',
@@ -4492,10 +4494,13 @@ def _build_reading_stats_payload(tz):
             "recentSessions": [],
             "activityDates": [],
             "trackedBookIds": [],
+            "trackedBookKeys": [],
         }
 
     stats = summary or {}
     stats.setdefault("booksTracked", 0)
+    stats.setdefault("linkedBooksTracked", 0)
+    stats.setdefault("unlinkedBooksTracked", 0)
     stats.setdefault("daysRead", len(activity_dates))
     stats.setdefault("totalSeconds", 0)
     stats.setdefault("pagesRead", 0)
@@ -4507,6 +4512,7 @@ def _build_reading_stats_payload(tz):
         datetime.now(tz).date(),
     ))
     stats.setdefault("trackedBookIds", [])
+    stats.setdefault("trackedBookKeys", [])
 
     return {
         "available": True,
@@ -4516,6 +4522,7 @@ def _build_reading_stats_payload(tz):
         "recentSessions": recent_sessions,
         "activityDates": activity_dates,
         "trackedBookIds": stats.get("trackedBookIds") or [],
+        "trackedBookKeys": stats.get("trackedBookKeys") or [],
     }
 
 
@@ -4587,13 +4594,19 @@ def _build_combined_stats_payload(listening, reading, tz):
     }
     all_activity_dates = listening_dates | reading_dates
 
+    listening_book_keys = {
+        f"abs:{book_id}"
+        for book_id in ((listening or {}).get("trackedBookIds") or [])
+        if book_id
+    }
+    reading_book_keys = set((reading or {}).get("trackedBookKeys") or [])
+
     combined_stats = {
         "activeDays": len(all_activity_dates),
         "totalSeconds": int(((listening or {}).get("stats") or {}).get("totalSeconds") or 0)
         + int(((reading or {}).get("stats") or {}).get("totalSeconds") or 0),
         "booksWithActivity": len(
-            set((listening or {}).get("trackedBookIds") or [])
-            | set((reading or {}).get("trackedBookIds") or [])
+            listening_book_keys | reading_book_keys
         ),
         "weekTotalSeconds": sum(int(row.get("seconds") or 0) for row in combined_daily),
         "dailyAverageSeconds": int(
@@ -4643,6 +4656,7 @@ def api_stats():
             "recentSessions": [],
             "activityDates": [],
             "trackedBookIds": [],
+            "trackedBookKeys": [],
         }
 
     combined = _build_combined_stats_payload(
@@ -4659,12 +4673,16 @@ def api_stats():
             "daily": reading.get("daily"),
             "heatmap": reading.get("heatmap"),
             "recentSessions": reading.get("recentSessions"),
+            "trackedBookIds": reading.get("trackedBookIds"),
+            "trackedBookKeys": reading.get("trackedBookKeys"),
         } if reading else {
             "available": False,
             "stats": None,
             "daily": [],
             "heatmap": [],
             "recentSessions": [],
+            "trackedBookIds": [],
+            "trackedBookKeys": [],
         },
         "combined": combined,
     }
@@ -5326,6 +5344,7 @@ def test_connection(service: str):
             _normalize_test_url(data.get('CWA_SERVER')),
             _coerce_test_str(data.get('CWA_USERNAME')),
             _coerce_test_str(data.get('CWA_PASSWORD')),
+            _coerce_test_str(data.get('CWA_SYNC_TOKEN')),
         ),
         'hardcover': lambda data: _test_hardcover(
             _coerce_test_bool(data.get('HARDCOVER_ENABLED')),
@@ -5477,17 +5496,43 @@ def _test_booklore(enabled: bool, url: str, user: str, pwd: str) -> dict:
     return {"ok": False, "message": f"Login returned {r.status_code}"}
 
 
-def _test_cwa(enabled: bool, url: str, user: str, pwd: str) -> dict:
+def _test_cwa(enabled: bool, url: str, user: str, pwd: str, sync_token: str = "") -> dict:
     if not enabled or not url:
         return {"ok": False, "message": "CWA not configured or disabled"}
-    r = requests.get(f"{url}/opds", auth=(user, pwd) if user else None, timeout=5)
-    if r.status_code == 200:
-        if r.text.lstrip().lower().startswith(('<!doctype html', '<html')):
-            return {"ok": False, "message": "Authentication failed — server returned login page instead of OPDS feed"}
-        return {"ok": True, "message": "Connected to OPDS feed"}
-    if r.status_code in (401, 403):
-        return {"ok": False, "message": "Invalid credentials"}
-    return {"ok": False, "message": f"Server returned {r.status_code}"}
+
+    results = []
+
+    # Test OPDS if credentials are provided
+    if user and pwd:
+        try:
+            r = requests.get(f"{url}/opds", auth=(user, pwd), timeout=5)
+            if r.status_code == 200 and not r.text.lstrip().lower().startswith(('<!doctype html', '<html')):
+                results.append("OPDS: OK")
+            elif r.status_code in (401, 403):
+                results.append("OPDS: Invalid credentials")
+            else:
+                results.append(f"OPDS: Failed ({r.status_code})")
+        except Exception as e:
+            results.append(f"OPDS: {_test_conn_error(e)}")
+
+    # Test Kobo sync if token is provided
+    if sync_token:
+        try:
+            r = requests.get(f"{url}/kobo/{sync_token}/v1/initialization", timeout=5)
+            if r.status_code == 200:
+                results.append("Sync: OK")
+            elif r.status_code in (401, 403):
+                results.append("Sync: Invalid token")
+            else:
+                results.append(f"Sync: Failed ({r.status_code})")
+        except Exception as e:
+            results.append(f"Sync: {_test_conn_error(e)}")
+
+    if not results:
+        return {"ok": False, "message": "No OPDS credentials or sync token configured"}
+
+    all_ok = all("OK" in r for r in results)
+    return {"ok": all_ok, "message": "\n".join(results)}
 
 
 def _test_hardcover(enabled: bool, token: str) -> dict:

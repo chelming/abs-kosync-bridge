@@ -86,7 +86,7 @@ def test_storyteller_validation_accepts_00000_prefix(tmp_path):
     _write_wordtimeline_file(transcriptions_dir, "00000-00001.json")
     _write_wordtimeline_file(transcriptions_dir, "00000-00002.json")
 
-    is_valid, source_files, destination_files = _validate_storyteller_chapters(transcriptions_dir, 2)
+    is_valid, source_files, destination_files = _validate_storyteller_chapters(transcriptions_dir)
     assert is_valid is True
     assert source_files == ["00000-00001.json", "00000-00002.json"]
     assert destination_files == ["00000-00001.json", "00000-00002.json"]
@@ -99,7 +99,7 @@ def test_storyteller_validation_accepts_00001_prefix(tmp_path):
     for idx in range(2):
         _write_wordtimeline_file(transcriptions_dir, f"00001-{idx + 1:05d}.json")
 
-    is_valid, source_files, destination_files = _validate_storyteller_chapters(transcriptions_dir, 2)
+    is_valid, source_files, destination_files = _validate_storyteller_chapters(transcriptions_dir)
     assert is_valid is True
     assert source_files == ["00001-00001.json", "00001-00002.json"]
     assert destination_files == ["00000-00001.json", "00000-00002.json"]
@@ -111,7 +111,7 @@ def test_storyteller_validation_accepts_chapter_first_zero_based(tmp_path):
     _write_wordtimeline_file(transcriptions_dir, "00000-00001.json")
     _write_wordtimeline_file(transcriptions_dir, "00001-00001.json")
 
-    is_valid, source_files, destination_files = _validate_storyteller_chapters(transcriptions_dir, 2)
+    is_valid, source_files, destination_files = _validate_storyteller_chapters(transcriptions_dir)
     assert is_valid is True
     assert source_files == ["00000-00001.json", "00001-00001.json"]
     assert destination_files == ["00000-00001.json", "00000-00002.json"]
@@ -123,23 +123,24 @@ def test_storyteller_validation_accepts_chapter_first_one_based(tmp_path):
     _write_wordtimeline_file(transcriptions_dir, "00001-00001.json")
     _write_wordtimeline_file(transcriptions_dir, "00002-00001.json")
 
-    is_valid, source_files, destination_files = _validate_storyteller_chapters(transcriptions_dir, 2)
+    is_valid, source_files, destination_files = _validate_storyteller_chapters(transcriptions_dir)
     assert is_valid is True
     assert source_files == ["00001-00001.json", "00002-00001.json"]
     assert destination_files == ["00000-00001.json", "00000-00002.json"]
 
 
-def test_storyteller_validation_rejects_count_mismatch(tmp_path):
+def test_storyteller_validation_accepts_any_count(tmp_path):
+    # 3 valid files — validation has no count expectation, works with whatever is present.
     transcriptions_dir = tmp_path / "transcriptions_count_mismatch"
     transcriptions_dir.mkdir(parents=True, exist_ok=True)
     _write_wordtimeline_file(transcriptions_dir, "00001-00001.json")
     _write_wordtimeline_file(transcriptions_dir, "00002-00001.json")
     _write_wordtimeline_file(transcriptions_dir, "00003-00001.json")
 
-    is_valid, source_files, destination_files = _validate_storyteller_chapters(transcriptions_dir, 2)
-    assert is_valid is False
-    assert source_files == []
-    assert destination_files == []
+    is_valid, source_files, destination_files = _validate_storyteller_chapters(transcriptions_dir)
+    assert is_valid is True
+    assert source_files == ["00001-00001.json", "00002-00001.json", "00003-00001.json"]
+    assert destination_files == ["00000-00001.json", "00000-00002.json", "00000-00003.json"]
 
 
 def test_storyteller_validation_rejects_non_wordtimeline_format(tmp_path):
@@ -149,7 +150,7 @@ def test_storyteller_validation_rejects_non_wordtimeline_format(tmp_path):
     segment_like = [{"start": 0.0, "end": 1.0, "text": "hello"}]
     (transcriptions_dir / "00001-00001.json").write_text(json.dumps(segment_like), encoding="utf-8")
 
-    is_valid, source_files, destination_files = _validate_storyteller_chapters(transcriptions_dir, 1)
+    is_valid, source_files, destination_files = _validate_storyteller_chapters(transcriptions_dir)
     assert is_valid is False
     assert source_files == []
     assert destination_files == []

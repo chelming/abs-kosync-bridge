@@ -650,24 +650,18 @@ def _is_storyteller_wordtimeline_chapter(chapter_path: Path) -> bool:
 
 
 def _validate_storyteller_chapters(
-    transcriptions_dir: Path, expected_count: int
+    transcriptions_dir: Path,
 ) -> tuple[bool, list[str], list[str]]:
     """
-    Validate Storyteller chapter files by expected naming and exact count.
+    Validate Storyteller chapter files by naming pattern and structural validity.
     Accept known source layouts:
       1) 00000-00001 ... 00000-N
       2) 00001-00001 ... 00001-N
       3) 00000-00001, 00001-00001 ... (N-1)-00001
       4) 00001-00001, 00002-00001 ... N-00001
+    Works with whatever valid files are present — no count expectation.
     Returns (is_valid, source_filenames, destination_filenames).
     """
-    if expected_count <= 0:
-        logger.info(
-            f"Storyteller validation failed at '{transcriptions_dir}': expected_count={expected_count} (must be > 0)"
-        )
-        return False, [], []
-
-    expected_files = [_storyteller_filename_for_abs_chapter(i, "00000") for i in range(expected_count)]
     pattern = re.compile(r"^(\d{5})-(\d{5})\.json$")
     numeric_matches = []
     for p in transcriptions_dir.glob("*.json"):
@@ -675,17 +669,13 @@ def _validate_storyteller_chapters(
         if match:
             numeric_matches.append((p.name, int(match.group(1)), int(match.group(2))))
 
-    if len(numeric_matches) != expected_count:
+    actual_count = len(numeric_matches)
+    if actual_count <= 0:
         all_json = sorted([p.name for p in transcriptions_dir.glob("*.json")])
-        numeric_names = sorted(name for name, _, _ in numeric_matches)
-        first_slot_values = [first for _, first, _ in numeric_matches]
-        second_slot_values = [second for _, _, second in numeric_matches]
         logger.info(
-            "Storyteller validation failed at '%s': expected %d chapter files, found %d matching "
-            "pattern '^\\d{5}-\\d{5}\\.json$' (total json=%d)",
+            "Storyteller validation failed at '%s': no files matching pattern '^\\d{5}-\\d{5}\\.json$' found "
+            "(total json=%d)",
             transcriptions_dir,
-            expected_count,
-            len(numeric_matches),
             len(all_json),
         )
         if all_json:
@@ -696,40 +686,26 @@ def _validate_storyteller_chapters(
                 sample,
                 " ..." if len(all_json) > 10 else "",
             )
-        if numeric_names:
-            numeric_sample = ", ".join(numeric_names[:10])
-            logger.info(
-                "Storyteller validation numeric sample at '%s': %s%s",
-                transcriptions_dir,
-                numeric_sample,
-                " ..." if len(numeric_names) > 10 else "",
-            )
-            logger.info(
-                "Storyteller validation slot ranges at '%s': first_slot=%d..%d second_slot=%d..%d",
-                transcriptions_dir,
-                min(first_slot_values),
-                max(first_slot_values),
-                min(second_slot_values),
-                max(second_slot_values),
-            )
         return False, [], []
+
+    dest_files = [_storyteller_filename_for_abs_chapter(i, "00000") for i in range(actual_count)]
 
     candidate_layouts: list[tuple[str, list[str]]] = [
         (
             "prefix_00000",
-            [f"00000-{i + 1:05d}.json" for i in range(expected_count)],
+            [f"00000-{i + 1:05d}.json" for i in range(actual_count)],
         ),
         (
             "prefix_00001",
-            [f"00001-{i + 1:05d}.json" for i in range(expected_count)],
+            [f"00001-{i + 1:05d}.json" for i in range(actual_count)],
         ),
         (
             "chapter_first_zero_based",
-            [f"{i:05d}-00001.json" for i in range(expected_count)],
+            [f"{i:05d}-00001.json" for i in range(actual_count)],
         ),
         (
             "chapter_first_one_based",
-            [f"{i + 1:05d}-00001.json" for i in range(expected_count)],
+            [f"{i + 1:05d}-00001.json" for i in range(actual_count)],
         ),
     ]
 
@@ -741,7 +717,7 @@ def _validate_storyteller_chapters(
             if not _is_storyteller_wordtimeline_chapter(transcriptions_dir / name)
         ]
         if not invalid_files:
-            return True, source_files, expected_files
+            return True, source_files, dest_files
         logger.info(
             "Storyteller validation failed at '%s': layout '%s' has %d chapter file(s) without storyteller "
             "timeline format ('wordTimeline' or 'timeline'); first invalid='%s'",
@@ -756,9 +732,9 @@ def _validate_storyteller_chapters(
     first_slot_values = [first for _, first, _ in numeric_matches]
     second_slot_values = [second for _, _, second in numeric_matches]
     logger.info(
-        "Storyteller validation failed at '%s': no supported filename layout matched expected_count=%d",
+        "Storyteller validation failed at '%s': no supported filename layout matched actual_count=%d",
         transcriptions_dir,
-        expected_count,
+        actual_count,
     )
     if all_json:
         sample = ", ".join(all_json[:10])
@@ -835,6 +811,7 @@ def probe_storyteller_transcripts(
         "source_files": [],
         "expected_files": [],
         "chapterless_mode": False,
+        "audio_aligned": False,
     }
 
     assets_dir_raw = os.environ.get("STORYTELLER_ASSETS_DIR", "").strip()
@@ -892,20 +869,15 @@ def probe_storyteller_transcripts(
     numeric_files = [p.name for p in transcriptions_dir.glob("*.json") if numeric_pattern.match(p.name)]
     result["found_count"] = len(numeric_files)
 
-    expected_count = len(chapter_list)
-    chapterless_mode = expected_count <= 0
+    chapterless_mode = len(chapter_list) <= 0
     result["chapterless_mode"] = chapterless_mode
-    if chapterless_mode:
-        expected_count = len(numeric_files)
-        if expected_count <= 0:
-            result["reason"] = "chapter_set_incomplete"
-            return result
+    if chapterless_mode and len(numeric_files) <= 0:
+        result["reason"] = "chapter_set_incomplete"
+        return result
 
-    result["expected_count"] = expected_count
+    result["expected_count"] = len(chapter_list) if not chapterless_mode else len(numeric_files)
 
-    is_valid, source_files, expected_files = _validate_storyteller_chapters(
-        transcriptions_dir, expected_count
-    )
+    is_valid, source_files, expected_files = _validate_storyteller_chapters(transcriptions_dir)
     result["source_files"] = source_files
     result["expected_files"] = expected_files
     if not is_valid:
@@ -914,6 +886,8 @@ def probe_storyteller_transcripts(
 
     result["ready"] = True
     result["reason"] = "validated"
+    if not chapterless_mode and len(source_files) != len(chapter_list):
+        result["audio_aligned"] = True
     return result
 
 
@@ -956,11 +930,17 @@ def ingest_storyteller_transcripts(
     source_files = probe["source_files"]
     expected_files = probe["expected_files"]
     chapterless_mode = probe["chapterless_mode"]
+    audio_aligned = probe.get("audio_aligned", False)
 
     if chapterless_mode:
         logger.info(
             f"Storyteller ingest chapterless mode for '{abs_id}': deriving {expected_count} chapters from "
             f"'{transcriptions_dir}'"
+        )
+    elif audio_aligned:
+        logger.info(
+            f"Storyteller ingest audio_aligned mode for '{abs_id}': file count ({len(source_files)}) differs "
+            f"from ABS chapter count ({len(chapter_list)}), deriving timing from file contents"
         )
 
     data_dir = Path(os.environ.get("DATA_DIR", "/data"))
@@ -999,7 +979,7 @@ def ingest_storyteller_transcripts(
         )
 
     chapter_entries = []
-    if chapterless_mode:
+    if chapterless_mode or audio_aligned:
         cumulative_start = 0.0
         for idx, chapter_file_name in enumerate(expected_files):
             chapter_file_path = target_dir / chapter_file_name

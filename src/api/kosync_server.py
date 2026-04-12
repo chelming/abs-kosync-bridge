@@ -1,10 +1,13 @@
 # KoSync Server - Extracted from web_server.py for clean code separation
 # Implements KOSync protocol compatible with kosync-dotnet
+import io
 import logging
 import mimetypes
 import os
+import re
 import threading
 import time
+import zipfile
 from datetime import datetime
 from functools import wraps
 from pathlib import Path
@@ -31,6 +34,17 @@ _hash_cache = None
 _ebook_dir = None
 _active_scans = set()
 
+# Plugin self-update: resolved from src/api/ -> project root -> plugins/
+_PLUGIN_DIR = Path(__file__).parent.parent.parent / "plugins" / "bridgesync.koplugin"
+_plugin_zip_cache: Optional[tuple] = None  # (zip_bytes: bytes, max_mtime: float)
+_plugin_zip_cache_lock = threading.Lock()
+
+# Manifest pre-cache: background thread rebuilds this; endpoint reads from it.
+_manifest_cache: Optional[dict] = None
+_manifest_cache_lock = threading.Lock()
+_manifest_rebuild_event = threading.Event()
+_manifest_prebuilder_started = False
+
 # KoSync PUT debounce state
 _kosync_debounce: dict = {}  # {abs_id: {'last_event': float, 'title': str, 'synced': bool}}
 _kosync_debounce_lock = threading.Lock()
@@ -44,6 +58,75 @@ _KOSYNC_DEVICE_SESSION_REGISTRY_KEY = "KOSYNC_DEVICE_SESSION_REGISTRY"
 _kosync_device_session_registry = None
 _kosync_device_session_registry_lock = threading.Lock()
 
+def signal_manifest_rebuild() -> None:
+    """Wake the manifest prebuilder thread so it rebuilds on the next cycle."""
+    _manifest_rebuild_event.set()
+
+
+def _build_shelf_mapping_for_cache() -> Optional[dict]:
+    """Fetch the Booklore shelf mapping — same logic as the manifest endpoint."""
+    collections_mode = os.environ.get("DEVICE_SYNC_COLLECTIONS", "off").lower()
+    if collections_mode == "off" or not _container:
+        return None
+    try:
+        bl = _container.booklore_client()
+        if not bl.is_configured():
+            return None
+        excluded_raw = os.environ.get("DEVICE_SYNC_EXCLUDED_SHELVES", "")
+        excludes = [s.strip() for s in excluded_raw.split(",") if s.strip()]
+        sync_shelf = os.environ.get("BOOKLORE_SHELF_NAME", "").strip()
+        if sync_shelf and sync_shelf not in excludes:
+            excludes.append(sync_shelf)
+        service = _get_koreader_device_sync_service()
+        if not service:
+            return None
+        target_book_ids = [
+            str(book.ebook_source_id)
+            for book in service.database_service.get_books_by_status("active")
+            if getattr(book, "ebook_source_id", None)
+        ]
+        return bl.get_book_shelf_mapping(
+            mode=collections_mode,
+            excludes=excludes,
+            target_book_ids=target_book_ids,
+        )
+    except Exception as e:
+        logger.warning("Manifest prebuilder: shelf mapping failed: %s", e)
+        return None
+
+
+def _manifest_prebuilder_loop() -> None:
+    """Daemon thread: rebuild manifest cache when signaled or every 60 seconds."""
+    global _manifest_cache
+    _REBUILD_INTERVAL = 60
+    logger.info("Manifest prebuilder thread started")
+    while True:
+        _manifest_rebuild_event.wait(timeout=_REBUILD_INTERVAL)
+        _manifest_rebuild_event.clear()
+        service = _get_koreader_device_sync_service()
+        if not service:
+            continue
+        try:
+            shelf_mapping = _build_shelf_mapping_for_cache()
+            manifest = service.build_manifest(shelf_mapping=shelf_mapping)
+            with _manifest_cache_lock:
+                _manifest_cache = manifest
+            logger.debug(
+                "Manifest cache rebuilt (%d books, revision=%.8s)",
+                len(manifest.get("books", [])),
+                manifest.get("revision", ""),
+            )
+        except Exception as e:
+            logger.error("Manifest prebuilder error: %s", e)
+
+
+def _start_manifest_prebuilder() -> None:
+    global _manifest_prebuilder_started
+    if not _manifest_prebuilder_started:
+        _manifest_prebuilder_started = True
+        threading.Thread(target=_manifest_prebuilder_loop, daemon=True).start()
+
+
 def init_kosync_server(database_service, container, manager, ebook_dir=None):
     """Initialize KoSync server with required dependencies."""
     global _database_service, _container, _manager, _ebook_dir, _kosync_device_session_registry
@@ -52,6 +135,7 @@ def init_kosync_server(database_service, container, manager, ebook_dir=None):
     _manager = manager
     _ebook_dir = ebook_dir
     _kosync_device_session_registry = None
+    _start_manifest_prebuilder()
 
 
 def _get_koreader_device_sync_service():
@@ -826,38 +910,33 @@ def kosync_put_progress():
 @kosync_sync_bp.route('/koreader/device-sync/manifest', methods=['GET'])
 @kosync_auth_required
 def koreader_device_sync_manifest():
-    """Return the optional KOReader managed-folder sync manifest."""
+    """Return the optional KOReader managed-folder sync manifest.
+
+    The response is always served from a pre-built cache maintained by
+    _manifest_prebuilder_loop(), so this endpoint returns in <200 ms.
+    On a cold start (cache not yet populated) it falls back to an inline
+    build and primes the cache so subsequent requests are instant.
+    """
+    global _manifest_cache
+    _start_manifest_prebuilder()
+
+    with _manifest_cache_lock:
+        cached = _manifest_cache
+
+    if cached is not None:
+        return jsonify(cached), 200
+
+    # Cold start: cache not yet populated — build inline and prime the cache.
     service = _get_koreader_device_sync_service()
     if not service:
         return jsonify({"error": "Device sync service unavailable"}), 503
 
-    shelf_mapping = None
-    collections_mode = os.environ.get("DEVICE_SYNC_COLLECTIONS", "off").lower()
-    if collections_mode != "off":
-        try:
-            bl = _container.booklore_client()
-            if bl.is_configured():
-                excluded_raw = os.environ.get("DEVICE_SYNC_EXCLUDED_SHELVES", "")
-                excludes = [s.strip() for s in excluded_raw.split(",") if s.strip()]
-                # Auto-exclude the Grimmory sync shelf (e.g. "Kobo") — every
-                # matched book is on it, so it would be a redundant collection.
-                sync_shelf = os.environ.get("BOOKLORE_SHELF_NAME", "").strip()
-                if sync_shelf and sync_shelf not in excludes:
-                    excludes.append(sync_shelf)
-                target_book_ids = []
-                for book in service.database_service.get_books_by_status("active"):
-                    source_id = getattr(book, "ebook_source_id", None)
-                    if source_id:
-                        target_book_ids.append(str(source_id))
-                shelf_mapping = bl.get_book_shelf_mapping(
-                    mode=collections_mode,
-                    excludes=excludes,
-                    target_book_ids=target_book_ids,
-                )
-        except Exception as e:
-            logger.warning("Device-sync manifest: shelf mapping failed: %s", e)
+    shelf_mapping = _build_shelf_mapping_for_cache()
+    manifest = service.build_manifest(shelf_mapping=shelf_mapping)
+    with _manifest_cache_lock:
+        _manifest_cache = manifest
 
-    return jsonify(service.build_manifest(shelf_mapping=shelf_mapping)), 200
+    return jsonify(manifest), 200
 
 
 @kosync_sync_bp.route('/device-sync/books/<path:abs_id>/download', methods=['GET'])
@@ -1116,6 +1195,96 @@ def kosync_upload_sessions():
 
     logger.info(f"Session upload: accepted={accepted}, rejected={rejected}")
     return jsonify({"accepted": accepted, "rejected": rejected}), 200
+
+
+# ── Plugin self-update helpers ──
+
+def _parse_meta_lua_version(meta_path: Path) -> Optional[str]:
+    """Extract the version string from a Lua table file of the form: version = "x.y.z"."""
+    try:
+        content = meta_path.read_text(encoding="utf-8")
+        m = re.search(r'version\s*=\s*"([^"]+)"', content)
+        if m:
+            return m.group(1)
+    except OSError:
+        pass
+    return None
+
+
+def _get_plugin_dir_max_mtime(plugin_dir: Path) -> float:
+    """Return the latest mtime across all files in plugin_dir (recursive)."""
+    max_mtime = 0.0
+    for path in plugin_dir.rglob("*"):
+        if path.is_file():
+            mtime = path.stat().st_mtime
+            if mtime > max_mtime:
+                max_mtime = mtime
+    return max_mtime
+
+
+def _build_plugin_zip(plugin_dir: Path) -> bytes:
+    """Build an in-memory zip of plugin_dir with bridgesync.koplugin/ as the top-level folder."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for path in sorted(plugin_dir.rglob("*")):
+            if not path.is_file():
+                continue
+            parts = path.parts
+            if "__pycache__" in parts or ".git" in parts:
+                continue
+            if path.name.endswith(".pyc"):
+                continue
+            arcname = "bridgesync.koplugin/" + str(path.relative_to(plugin_dir))
+            zf.write(str(path), arcname)
+    return buf.getvalue()
+
+
+@kosync_sync_bp.route('/device-sync/plugin/version', methods=['GET'])
+@kosync_sync_bp.route('/koreader/device-sync/plugin/version', methods=['GET'])
+@kosync_auth_required
+def koreader_plugin_version():
+    """Return the current BridgeSync plugin version from _meta.lua."""
+    logger.debug("Plugin directory path: %s (exists: %s)", _PLUGIN_DIR, _PLUGIN_DIR.is_dir())
+    if not _PLUGIN_DIR.is_dir():
+        return jsonify({"error": "Plugin directory not found"}), 404
+
+    version = _parse_meta_lua_version(_PLUGIN_DIR / "_meta.lua")
+    if not version:
+        return jsonify({"error": "Could not determine plugin version"}), 404
+
+    return jsonify({"version": version, "name": "bridgesync"}), 200
+
+
+@kosync_sync_bp.route('/device-sync/plugin/download', methods=['GET'])
+@kosync_sync_bp.route('/koreader/device-sync/plugin/download', methods=['GET'])
+@kosync_auth_required
+def koreader_plugin_download():
+    """Serve the BridgeSync plugin as a zip archive; cached until any file's mtime changes."""
+    global _plugin_zip_cache
+
+    if not _PLUGIN_DIR.is_dir():
+        return jsonify({"error": "Plugin directory not found"}), 404
+
+    version = _parse_meta_lua_version(_PLUGIN_DIR / "_meta.lua")
+    if not version:
+        return jsonify({"error": "Could not determine plugin version"}), 404
+
+    current_mtime = _get_plugin_dir_max_mtime(_PLUGIN_DIR)
+
+    with _plugin_zip_cache_lock:
+        if _plugin_zip_cache is None or _plugin_zip_cache[1] < current_mtime:
+            logger.info("Plugin zip cache miss — rebuilding bridgesync plugin archive")
+            zip_bytes = _build_plugin_zip(_PLUGIN_DIR)
+            _plugin_zip_cache = (zip_bytes, current_mtime)
+        zip_bytes = _plugin_zip_cache[0]
+
+    filename = f"bridgesync-{version}.zip"
+    return send_file(
+        io.BytesIO(zip_bytes),
+        mimetype="application/zip",
+        as_attachment=True,
+        download_name=filename,
+    )
 
 
 # ---------------- Helper Functions ----------------
