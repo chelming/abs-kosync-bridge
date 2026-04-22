@@ -539,6 +539,107 @@ class CleanFlaskIntegrationTest(unittest.TestCase):
         finally:
             src.web_server.get_kosync_id_for_ebook = original_get_kosync
 
+    def test_match_endpoint_creates_abs_ebook_only_mapping_with_real_abs_id(self):
+        """ABS ebook-only matches should preserve the real ABS ebook item ID."""
+        import src.web_server
+
+        original_get_kosync = src.web_server.get_kosync_id_for_ebook
+        src.web_server.get_kosync_id_for_ebook = Mock(return_value='abs-ebook-kosync-id')
+
+        try:
+            self.mock_abs_client.get_all_audiobooks.return_value = []
+            self.mock_abs_client.get_item_details.return_value = {
+                'media': {
+                    'metadata': {
+                        'title': 'ABS Ebook Title'
+                    }
+                }
+            }
+            self.mock_database_service.get_book_by_kosync_id.return_value = None
+            self.mock_database_service.get_book.return_value = None
+            self.mock_booklore_client.is_configured.return_value = False
+
+            response = self.client.post('/match', data={
+                'ebook_filename': 'abs-ebook-123_abs.epub',
+                'ebook_source': 'ABS',
+                'ebook_source_id': 'abs-ebook-123'
+            })
+
+            self.assertEqual(response.status_code, 302)
+            self.assertTrue(response.location.endswith('/'))
+
+            self.mock_database_service.save_book.assert_called_once()
+            saved_book = self.mock_database_service.save_book.call_args[0][0]
+
+            self.assertEqual(saved_book.abs_id, 'abs-ebook-123')
+            self.assertEqual(saved_book.abs_title, 'ABS Ebook Title')
+            self.assertEqual(saved_book.sync_mode, 'ebook_only')
+            self.assertEqual(saved_book.ebook_source, 'ABS')
+            self.assertEqual(saved_book.ebook_source_id, 'abs-ebook-123')
+            self.assertEqual(saved_book.abs_ebook_item_id, 'abs-ebook-123')
+            self.assertEqual(saved_book.original_ebook_filename, 'abs-ebook-123_abs.epub')
+            self.assertEqual(saved_book.kosync_doc_id, 'abs-ebook-kosync-id')
+            self.mock_database_service.migrate_book_data.assert_not_called()
+            self.mock_database_service.delete_book.assert_not_called()
+        finally:
+            src.web_server.get_kosync_id_for_ebook = original_get_kosync
+
+    def test_match_endpoint_migrates_synthetic_abs_ebook_only_mapping_to_real_abs_id(self):
+        """ABS ebook-only rematches should fold old synthetic rows into the real ABS ebook item ID."""
+        import src.web_server
+        from src.db.models import Book
+
+        original_get_kosync = src.web_server.get_kosync_id_for_ebook
+        src.web_server.get_kosync_id_for_ebook = Mock(return_value='abs-ebook-kosync-id')
+
+        try:
+            legacy_book = Book(
+                abs_id='ebook-abs-ebook-kosy',
+                abs_title='Legacy Synthetic Title',
+                ebook_filename='legacy.epub',
+                original_ebook_filename='legacy.epub',
+                kosync_doc_id='abs-ebook-kosync-id',
+                sync_mode='ebook_only',
+                status='active'
+            )
+            self.mock_abs_client.get_all_audiobooks.return_value = []
+            self.mock_abs_client.get_item_details.return_value = {
+                'media': {
+                    'metadata': {
+                        'title': 'ABS Ebook Title'
+                    }
+                }
+            }
+            self.mock_database_service.get_book_by_kosync_id.return_value = legacy_book
+            self.mock_database_service.get_book.return_value = None
+            self.mock_booklore_client.is_configured.return_value = False
+
+            response = self.client.post('/match', data={
+                'ebook_filename': 'abs-ebook-123_abs.epub',
+                'ebook_source': 'ABS',
+                'ebook_source_id': 'abs-ebook-123'
+            })
+
+            self.assertEqual(response.status_code, 302)
+            self.assertTrue(response.location.endswith('/'))
+
+            self.mock_database_service.save_book.assert_called_once()
+            saved_book = self.mock_database_service.save_book.call_args[0][0]
+
+            self.assertEqual(saved_book.abs_id, 'abs-ebook-123')
+            self.assertEqual(saved_book.abs_title, 'ABS Ebook Title')
+            self.assertEqual(saved_book.sync_mode, 'ebook_only')
+            self.assertEqual(saved_book.ebook_source, 'ABS')
+            self.assertEqual(saved_book.ebook_source_id, 'abs-ebook-123')
+            self.assertEqual(saved_book.abs_ebook_item_id, 'abs-ebook-123')
+            self.mock_database_service.migrate_book_data.assert_called_once_with(
+                'ebook-abs-ebook-kosy',
+                'abs-ebook-123'
+            )
+            self.mock_database_service.delete_book.assert_called_once_with('ebook-abs-ebook-kosy')
+        finally:
+            src.web_server.get_kosync_id_for_ebook = original_get_kosync
+
     def test_storyteller_unlink_removes_from_collection_by_uuid(self):
         """Unlinking Storyteller should remove the prior UUID from Storyteller collection."""
         from src.db.models import Book

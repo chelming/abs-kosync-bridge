@@ -696,6 +696,8 @@ def _upsert_storyteller_mapping(
     abs_title=None,
     storyteller_uuid=None,
     ebook_filename=None,
+    ebook_source=None,
+    ebook_source_id=None,
     existing_book=None,
     duration=None,
 ):
@@ -709,11 +711,14 @@ def _upsert_storyteller_mapping(
 
     selected_storyteller_uuid = (storyteller_uuid or "").strip() or None
     selected_ebook_filename = (ebook_filename or "").strip() or None
+    selected_ebook_source = _normalize_text_source_type(ebook_source)
+    selected_ebook_source_id = str(ebook_source_id or "").strip() or None
+    requested_abs_id = str(abs_id or "").strip() or None
 
     target_book = existing_book
     if mode_hint == "existing":
-        if target_book is None and abs_id:
-            target_book = database_service.get_book(abs_id)
+        if target_book is None and requested_abs_id:
+            target_book = database_service.get_book(requested_abs_id)
         if not target_book:
             return None, "Book not found", 404
 
@@ -778,31 +783,77 @@ def _upsert_storyteller_mapping(
             return None, "Could not compute KOSync ID for ebook", 404
 
     created_ebook_only = False
+    migration_source_id = None
     if mode_hint == "ebook_only_create":
         existing_by_hash = database_service.get_book_by_kosync_id(kosync_doc_id)
+        preferred_abs_id = requested_abs_id
+        if not preferred_abs_id and selected_ebook_source == "ABS" and selected_ebook_source_id:
+            preferred_abs_id = selected_ebook_source_id
+
         if existing_by_hash:
-            target_book = existing_by_hash
-            logger.info(
-                "Match ebook-only create: reusing existing mapping '%s' for hash '%s'",
-                sanitize_log_data(target_book.abs_id),
-                kosync_doc_id,
-            )
+            if preferred_abs_id and existing_by_hash.abs_id != preferred_abs_id:
+                migration_source_id = existing_by_hash.abs_id
+                target_book = database_service.get_book(preferred_abs_id)
+                if not target_book:
+                    from src.db.models import Book
+
+                    target_book = Book(
+                        abs_id=preferred_abs_id,
+                        abs_title=existing_by_hash.abs_title or abs_title,
+                        sync_mode=getattr(existing_by_hash, "sync_mode", "ebook_only") or "ebook_only",
+                    )
+                    created_ebook_only = True
+                for attr in (
+                    "audio_source",
+                    "audio_source_id",
+                    "audio_title",
+                    "audio_cover_url",
+                    "audio_duration",
+                    "audio_provider_book_id",
+                    "audio_provider_file_id",
+                    "ebook_filename",
+                    "ebook_source",
+                    "ebook_source_id",
+                    "original_ebook_filename",
+                    "transcript_file",
+                    "transcript_source",
+                    "storyteller_uuid",
+                    "abs_ebook_item_id",
+                    "duration",
+                    "status",
+                ):
+                    existing_value = getattr(existing_by_hash, attr, None)
+                    if existing_value and not getattr(target_book, attr, None):
+                        setattr(target_book, attr, existing_value)
+                logger.info(
+                    "Match ebook-only create: migrating mapping '%s' -> '%s' for hash '%s'",
+                    sanitize_log_data(existing_by_hash.abs_id),
+                    sanitize_log_data(preferred_abs_id),
+                    kosync_doc_id,
+                )
+            else:
+                target_book = existing_by_hash
+                logger.info(
+                    "Match ebook-only create: reusing existing mapping '%s' for hash '%s'",
+                    sanitize_log_data(target_book.abs_id),
+                    kosync_doc_id,
+                )
         if not target_book:
             from src.db.models import Book
 
-            synthetic_abs_id = f"ebook-{kosync_doc_id[:16]}"
-            target_book = database_service.get_book(synthetic_abs_id)
+            target_abs_id = preferred_abs_id or f"ebook-{kosync_doc_id[:16]}"
+            target_book = database_service.get_book(target_abs_id)
             if not target_book:
-                inferred_title = abs_title or Path(resolved_ebook_filename).stem or synthetic_abs_id
+                inferred_title = abs_title or Path(resolved_ebook_filename).stem or target_abs_id
                 target_book = Book(
-                    abs_id=synthetic_abs_id,
+                    abs_id=target_abs_id,
                     abs_title=inferred_title,
                     sync_mode="ebook_only",
                 )
                 created_ebook_only = True
                 logger.info(
                     "Match ebook-only create: creating new mapping '%s' for '%s'",
-                    sanitize_log_data(synthetic_abs_id),
+                    sanitize_log_data(target_abs_id),
                     sanitize_log_data(inferred_title),
                 )
 
@@ -813,6 +864,12 @@ def _upsert_storyteller_mapping(
     target_book.ebook_filename = resolved_ebook_filename
     target_book.kosync_doc_id = kosync_doc_id
     target_book.status = "pending"
+    if selected_ebook_source:
+        target_book.ebook_source = selected_ebook_source
+    if selected_ebook_source_id:
+        target_book.ebook_source_id = selected_ebook_source_id
+        if selected_ebook_source == "ABS":
+            target_book.abs_ebook_item_id = selected_ebook_source_id
 
     if original_ebook_filename:
         target_book.original_ebook_filename = original_ebook_filename
@@ -855,6 +912,23 @@ def _upsert_storyteller_mapping(
     saved_book = database_service.save_book(target_book)
     if not isinstance(getattr(saved_book, "abs_id", None), str):
         saved_book = target_book
+
+    if migration_source_id and migration_source_id != saved_book.abs_id:
+        try:
+            database_service.migrate_book_data(migration_source_id, saved_book.abs_id)
+            database_service.delete_book(migration_source_id)
+            logger.info(
+                "Match ebook-only create: migrated '%s' into '%s'",
+                sanitize_log_data(migration_source_id),
+                sanitize_log_data(saved_book.abs_id),
+            )
+        except Exception as merge_err:
+            logger.error(
+                "Match ebook-only create: failed to migrate '%s' into '%s': %s",
+                sanitize_log_data(migration_source_id),
+                sanitize_log_data(saved_book.abs_id),
+                merge_err,
+            )
 
     if selected_storyteller_uuid and container.storyteller_client().is_configured():
         try:
@@ -2379,11 +2453,25 @@ def match():
                 return "Please select a text source (Storyteller or Standard Ebook)", 400
 
             storyteller_meta = _get_storyteller_display_metadata(storyteller_uuid)
-            ebook_only_title = (
-                Path(selected_filename).stem
-                if selected_filename
-                else (storyteller_meta.get("title") or f"storyteller_{storyteller_uuid or 'book'}")
-            )
+            ebook_only_title = None
+            if ebook_source == 'ABS' and ebook_source_id:
+                try:
+                    item_details = container.abs_client().get_item_details(ebook_source_id)
+                except Exception as e:
+                    logger.warning(
+                        "Match: failed ABS ebook metadata lookup for '%s': %s",
+                        sanitize_log_data(ebook_source_id),
+                        e,
+                    )
+                    item_details = None
+                metadata = (item_details or {}).get('media', {}).get('metadata', {})
+                ebook_only_title = (metadata.get('title') or '').strip() or None
+            if not ebook_only_title:
+                ebook_only_title = (
+                    Path(selected_filename).stem
+                    if selected_filename
+                    else (storyteller_meta.get("title") or f"storyteller_{storyteller_uuid or 'book'}")
+                )
             logger.info(
                 "Match: entering ebook-only create path (storyteller_selected=%s, ebook_selected=%s)",
                 bool(storyteller_uuid),
@@ -2391,9 +2479,12 @@ def match():
             )
             saved_book, err_msg, err_code = _upsert_storyteller_mapping(
                 mode_hint="ebook_only_create",
+                abs_id=ebook_source_id if ebook_source == 'ABS' and ebook_source_id else None,
                 abs_title=ebook_only_title,
                 storyteller_uuid=storyteller_uuid,
                 ebook_filename=selected_filename,
+                ebook_source=ebook_source,
+                ebook_source_id=ebook_source_id,
                 duration=0.0,
             )
             if err_msg:
