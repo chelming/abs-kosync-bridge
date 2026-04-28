@@ -103,6 +103,12 @@ def api_storygraph_resolve():
     if not book_id:
         return jsonify({"found": False, "message": "StoryGraph did not return a book id"}), 502
 
+    editions = []
+    try:
+        editions = storygraph_client.get_book_editions(book_id)
+    except Exception as exc:
+        logger.warning("Failed to fetch StoryGraph editions for %s: %s", book_id, exc)
+
     return jsonify(
         {
             "found": True,
@@ -111,6 +117,8 @@ def api_storygraph_resolve():
             "author": match.get("author") or author or "",
             "url": match.get("url") or storygraph_client.book_url(book_id),
             "linked": bool(existing_details and str(existing_details.storygraph_book_id) == book_id),
+            "linked_edition_id": existing_details.storygraph_edition_id if existing_details else None,
+            "editions": editions,
         }
     )
 
@@ -144,11 +152,30 @@ def link_storygraph(abs_id):
         if not book_id:
             return jsonify({"error": "Missing book_id"}), 400
 
+        edition_id = str(data.get("edition_id") or "").strip()
+        pages = data.get("pages")
+
+        # Handle edition switch if needed
+        existing_details = database_service.get_storygraph_details(abs_id)
+        if existing_details and edition_id and existing_details.storygraph_edition_id != edition_id:
+            try:
+                storygraph_client.switch_edition(existing_details.storygraph_edition_id or existing_details.storygraph_book_id, edition_id)
+            except Exception as exc:
+                logger.warning("Failed to switch StoryGraph edition: %s", exc)
+        elif not existing_details and edition_id and book_id != edition_id:
+             # If new link and edition is different from parent, try to switch
+             try:
+                storygraph_client.switch_edition(book_id, edition_id)
+             except Exception as exc:
+                logger.warning("Failed to switch StoryGraph edition: %s", exc)
+
         _, meta = _get_abs_metadata(abs_id, database_service, container)
         details = StorygraphDetails(
             abs_id=abs_id,
             storygraph_book_id=book_id,
             storygraph_url=url or storygraph_client.book_url(book_id),
+            storygraph_edition_id=edition_id or None,
+            storygraph_pages=pages,
             isbn=(meta or {}).get("isbn"),
             asin=(meta or {}).get("asin"),
             matched_by="manual",
@@ -157,7 +184,10 @@ def link_storygraph(abs_id):
         try:
             database_service.save_storygraph_details(details)
             try:
-                storygraph_client.update_status(book_id, 1)
+                # Set status to "Currently Reading" (2) instead of "To Read" (1) if it's already in progress?
+                # For now, stick to the request's pattern which uses update_status(book_id, 1) in existing code.
+                # Actually, the existing code uses update_status(book_id, 1).
+                storygraph_client.update_status(edition_id or book_id, 1)
             except Exception as exc:
                 logger.warning("Failed to set StoryGraph status: %s", exc)
             return jsonify({"success": True, "title": title})

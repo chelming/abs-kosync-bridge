@@ -215,6 +215,109 @@ class StorygraphClient:
     def book_url(self, book_id: str) -> str:
         return f"{self.base_url}/books/{book_id}"
 
+    def get_book_editions(self, book_id: str) -> list[dict]:
+        """
+        Fetches all editions for a book.
+        Returns a list of dicts with: id, title, format, pages, isbn, language.
+        """
+        if not book_id:
+            return []
+
+        resp = self._request(f"/books/{book_id}/editions")
+        if not resp or resp.status_code != 200:
+            return []
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        editions = []
+
+        for pane in soup.select(".book-pane"):
+            ed_id = pane.get("data-book-id")
+            if not ed_id:
+                continue
+
+            # Extract details from the pane
+            title = ""
+            title_node = pane.select_one(".book-title-author-and-series a[href^='/books/']")
+            if title_node:
+                title = title_node.get_text(" ", strip=True)
+
+            details_text = pane.get_text(" ", strip=True)
+            
+            # Format and pages
+            # StoryGraph editions often list "Format, Pages" or similar
+            format_val = "Unknown"
+            pages_val = 0
+            
+            # Look for format/pages in the text
+            # Often looks like: "Paperback, 320 pages" or "Kindle Edition, 320 pages"
+            match_pages = re.search(r"(\d+)\s+pages?", details_text, re.IGNORECASE)
+            if match_pages:
+                pages_val = int(match_pages.group(1))
+
+            formats = ["Paperback", "Hardcover", "Ebook", "Kindle Edition", "Audiobook", "Audio CD", "Digital Audiobook"]
+            for f in formats:
+                if f.lower() in details_text.lower():
+                    format_val = f
+                    break
+
+            # Language
+            language = ""
+            if "English" in details_text:
+                language = "English"
+            elif "Spanish" in details_text:
+                language = "Spanish"
+            # ... could add more but these are common
+
+            editions.append({
+                "id": ed_id,
+                "book_id": ed_id,
+                "title": title,
+                "format": format_val,
+                "pages": pages_val,
+                "language": language,
+                "is_audio": "audio" in format_val.lower()
+            })
+
+        return editions
+
+    def switch_edition(self, from_book_id: str, to_book_id: str) -> bool:
+        """
+        Switches the currently tracked edition on StoryGraph.
+        """
+        if not from_book_id or not to_book_id or from_book_id == to_book_id:
+            return True
+
+        # First get the editions page to extract a fresh CSRF token
+        page = self._request(f"/books/{from_book_id}/editions")
+        if not page or page.status_code != 200:
+            return False
+
+        csrf = self._extract_csrf(page.text)
+        if not csrf:
+            logger.warning("StoryGraph: could not extract CSRF token for edition switch")
+            return False
+
+        payload = {
+            "authenticity_token": csrf,
+            "from_book_id": from_book_id,
+            "to_book_id": to_book_id
+        }
+
+        resp = self._request(
+            "/switch-editions",
+            method="POST",
+            data=payload,
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "X-CSRF-Token": csrf,
+                "X-Requested-With": "XMLHttpRequest",
+                "Referer": f"{self.base_url}/books/{from_book_id}/editions",
+            },
+            allow_redirects=False
+        )
+
+        return bool(resp and resp.status_code in (200, 204, 302, 303))
+
     def _extract_book_id_from_input(self, input_str: str) -> str:
         value = (input_str or "").strip()
         if not value:

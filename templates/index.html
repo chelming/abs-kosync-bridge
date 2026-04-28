@@ -217,7 +217,10 @@
                         rel="noopener noreferrer"
                         title="{% if mapping.storygraph_book_id %}Open {{ mapping.storygraph_title }} in StoryGraph{% else %}Not linked to StoryGraph{% endif %}"
                         class="hc-link {% if not mapping.storygraph_book_id %}pe-none{% endif %}">
-                        <span class="service-icon-emoji {% if not mapping.storygraph_book_id %}grayscale-muted{% endif %}">SG</span>
+                        <img src="/static/storygraph.svg" alt="SG"
+                            class="service-icon {% if not mapping.storygraph_book_id %}grayscale-muted{% endif %}"
+                            onerror="this.style.display='none'; this.nextElementSibling.classList.remove('hidden');">
+                        <span class="hidden service-icon-emoji">SG</span>
                     </a>
                     <span class="service-name">StoryGraph</span>
                     <span class="service-value cursor-pointer color-inherit" title="Click to edit StoryGraph link"
@@ -2428,6 +2431,8 @@
                             <div class="hc-book-title" id="sg-title"></div>
                             <div class="hc-book-author" id="sg-author"></div>
                         </div>
+                        <div class="sg-editions-label" id="sg-editions-label">Select Edition</div>
+                        <div id="sg-editions"></div>
                         <p class="hc-text-muted">
                             <a id="sg-found-url" href="#" target="_blank" rel="noopener noreferrer">Open in StoryGraph</a>
                         </p>
