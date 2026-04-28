@@ -28,6 +28,7 @@ from src.utils.logging_utils import sanitize_log_data
 from src.api.api_clients import ABS_DISABLED_SENTINEL, is_abs_disabled_value
 from src.api.kosync_server import kosync_sync_bp, kosync_admin_bp, init_kosync_server, signal_manifest_rebuild
 from src.api.hardcover_routes import hardcover_bp, init_hardcover_routes
+from src.api.storygraph_routes import storygraph_bp, init_storygraph_routes
 from src.version import APP_VERSION, get_update_status
 from src.db.models import State
 from src.sync_clients.sync_client_interface import LocatorResult, UpdateProgressRequest
@@ -313,6 +314,8 @@ def setup_dependencies(app, test_container=None):
     # Register Hardcover Blueprint and initialize with dependencies
     init_hardcover_routes(database_service, container)
     app.register_blueprint(hardcover_bp)
+    init_storygraph_routes(database_service, container)
+    app.register_blueprint(storygraph_bp)
 
     logger.info(f"🚀 Web server dependencies initialized (DATA_DIR={DATA_DIR})")
 
@@ -1418,6 +1421,7 @@ def settings():
             'CWA_ENABLED',
             'CWA_SYNC_ENABLED',
             'HARDCOVER_ENABLED',
+            'STORYGRAPH_ENABLED',
             'TELEGRAM_ENABLED',
             'SUGGESTIONS_ENABLED',
             'ABS_ONLY_SEARCH_IN_ABS_LIBRARY_ID',
@@ -1851,6 +1855,7 @@ def _build_dashboard_mapping(
     states_by_book,
     integrations,
     hardcover_by_book,
+    storygraph_by_book,
     reading_stats_by_book,
     cached_booklore_by_filename,
 ):
@@ -1956,6 +1961,24 @@ def _build_dashboard_mapping(
             "hardcover_title": None,
         })
 
+    storygraph_details = storygraph_by_book.get(book.abs_id)
+    if storygraph_details:
+        mapping.update({
+            "storygraph_book_id": storygraph_details.storygraph_book_id,
+            "storygraph_linked": True,
+            "storygraph_url": storygraph_details.storygraph_url,
+            "storygraph_title": book.abs_title,
+            "storygraph_matched_by": storygraph_details.matched_by,
+        })
+    else:
+        mapping.update({
+            "storygraph_book_id": None,
+            "storygraph_linked": False,
+            "storygraph_url": None,
+            "storygraph_title": None,
+            "storygraph_matched_by": None,
+        })
+
     mapping["storyteller_legacy_link"] = "storyteller" in state_by_client and not book.storyteller_uuid
 
     if mapping.get("sync_mode") == "ebook_only":
@@ -1981,6 +2004,9 @@ def _build_dashboard_mapping(
     else:
         mapping["hardcover_url"] = None
 
+    if not mapping.get("storygraph_url") and mapping.get("storygraph_book_id"):
+        mapping["storygraph_url"] = f"https://app.thestorygraph.com/books/{mapping['storygraph_book_id']}"
+
     mapping["sync_warning_pct"] = _compute_dashboard_sync_warning_pct(mapping, integrations)
     mapping["is_out_of_sync"] = mapping["sync_warning_pct"] > 5.0
     mapping["unified_progress"] = min(max_progress, 100.0)
@@ -2005,10 +2031,12 @@ def _build_dashboard_mappings(
     all_states,
     integrations,
     all_hardcover=None,
+    all_storygraph=None,
     reading_stats_by_book=None,
     cached_booklore_by_filename=None,
 ):
     hardcover_by_book = {h.abs_id: h for h in (all_hardcover or [])}
+    storygraph_by_book = {s.abs_id: s for s in (all_storygraph or [])}
     states_by_book = _group_dashboard_states_by_book(all_states)
     reading_stats_by_book = reading_stats_by_book or {}
     cached_booklore_by_filename = cached_booklore_by_filename or {}
@@ -2023,6 +2051,7 @@ def _build_dashboard_mappings(
             states_by_book,
             integrations,
             hardcover_by_book,
+            storygraph_by_book,
             reading_stats_by_book,
             cached_booklore_by_filename,
         )
@@ -2075,6 +2104,7 @@ def index():
     books = database_service.get_all_books()
     all_states = database_service.get_all_states()
     all_hardcover = database_service.get_all_hardcover_details()
+    all_storygraph = database_service.get_all_storygraph_details()
     all_reading_stats = database_service.get_all_reading_stats()
     cached_booklore_by_filename = _index_cached_booklore_books(database_service.get_all_booklore_books())
     integrations = _build_dashboard_integrations()
@@ -2083,6 +2113,7 @@ def index():
         all_states,
         integrations,
         all_hardcover=all_hardcover,
+        all_storygraph=all_storygraph,
         reading_stats_by_book=all_reading_stats,
         cached_booklore_by_filename=cached_booklore_by_filename,
     )
@@ -4832,6 +4863,7 @@ def api_status():
     books = database_service.get_all_books()
     all_states = database_service.get_all_states()
     all_hardcover = database_service.get_all_hardcover_details()
+    all_storygraph = database_service.get_all_storygraph_details()
     all_reading_stats = database_service.get_all_reading_stats()
     cached_booklore_by_filename = _index_cached_booklore_books(database_service.get_all_booklore_books())
     integrations = _build_dashboard_integrations()
@@ -4840,6 +4872,7 @@ def api_status():
         all_states,
         integrations,
         all_hardcover=all_hardcover,
+        all_storygraph=all_storygraph,
         reading_stats_by_book=all_reading_stats,
         cached_booklore_by_filename=cached_booklore_by_filename,
     )
@@ -5441,6 +5474,11 @@ def test_connection(service: str):
             _coerce_test_bool(data.get('HARDCOVER_ENABLED')),
             _coerce_test_str(data.get('HARDCOVER_TOKEN')),
         ),
+        'storygraph': lambda data: _test_storygraph(
+            _coerce_test_bool(data.get('STORYGRAPH_ENABLED')),
+            _coerce_test_str(data.get('STORYGRAPH_SESSION_COOKIE')),
+            _coerce_test_str(data.get('STORYGRAPH_REMEMBER_USER_TOKEN')),
+        ),
         'telegram': lambda data: _test_telegram(
             _coerce_test_bool(data.get('TELEGRAM_ENABLED')),
             _coerce_test_str(data.get('TELEGRAM_BOT_TOKEN')),
@@ -5659,6 +5697,32 @@ def _test_hardcover(enabled: bool, token: str) -> dict:
     return {"ok": False, "message": f"API returned {r.status_code}"}
 
 
+def _test_storygraph(enabled: bool, session_cookie: str, remember_user_token: str) -> dict:
+    if not enabled:
+        return {"ok": False, "message": "StoryGraph is disabled"}
+    if not session_cookie or not remember_user_token:
+        return {"ok": False, "message": "Missing StoryGraph session cookies"}
+
+    cookie = f"_storygraph_session={session_cookie}; remember_user_token={remember_user_token}"
+    r = requests.get(
+        "https://app.thestorygraph.com/users/sign_in",
+        headers={
+            "Cookie": cookie,
+            "User-Agent": "ABS-KoSync-Bridge/StoryGraph",
+        },
+        timeout=10,
+        allow_redirects=False,
+    )
+    location = (r.headers.get("Location") or r.headers.get("location") or "").lower()
+    if r.status_code in (302, 303) and "/users/sign_in" not in location:
+        return {"ok": True, "message": "StoryGraph session accepted"}
+    if r.status_code in (200, 401, 403):
+        return {"ok": False, "message": "Invalid StoryGraph session cookies"}
+    if r.status_code in (302, 303) and "/users/sign_in" in location:
+        return {"ok": False, "message": "Invalid StoryGraph session cookies"}
+    return {"ok": False, "message": f"StoryGraph returned {r.status_code}"}
+
+
 def _test_telegram(enabled: bool, token: str) -> dict:
     if not enabled or not token:
         return {"ok": False, "message": "Telegram not configured or disabled"}
@@ -5874,5 +5938,4 @@ if __name__ == '__main__':
         logger.info(f"🚀 Split-Port Mode Active: Sync-only server on port {sync_port}")
 
     app.run(host='0.0.0.0', port=5757, debug=False)
-
 
