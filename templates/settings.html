@@ -642,6 +642,12 @@
                                 %}>Filename (Fast)</option>
                         </select>
                     </div>
+                    <div class="form-group full-width">
+                        <label>KoSync PUT debounce seconds</label>
+                        <input type="number" min="0" name="KOSYNC_PUT_DEBOUNCE_SECONDS"
+                            value="{{ get_val('KOSYNC_PUT_DEBOUNCE_SECONDS') or '300' }}">
+                        <div class="help-text">Wait this many seconds after KoReader stops sending PUTs before running the sync cycle.</div>
+                    </div>
                     <div class="checkbox-wrapper full-width">
                         <input type="checkbox" id="kosync_pct" name="KOSYNC_USE_PERCENTAGE_FROM_SERVER" {% if
                             get_bool('KOSYNC_USE_PERCENTAGE_FROM_SERVER') %}checked{% endif %}>
