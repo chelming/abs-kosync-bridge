@@ -629,6 +629,28 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#storygraph" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        StoryGraph
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#progress-tracker-provider" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Progress Tracker Provider
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#telegram-notifications" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -948,6 +970,28 @@
     <span class="md-ellipsis">
       
         Hardcover.app
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#storygraph" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        StoryGraph
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#progress-tracker-provider" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Progress Tracker Provider
       
     </span>
   </a>
@@ -1501,6 +1545,7 @@ Environment variables are mainly for first boot or advanced overrides. Once a va
 </tbody>
 </table>
 <h4 id="hardcoverapp">Hardcover.app</h4>
+<p>Hardcover provides modern reading tracking with a beautiful UI.</p>
 <table>
 <thead>
 <tr>
@@ -1525,6 +1570,73 @@ Environment variables are mainly for first boot or advanced overrides. Once a va
 </tr>
 </tbody>
 </table>
+<p>Hardcover notes:</p>
+<ul>
+<li>When enabled, progress is synced from KOReader/Audiobookshelf to Hardcover.</li>
+<li>Use the <strong>Edition Picker</strong> on the dashboard to select which specific edition to track.</li>
+</ul>
+<h4 id="storygraph">StoryGraph</h4>
+<p>StoryGraph is a popular alternative to Goodreads that focuses on reading data and moods.</p>
+<table>
+<thead>
+<tr>
+<th>Setting</th>
+<th>Env Var</th>
+<th>Default</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Enable</td>
+<td><code>STORYGRAPH_ENABLED</code></td>
+<td><code>false</code></td>
+<td>Turns on StoryGraph updates.</td>
+</tr>
+<tr>
+<td>Session Cookie</td>
+<td><code>STORYGRAPH_SESSION_COOKIE</code></td>
+<td>empty</td>
+<td><code>_storygraph_session</code> cookie value.</td>
+</tr>
+<tr>
+<td>Remember User Token</td>
+<td><code>STORYGRAPH_REMEMBER_USER_TOKEN</code></td>
+<td>empty</td>
+<td><code>remember_user_token</code> cookie value.</td>
+</tr>
+</tbody>
+</table>
+<p>StoryGraph notes:</p>
+<ul>
+<li>Requires browser cookies for authentication. See the <a href="../user-guide/#storygraph-authentication">User Guide</a> for instructions on how to retrieve these.</li>
+<li>Supports <strong>Edition Picking</strong>: Select specific editions (Paperback, Kindle, etc.) to ensure accurate page counts.</li>
+<li><strong>Switch Editions</strong>: The bridge can automatically "switch" your tracked edition on StoryGraph to match your selection.</li>
+</ul>
+<h4 id="progress-tracker-provider">Progress Tracker Provider</h4>
+<p>Since Hardcover and StoryGraph serve similar purposes, the bridge uses an "either-or" mode for active tracking.</p>
+<table>
+<thead>
+<tr>
+<th>Setting</th>
+<th>Env Var</th>
+<th>Default</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Provider</td>
+<td><code>PROGRESS_TRACKER_PROVIDER</code></td>
+<td><code>none</code></td>
+<td><code>none</code>, <code>hardcover</code>, or <code>storygraph</code>.</td>
+</tr>
+</tbody>
+</table>
+<ul>
+<li>Selecting a provider in the UI automatically enables that service and disables the other.</li>
+<li>If you want to use both simultaneously for different books, you must currently manage the "Enable" toggles manually in Settings (not recommended).</li>
+</ul>
 <h4 id="telegram-notifications">Telegram Notifications</h4>
 <table>
 <thead>
