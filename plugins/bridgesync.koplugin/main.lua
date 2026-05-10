@@ -77,11 +77,18 @@ function BridgeSync:init()
         self.session_tracking_enabled = session_tracking
     end
     self.min_session_duration = tonumber(self.settings:readSetting("min_session_duration")) or 30
+    local auto_sync_stats = self.settings:readSetting("auto_sync_stats")
+    if auto_sync_stats == nil then
+        self.auto_sync_stats = true
+    else
+        self.auto_sync_stats = auto_sync_stats
+    end
     self.current_session = nil
     self.pending_sessions = self.state:readSetting("pending_sessions") or {}
 
     self.sync_in_progress = false
     self.last_auto_sync_time = 0
+    self.last_stats_sync_time = 0
     self.needs_wake_sync = false
     self.sync_scheduled = false
     self.log_path = DataStorage:getSettingsDir() .. "/bridge_sync.log"
@@ -141,6 +148,7 @@ function BridgeSync:_saveSettings()
     self.settings:saveSetting("wake_sync_delay_seconds", self.wake_sync_delay_seconds)
     self.settings:saveSetting("session_tracking_enabled", self.session_tracking_enabled)
     self.settings:saveSetting("min_session_duration", self.min_session_duration)
+    self.settings:saveSetting("auto_sync_stats", self.auto_sync_stats)
     self.settings:flush()
     self.api:init(self.server_url, self.username, self.key, function(level, message)
         self:_appendLog(level, message)
@@ -502,6 +510,26 @@ function BridgeSync:_maybeUploadPendingSessions(reason)
     return true
 end
 
+function BridgeSync:_maybeAutoSyncStats(reason)
+    if not self.is_enabled or not self.session_tracking_enabled or not self.auto_sync_stats then
+        return false
+    end
+    if not NetworkMgr:isConnected() then
+        return false
+    end
+    if (os.time() - (self.last_stats_sync_time or 0)) < 300 then
+        return false
+    end
+    self.last_stats_sync_time = os.time()
+    if reason then
+        self:logInfo("Auto-syncing reading stats after", reason)
+    end
+    Trapper:wrap(function()
+        self:syncReadingStats(true)
+    end)
+    return true
+end
+
 function BridgeSync:onResume()
     if not self.is_enabled then
         return false
@@ -516,6 +544,8 @@ function BridgeSync:onResume()
     if #self.pending_sessions > 0 then
         self:_maybeUploadPendingSessions("resume")
     end
+
+    self:_maybeAutoSyncStats("resume")
 
     if self.manual_only then
         return false
@@ -539,6 +569,8 @@ function BridgeSync:onNetworkConnected()
     if #self.pending_sessions > 0 then
         self:_maybeUploadPendingSessions("network reconnect")
     end
+
+    self:_maybeAutoSyncStats("network reconnect")
 
     if self.manual_only then
         return false
@@ -1043,6 +1075,8 @@ function BridgeSync:syncFromBridge(silent)
     then
         FileManager.instance:reinit(self.download_dir)
     end
+
+    self:_maybeAutoSyncStats("manifest sync")
 
     return true
 end
@@ -1794,6 +1828,21 @@ function BridgeSync:addToMainMenu(menu_items)
                 end,
                 callback = function(touchmenu_instance)
                     self.session_tracking_enabled = not self.session_tracking_enabled
+                    self:_saveSettings()
+                    self:_refreshMenu(touchmenu_instance)
+                end,
+            },
+            {
+                text = _("Auto-Sync Reading Stats"),
+                keep_menu_open = true,
+                enabled_func = function()
+                    return self.session_tracking_enabled
+                end,
+                checked_func = function()
+                    return self.auto_sync_stats
+                end,
+                callback = function(touchmenu_instance)
+                    self.auto_sync_stats = not self.auto_sync_stats
                     self:_saveSettings()
                     self:_refreshMenu(touchmenu_instance)
                 end,

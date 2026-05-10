@@ -71,10 +71,11 @@ The settings menu stays open while you adjust configuration values so you can ma
 
 ### Reading Sessions
 
-| Setting                | Default | Description                                                                |
-|------------------------|---------|----------------------------------------------------------------------------|
-| Track Reading Sessions | On      | Records reading sessions (start/end time, pages, progress) locally         |
-| Pending Sessions       | —       | Shows the count of queued sessions; tap to upload when connected           |
+| Setting                  | Default | Description                                                                |
+|--------------------------|---------|----------------------------------------------------------------------------|
+| Track Reading Sessions   | On      | Records reading sessions (start/end time, pages, progress) locally         |
+| Auto-Sync Reading Stats  | On      | Uploads KOReader's `statistics.sqlite` page-stat rows alongside auto-syncs (wake / network reconnect / Sync Now), with a 5-minute cooldown between uploads |
+| Pending Sessions         | —       | Shows the count of queued sessions; tap to upload when connected           |
 
 Sessions are stored locally and uploaded to the bridge when WiFi is available. Sessions shorter than 30 seconds or with no page progress are discarded.
 
