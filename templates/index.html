@@ -1874,6 +1874,28 @@
         }
         .series-group.expanded .series-children { display: flex; }
         .series-children .book-card { width: auto; }
+
+        /* Series grouping toggle */
+        .series-grouping-label {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            cursor: pointer;
+            user-select: none;
+            color: rgba(255, 255, 255, 0.85);
+            font-size: 14px;
+        }
+        .series-grouping-label input[type="checkbox"] {
+            width: 16px;
+            height: 16px;
+            cursor: pointer;
+            accent-color: #6ec1e4;
+        }
+
+        /* When series grouping is off, hide series-group shells and any
+           cards left inside them that are duplicates of flat-rendered cards. */
+        body.series-grouping-off .series-group { display: none !important; }
+        body.series-grouping-off .book-card.flatten-duplicate { display: none !important; }
     </style>
 </head>
 
@@ -2131,18 +2153,14 @@
         {% endif %}
         {% endwith %}
         {% if mappings %}
+        {# Detect sections from the flat mappings list so all three sections exist if any
+           book matches each state. This matters when series grouping is toggled off and
+           series children need to land in the correct section. #}
         {% set section_flags = namespace(has_in_progress=false, has_not_started=false, has_finished=false) %}
         {% for m in mappings %}
           {% if m.unified_progress > 0 and m.unified_progress < 100 %}{% set section_flags.has_in_progress = true %}{% endif %}
-        {% endfor %}
-        {% for entry in grouped_mappings %}
-        {% if entry.is_series_group %}
-          {% if entry.section_bucket == 'not_started' %}{% set section_flags.has_not_started = true %}{% endif %}
-          {% if entry.section_bucket == 'finished' %}{% set section_flags.has_finished = true %}{% endif %}
-        {% else %}
-          {% if entry.unified_progress == 0 %}{% set section_flags.has_not_started = true %}{% endif %}
-          {% if entry.unified_progress >= 100 %}{% set section_flags.has_finished = true %}{% endif %}
-        {% endif %}
+          {% if m.unified_progress == 0 %}{% set section_flags.has_not_started = true %}{% endif %}
+          {% if m.unified_progress >= 100 %}{% set section_flags.has_finished = true %}{% endif %}
         {% endfor %}
         <div class="controls-bar">
             <div class="control-group">
@@ -2166,6 +2184,12 @@
                     <option value="rating">Rating</option>
                 </select>
                 <span class="sort-direction" id="sort-direction" title="Click to Reverse Order">↓</span>
+            </div>
+            <div class="control-group">
+                <label class="series-grouping-label" for="series-grouping-toggle" title="Group books from the same series into a single stacked card">
+                    <input type="checkbox" id="series-grouping-toggle" checked>
+                    <span>Group series</span>
+                </label>
             </div>
         </div>
 
@@ -2242,6 +2266,7 @@
             const notStartedHeader = document.getElementById('not-started-header');
             const notStartedGrid = document.getElementById('not-started-grid');
             const notStartedChevron = document.getElementById('not-started-chevron');
+            const seriesGroupingToggle = document.getElementById('series-grouping-toggle');
 
             function updateNotStartedChevron(isExpanded) {
                 if (notStartedChevron) {
@@ -2518,11 +2543,90 @@
                 }
             }
 
+            // --- Series Grouping Toggle ---
+
+            // Tag every book card that lives inside a series-children container so we can
+            // restore it to its original position when grouping is turned back on.
+            document.querySelectorAll('.series-children').forEach(container => {
+                if (!container.id) return;
+                Array.from(container.children).forEach((card, idx) => {
+                    if (!card.classList || !card.classList.contains('book-card')) return;
+                    card.dataset.seriesContainerId = container.id;
+                    card.dataset.seriesOrder = String(idx);
+                });
+            });
+
+            function flattenSeriesGroups() {
+                const inProgressGrid = document.getElementById('in-progress-grid');
+                const notStartedGridEl = document.getElementById('not-started-grid');
+                const finishedGrid = document.getElementById('finished-grid');
+
+                // Track abs-ids already rendered flat so series children don't duplicate.
+                const flatAbsIds = new Set();
+                document.querySelectorAll('.book-grid > .book-card').forEach(c => {
+                    if (c.dataset.absId) flatAbsIds.add(c.dataset.absId);
+                });
+
+                document.querySelectorAll('.series-group .book-card').forEach(card => {
+                    const absId = card.dataset.absId || '';
+                    if (absId && flatAbsIds.has(absId)) {
+                        card.classList.add('flatten-duplicate');
+                        return;
+                    }
+                    const progress = parseFloat(card.dataset.progress || '0') || 0;
+                    let target;
+                    if (progress > 0 && progress < 100) target = inProgressGrid;
+                    else if (progress >= 100) target = finishedGrid;
+                    else target = notStartedGridEl;
+                    if (target) {
+                        target.appendChild(card);
+                        if (absId) flatAbsIds.add(absId);
+                    }
+                });
+            }
+
+            function restoreSeriesGroups() {
+                // Clear duplicate flags first.
+                document.querySelectorAll('.book-card.flatten-duplicate').forEach(card => {
+                    card.classList.remove('flatten-duplicate');
+                });
+                // Reparent any card that was moved out of its series-children.
+                document.querySelectorAll('.book-card[data-series-container-id]').forEach(card => {
+                    const container = document.getElementById(card.dataset.seriesContainerId);
+                    if (!container || card.parentNode === container) return;
+                    container.appendChild(card);
+                });
+                // Restore original sibling order within each series-children container.
+                document.querySelectorAll('.series-children').forEach(container => {
+                    const items = Array.from(container.children).filter(el => el.classList && el.classList.contains('book-card'));
+                    items.sort((a, b) => (parseInt(a.dataset.seriesOrder || '0', 10) - parseInt(b.dataset.seriesOrder || '0', 10)));
+                    items.forEach(el => container.appendChild(el));
+                });
+            }
+
+            function applySeriesGrouping(enabled) {
+                document.body.classList.toggle('series-grouping-off', !enabled);
+                if (enabled) restoreSeriesGroups();
+                else flattenSeriesGroups();
+
+                if (sortSelect) sortBooks(sortSelect.value, sortState[sortSelect.value]);
+                if (typeof filterBooks === 'function') filterBooks();
+                updateDashboardSectionVisibility();
+            }
+
             // --- Event Listeners ---
 
             if (sortSelect) {
                 sortSelect.addEventListener('change', (e) => {
                     applySorting(e.target.value);
+                });
+            }
+
+            if (seriesGroupingToggle) {
+                seriesGroupingToggle.addEventListener('change', (e) => {
+                    const enabled = e.target.checked;
+                    try { localStorage.setItem('abs_kosync_series_grouping', enabled ? '1' : '0'); } catch (err) { /* ignore */ }
+                    applySeriesGrouping(enabled);
                 });
             }
 
@@ -2578,6 +2682,18 @@
             // Apply initial sort on load (if content exists)
             if (dashboardGrids.length > 0) {
                 applySorting(savedSort);
+            }
+
+            // Restore series-grouping preference (default ON).
+            if (seriesGroupingToggle) {
+                let savedGrouping = '1';
+                try {
+                    const v = localStorage.getItem('abs_kosync_series_grouping');
+                    if (v === '0' || v === '1') savedGrouping = v;
+                } catch (e) { /* ignore */ }
+                const enabled = savedGrouping === '1';
+                seriesGroupingToggle.checked = enabled;
+                if (!enabled) applySeriesGrouping(false);
             }
 
             // Filter Logic initialization

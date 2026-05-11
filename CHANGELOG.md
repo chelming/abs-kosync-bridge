@@ -4,6 +4,54 @@
 
 All notable changes to ABS-KoSync Enhanced will be documented in this file.
 
+## [6.7.0] - 2026-05-11
+
+### What's New
+
+- **Book ratings now appear on dashboard cards.** Each card shows StoryGraph and Goodreads ratings as small badges under the cover, with tooltips that include the rating, review count, and source. Both ratings are captured automatically when a book is linked — Goodreads via the cached Grimmory metadata, StoryGraph via a one-time scrape of the book's community-reviews page. A one-time backfill runs in the background at startup so books linked before this release also get their StoryGraph ratings filled in (self-limiting; no settings toggle needed).
+
+- **Sort by rating.** A new **Rating** option in the dashboard sort dropdown sorts books by the average of their StoryGraph and Goodreads ratings (using whichever is available when only one is present). Books without ratings always sort to the bottom regardless of direction.
+
+- **Series grouping on the dashboard.** Books that are part of the same series can now be grouped into a single stacked card with combined progress and metadata, instead of showing each entry separately. A new Alembic migration adds the supporting series-metadata columns and existing series entries are populated automatically.
+
+- **StoryGraph supports audio editions and shows audio duration.** The StoryGraph edition picker now detects audiobook, digital audiobook, audio CD, and narrated print/audio formats and displays duration alongside other edition metadata, so audiobook listeners can pick the correct StoryGraph edition.
+
+- **Authoritative ABS identifier mapping via Calibre.** When the [Audiobookshelf-calibre-plugin](https://github.com/jbhul/Audiobookshelf-calibre-plugin) is in use, the bridge can read its `audiobookshelf_id` identifier from Calibre's `metadata.db` (or the CWA `/ajax/book/{id}` endpoint as fallback) and treat it as authoritative during suggestion scans — bypassing fuzzy title/author matching for already-mapped books. Configurable in Settings → CWA → Authoritative ABS Identifier Mapping.
+
+- **Bridge Sync plugin can auto-upload KOReader reading stats.** A new "Auto-Sync Reading Stats" toggle (on by default) uploads KOReader's `statistics.sqlite` page-stat rows alongside the plugin's existing auto-syncs (wake, network reconnect, Sync Now), with a 5-minute cooldown between uploads so it stays quiet on the device.
+
+- **Forge tuning for Storyteller ReadAloud workflows.** Three new settings appear in Settings → Storyteller / Forge:
+  - **Skip ReadAloud EPUB Cache** (`STORYTELLER_NO_EPUB_CACHE`) — make Forge use the original EPUB for text extraction instead of downloading and caching Storyteller's ReadAloud EPUB. Useful when the original EPUB is on a mapped library volume.
+  - **Forge Recovery Max Wait** (`STORYTELLER_RECOVERY_MAX_WAIT_MINUTES`, default 360) and **Forge Recovery Poll Interval** (`STORYTELLER_RECOVERY_POLL_INTERVAL_MINUTES`, default 2) — tune how long the bridge waits for in-flight Storyteller jobs to recover after restart before giving up.
+
+### What Changed
+
+- **Grimmory library scans are skipped when Grimmory is not configured.** Previously, library refresh paths could attempt a Grimmory scan even with no credentials configured, generating noisy error logs. The bridge now short-circuits cleanly when Grimmory is disabled.
+
+### Fixed
+
+- **KOReader sync was silently demoted to percent-fallback for many EPUBs with inline span markup.** KOReader emits XPaths in the form `/text()[N].MMM` whenever a paragraph contains inline children that split text into multiple nodes. The XPath resolver's offset-stripping regex only matched the unbracketed `/text().NNN` form, leaving the `.MMM` glued onto the path and causing `lxml` to reject it as invalid. The resolver fell back to percent-based normalization, bypassing single-client-delta and deadband-rollback protections in the sync manager. Both bracketed and unbracketed forms now parse correctly.
+
+---
+
+## [6.6.0] - 2026-05-01
+
+### What's New
+
+- **StoryGraph integration (alongside Hardcover).** The bridge now supports StoryGraph as a tracker target with linking, modal-based matching, edition picking, automatch, and either-or progress sync. A new `storygraph_details` table stores the link and matching metadata.
+- **Either-or tracker mode.** Books can be tracked on either Hardcover *or* StoryGraph (one at a time per book) instead of having to pick a single tracker globally.
+- **KoSync PUT debounce.** A new `KOSYNC_PUT_DEBOUNCE_SECONDS` setting coalesces bursts of KoSync writes so rapid page-turns no longer trigger a sync cycle per write.
+
+### Fixed
+
+- **Hangs during parallel state fetch.** `_fetch_states_parallel` now uses `concurrent.futures.wait()` instead of `as_completed()` so a single slow client no longer blocks the whole sync cycle until timeout.
+- **StoryGraph edition and URL handling** has been hardened for edge cases discovered during the integration rollout.
+- **KOReader DocFragment spine drift** is now handled gracefully when fragments are renumbered between updates.
+- **ABS IDs are preserved for ebook-only matches** so manual matches don't lose their link after rematch.
+- **LXML position fallback for XPath resolution** improves locator accuracy when the canonical XPath cannot be resolved exactly.
+
+---
+
 ## [6.5.0] 2026-4-12
 
 ### What's New

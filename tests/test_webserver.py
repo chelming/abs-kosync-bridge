@@ -1160,6 +1160,10 @@ class CleanFlaskIntegrationTest(unittest.TestCase):
         self.assertIn('data-rating="3.95"', html)
         # Rating option is in the sort dropdown
         self.assertIn('<option value="rating">Rating</option>', html)
+        # Series-grouping checkbox is present, default-checked, and the JS toggle handler is wired.
+        self.assertIn('id="series-grouping-toggle"', html)
+        self.assertIn('abs_kosync_series_grouping', html)
+        self.assertIn('series-grouping-off', html)
         self.mock_storygraph_client.get_book_rating.assert_not_called()
 
     def test_index_template_renders_three_progress_sections_and_not_started_toggle(self):
