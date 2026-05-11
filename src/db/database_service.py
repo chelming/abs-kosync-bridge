@@ -254,7 +254,8 @@ class DatabaseService:
                            'audio_provider_file_id', 'ebook_filename', 'ebook_source',
                            'ebook_source_id', 'original_ebook_filename', 'kosync_doc_id',
                            'transcript_file', 'status', 'duration', 'sync_mode',
-                           'transcript_source', 'storyteller_uuid', 'abs_ebook_item_id']:
+                           'transcript_source', 'storyteller_uuid', 'abs_ebook_item_id',
+                           'series_name', 'series_sequence']:
                     if hasattr(book, attr):
                         setattr(existing, attr, getattr(book, attr))
                 session.flush()
@@ -504,6 +505,9 @@ class DatabaseService:
                     'storygraph_url',
                     'storygraph_edition_id',
                     'storygraph_pages',
+                    'storygraph_rating',
+                    'storygraph_review_count',
+                    'storygraph_rating_updated_at',
                     'isbn',
                     'asin',
                     'matched_by',

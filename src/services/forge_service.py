@@ -16,6 +16,31 @@ from src.utils.storyteller_transcript import StorytellerTranscript
 
 logger = logging.getLogger(__name__)
 AUDIO_EXTENSIONS = {'.mp3', '.m4b', '.m4a', '.flac', '.ogg', '.opus', '.wma', '.wav', '.aac'}
+
+
+def _extract_series_from_abs_meta(metadata: dict, booklore_mode: bool = False) -> tuple:
+    """Return (series_name, series_sequence) from ABS or BookLore metadata dict."""
+    if not isinstance(metadata, dict):
+        return None, None
+    if booklore_mode:
+        name = (metadata.get("seriesName") or "").strip() or None
+        raw_seq = metadata.get("seriesNumber") or metadata.get("seriesSequence")
+    else:
+        series_list = metadata.get("series") or []
+        if isinstance(series_list, list) and series_list:
+            first = series_list[0]
+            name = (first.get("name") if isinstance(first, dict) else str(first)).strip() or None
+            raw_seq = first.get("sequence") if isinstance(first, dict) else None
+        else:
+            name = (metadata.get("seriesName") or "").strip() or None
+            raw_seq = None
+    sequence = None
+    if raw_seq is not None:
+        try:
+            sequence = float(raw_seq)
+        except (TypeError, ValueError):
+            pass
+    return name, sequence
 DEFAULT_STAGE_MODE = "cleanup"
 HARDLINK_STAGE_MODE = "hardlink"
 VALID_STAGE_MODES = {DEFAULT_STAGE_MODE, HARDLINK_STAGE_MODE}
@@ -38,9 +63,9 @@ class ForgeService:
         self.ABS_API_URL = os.environ.get("ABS_SERVER")
         self.ABS_AUDIO_ROOT = Path(os.environ.get("AUDIOBOOKS_DIR", "/audiobooks"))
         self.storyteller_cleanup_grace_seconds = self._safe_int_env("STORYTELLER_CLEANUP_GRACE_SECONDS", 120)
-        self.storyteller_recovery_max_wait_seconds = self._safe_int_env("STORYTELLER_RECOVERY_MAX_WAIT_SECONDS", 21600)
+        self.storyteller_recovery_max_wait_seconds = self._safe_int_env("STORYTELLER_RECOVERY_MAX_WAIT_MINUTES", 360) * 60
         self.storyteller_recovery_poll_interval_seconds = max(
-            30, self._safe_int_env("STORYTELLER_RECOVERY_POLL_INTERVAL_SECONDS", 120)
+            30, self._safe_int_env("STORYTELLER_RECOVERY_POLL_INTERVAL_MINUTES", 2) * 60
         )
 
     @staticmethod
@@ -1266,15 +1291,53 @@ class ForgeService:
                 time.sleep(self.storyteller_cleanup_grace_seconds)
 
             # --- DOWNLOAD ---
-            logger.info("Auto-Forge: Processing complete. Downloading artifact...")
+            no_epub_cache = os.environ.get("STORYTELLER_NO_EPUB_CACHE", "false").lower() == "true"
             target_filename = f"storyteller_{book_uuid}.epub"
             target_path = epub_cache / target_filename
 
-            try:
-                if not st_client.download_book(book_uuid, target_path):
-                    raise Exception("API download returned False")
-            except Exception as api_err:
-                raise Exception(f"Failed to download Storyteller artifact: {api_err}")
+            if no_epub_cache:
+                original_name = Path(str(original_ebook_filename or original_filename or "")).name
+                nocache_candidates = []
+                if original_name:
+                    nocache_candidates.append(self.ebook_parser.epub_cache_dir / original_name)
+                source_path = text_item.get('path') if isinstance(text_item, dict) else None
+                if source_path:
+                    nocache_candidates.append(Path(source_path))
+                try:
+                    nocache_candidates.append(self.ebook_parser.resolve_book_path(original_name))
+                except Exception:
+                    pass
+
+                resolved = None
+                for c in nocache_candidates:
+                    try:
+                        if c and Path(c).exists():
+                            resolved = Path(c)
+                            break
+                    except Exception:
+                        continue
+
+                if resolved:
+                    logger.info(
+                        "⚡ Auto-Forge: STORYTELLER_NO_EPUB_CACHE=true; using original EPUB '%s'",
+                        resolved.name,
+                    )
+                    target_path = resolved
+                    target_filename = resolved.name
+                else:
+                    logger.warning(
+                        "⚡ Auto-Forge: STORYTELLER_NO_EPUB_CACHE=true but no original EPUB found; "
+                        "falling back to Storyteller ReadAloud download"
+                    )
+                    no_epub_cache = False
+
+            if not no_epub_cache:
+                logger.info("Auto-Forge: Processing complete. Downloading artifact...")
+                try:
+                    if not st_client.download_book(book_uuid, target_path):
+                        raise Exception("API download returned False")
+                except Exception as api_err:
+                    raise Exception(f"Failed to download Storyteller artifact: {api_err}")
 
             # --- RECALCULATE HASH ---
             if original_hash:
@@ -1377,6 +1440,22 @@ class ForgeService:
                     book.transcript_source = "storyteller"
                 elif transcript_source:
                     book.transcript_source = transcript_source
+                if not book.series_name:
+                    try:
+                        if audio_source != "BookLore" and item_details:
+                            _meta = item_details.get("media", {}).get("metadata", {})
+                            _sname, _sseq = _extract_series_from_abs_meta(_meta)
+                            book.series_name = _sname
+                            book.series_sequence = _sseq
+                        elif audio_source == "BookLore" and audio_source_id and self.booklore_client:
+                            _bl_detail = self.booklore_client.get_book_by_id(audio_source_id)
+                            if _bl_detail:
+                                _raw = _bl_detail.get("metadata") or _bl_detail
+                                _sname, _sseq = _extract_series_from_abs_meta(_raw, booklore_mode=True)
+                                book.series_name = _sname
+                                book.series_sequence = _sseq
+                    except Exception as _se:
+                        logger.debug(f"Auto-Forge: could not capture series metadata: {_se}")
                 self.database_service.save_book(book)
                 logger.info(f"✅ Auto-Forge: Book {abs_id} updated successfully!")
             else:

@@ -10,6 +10,75 @@ from bs4 import BeautifulSoup
 
 from src.utils.string_utils import calculate_similarity, clean_book_title
 
+_AUDIO_FORMAT_MAP = (
+    ("digital audiobook", "Digital Audiobook"),
+    ("audio cd", "Audio CD"),
+    ("mp3", "Audiobook"),
+    ("cassette", "Audiobook"),
+    ("audiobook", "Audiobook"),
+    ("audio", "Audiobook"),
+    ("narrated", "Audiobook"),
+    ("narrator", "Audiobook"),
+)
+
+_PRINT_FORMAT_MAP = (
+    ("mass market paperback", "Mass Market Paperback"),
+    ("trade paperback", "Paperback"),
+    ("paperback", "Paperback"),
+    ("hardcover", "Hardcover"),
+    ("hardback", "Hardcover"),
+    ("kindle edition", "Kindle Edition"),
+    ("kindle", "Kindle Edition"),
+    ("ebook", "Ebook"),
+    ("e-book", "Ebook"),
+    ("digital", "Ebook"),
+)
+
+
+def _get_text_excluding_title_links(node) -> str:
+    texts = []
+    for string in node.strings:
+        parent = getattr(string, 'parent', None)
+        if parent and parent.name == 'a' and (parent.get('href') or '').startswith('/books/'):
+            continue
+        text = string.strip()
+        if text:
+            texts.append(text)
+    return ' '.join(texts)
+
+
+
+def _parse_audio_seconds(text: str) -> Optional[int]:
+    if not text:
+        return None
+    lower = text.lower()
+
+    match = re.search(r"(\d+)\s*(?:hours?|hrs?|h)\s*(?:(\d+)\s*(?:minutes?|mins?|m))?", lower)
+    if match:
+        hours = int(match.group(1))
+        minutes = int(match.group(2)) if match.group(2) else 0
+        return hours * 3600 + minutes * 60
+
+    match = re.search(r"(\d+)\s*(?:minutes?|mins?)\b", lower)
+    if match:
+        return int(match.group(1)) * 60
+
+    return None
+
+
+def _classify_format(text: str) -> tuple[str, bool]:
+    if not text:
+        return "Unknown", False
+    lower = text.lower()
+
+    for needle, label in _AUDIO_FORMAT_MAP:
+        if needle in lower:
+            return label, True
+    for needle, label in _PRINT_FORMAT_MAP:
+        if needle in lower:
+            return label, False
+    return "Unknown", False
+
 logger = logging.getLogger(__name__)
 
 
@@ -96,8 +165,7 @@ class StorygraphClient:
 
     @staticmethod
     def _is_audio_edition(text: str) -> bool:
-        txt = (text or "").lower()
-        return any(kw in txt for kw in ("audio", "mp3", "cd", "cassette", "narrat"))
+        return _classify_format(text)[1]
 
     @staticmethod
     def _is_sign_in_redirect(resp) -> bool:
@@ -127,6 +195,56 @@ class StorygraphClient:
         if node and node.get("value"):
             return str(node.get("value"))
         return "0"
+
+    @staticmethod
+    def _parse_review_count(value: str) -> Optional[int]:
+        if not value:
+            return None
+        match = re.search(r"([\d,.]+)\s+reviews?", value, flags=re.IGNORECASE)
+        if not match:
+            return None
+        try:
+            return int(match.group(1).replace(",", "").replace(".", ""))
+        except Exception:
+            return None
+
+    @classmethod
+    def _parse_community_reviews_rating(cls, html: str) -> dict:
+        if not html:
+            return {"rating": None, "review_count": None}
+
+        soup = BeautifulSoup(html, "html.parser")
+        lines = [line.strip() for line in soup.get_text("\n", strip=True).splitlines() if line.strip()]
+        rating = None
+
+        for idx, line in enumerate(lines):
+            if line.lower() != "community reviews":
+                continue
+            for candidate in lines[idx + 1: idx + 6]:
+                if re.fullmatch(r"[0-5](?:\.\d{1,2})?", candidate):
+                    try:
+                        rating = float(candidate)
+                    except Exception:
+                        rating = None
+                    break
+            if rating is not None:
+                break
+
+        if rating is None:
+            text = "\n".join(lines)
+            match = re.search(
+                r"(?<!\d)([0-5](?:\.\d{1,2})?)\s+(?:AVERAGE|average)\b",
+                text,
+                flags=re.IGNORECASE,
+            )
+            if match:
+                try:
+                    rating = float(match.group(1))
+                except Exception:
+                    rating = None
+
+        review_count = cls._parse_review_count("\n".join(lines))
+        return {"rating": rating, "review_count": review_count}
 
     def _request(
         self,
@@ -223,7 +341,10 @@ class StorygraphClient:
     def get_book_editions(self, book_id: str) -> list[dict]:
         """
         Fetches all editions for a book.
-        Returns a list of dicts with: id, title, format, pages, isbn, language.
+        Returns a list of dicts with: id, book_id, title, format, pages, audio_seconds, is_audio, language.
+
+        Mirrors the Lua plugin's findEditions: format from .edition-info p "Format: X" labels,
+        pages/duration from p.text-xs.font-light.
         """
         if not book_id:
             return []
@@ -240,43 +361,41 @@ class StorygraphClient:
             if not ed_id:
                 continue
 
-            # Extract details from the pane
             title = ""
             title_node = pane.select_one(".book-title-author-and-series a[href^='/books/']")
             if title_node:
                 title = title_node.get_text(" ", strip=True)
 
-            details_text = pane.get_text(" ", strip=True)
-            
-            # Format and pages
-            # StoryGraph editions often list "Format, Pages" or similar
-            format_val = "Unknown"
-            pages_val = 0
-            
-            # Look for format/pages in the text
-            # Often looks like: "Paperback, 320 pages" or "Kindle Edition, 320 pages"
-            match_pages = re.search(r"(\d+)\s+pages?", details_text, re.IGNORECASE)
-            if match_pages:
-                pages_val = int(match_pages.group(1))
-
-            is_audio = self._is_audio_edition(details_text)
-
-            formats = ["Paperback", "Hardcover", "Ebook", "Kindle Edition", "Audiobook", "Audio CD", "Digital Audiobook"]
-            for f in formats:
-                if f.lower() in details_text.lower():
-                    format_val = f
-                    break
-
-            if format_val == "Unknown" and is_audio:
-                format_val = "Audiobook"
-
-            # Language
+            # Format and language from .edition-info p elements ("Format: Paperback", etc.)
+            format_raw = ""
             language = ""
-            if "English" in details_text:
-                language = "English"
-            elif "Spanish" in details_text:
-                language = "Spanish"
-            # ... could add more but these are common
+            for p in pane.select(".edition-info p"):
+                text = p.get_text(" ", strip=True)
+                if "Format:" in text:
+                    format_raw = re.sub(r".*Format:\s*", "", text).strip()
+                elif "Language:" in text:
+                    language = re.sub(r".*Language:\s*", "", text).strip()
+
+            # Normalize via _classify_format; fall back to raw string if unrecognised
+            if format_raw:
+                format_val, is_audio = _classify_format(format_raw)
+                if format_val == "Unknown":
+                    format_val = format_raw
+                    is_audio = "audio" in format_raw.lower()
+            else:
+                format_val, is_audio = "Unknown", False
+
+            # Pages / duration from p.text-xs.font-light (descendant, not direct child)
+            pages_val = 0
+            audio_seconds = None
+            detail_p = pane.select_one("p.text-xs.font-light")
+            if detail_p:
+                detail_text = detail_p.get_text(" ", strip=True)
+                m = re.search(r"(\d+)\s*pages?", detail_text, re.IGNORECASE)
+                if m:
+                    pages_val = int(m.group(1))
+                if is_audio:
+                    audio_seconds = _parse_audio_seconds(detail_text)
 
             editions.append({
                 "id": ed_id,
@@ -284,8 +403,9 @@ class StorygraphClient:
                 "title": title,
                 "format": format_val,
                 "pages": pages_val,
+                "audio_seconds": audio_seconds,
+                "is_audio": is_audio,
                 "language": language,
-                "is_audio": is_audio
             })
 
         return editions
@@ -381,6 +501,16 @@ class StorygraphClient:
             "author": author,
             "url": self.book_url(book_id),
         }
+
+    def get_book_rating(self, book_id: str) -> dict:
+        if not book_id:
+            return {"rating": None, "review_count": None}
+
+        resp = self._request(f"/books/{book_id}/community_reviews", allow_redirects=False)
+        if not resp or resp.status_code != 200 or self._is_sign_in_redirect(resp):
+            return {"rating": None, "review_count": None}
+
+        return self._parse_community_reviews_rating(resp.text)
 
     def resolve_book_from_input(self, input_str: str) -> Optional[dict]:
         value = (input_str or "").strip()

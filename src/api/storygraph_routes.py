@@ -1,4 +1,5 @@
 import logging
+import time
 
 from flask import Blueprint, flash, jsonify, redirect, request, url_for
 
@@ -54,6 +55,24 @@ def _match_strategy(meta: dict) -> str:
     return "title"
 
 
+def _storygraph_rating_fields(storygraph_client, book_id: str) -> dict:
+    try:
+        rating_info = storygraph_client.get_book_rating(book_id) or {}
+    except Exception as exc:
+        logger.warning("Failed to fetch StoryGraph rating for %s: %s", book_id, exc)
+        rating_info = {}
+    if not isinstance(rating_info, dict):
+        rating_info = {}
+
+    rating = rating_info.get("rating")
+    review_count = rating_info.get("review_count")
+    return {
+        "storygraph_rating": rating,
+        "storygraph_review_count": review_count,
+        "storygraph_rating_updated_at": time.time() if rating is not None or review_count is not None else None,
+    }
+
+
 @storygraph_bp.route("/api/storygraph/resolve", methods=["GET"])
 def api_storygraph_resolve():
     database_service, container, error_response = _get_dependencies()
@@ -103,9 +122,24 @@ def api_storygraph_resolve():
     if not book_id:
         return jsonify({"found": False, "message": "StoryGraph did not return a book id"}), 502
 
+    rating_fields = _storygraph_rating_fields(storygraph_client, book_id)
+    if existing_details and str(existing_details.storygraph_book_id) == book_id and (
+        rating_fields.get("storygraph_rating") is not None
+        or rating_fields.get("storygraph_review_count") is not None
+    ):
+        existing_details.storygraph_rating = rating_fields.get("storygraph_rating")
+        existing_details.storygraph_review_count = rating_fields.get("storygraph_review_count")
+        existing_details.storygraph_rating_updated_at = rating_fields.get("storygraph_rating_updated_at")
+        try:
+            database_service.save_storygraph_details(existing_details)
+        except Exception as exc:
+            logger.warning("Failed to save StoryGraph rating for %s: %s", abs_id, exc)
+
     editions = []
     try:
-        editions = storygraph_client.get_book_editions(book_id)
+        raw_editions = storygraph_client.get_book_editions(book_id)
+        if isinstance(raw_editions, list):
+            editions = raw_editions
     except Exception as exc:
         logger.warning("Failed to fetch StoryGraph editions for %s: %s", book_id, exc)
 
@@ -116,6 +150,8 @@ def api_storygraph_resolve():
             "title": match.get("title") or "",
             "author": match.get("author") or author or "",
             "url": match.get("url") or storygraph_client.book_url(book_id),
+            "rating": rating_fields.get("storygraph_rating"),
+            "review_count": rating_fields.get("storygraph_review_count"),
             "linked": bool(existing_details and str(existing_details.storygraph_book_id) == book_id),
             "linked_edition_id": existing_details.storygraph_edition_id if existing_details else None,
             "editions": editions,
@@ -154,6 +190,9 @@ def link_storygraph(abs_id):
 
         edition_id = str(data.get("edition_id") or "").strip()
         pages = data.get("pages")
+        audio_seconds = data.get("audio_seconds")
+        if (pages is None or pages == 0) and audio_seconds:
+            pages = -1
 
         # Handle edition switch if needed
         existing_details = database_service.get_storygraph_details(abs_id)
@@ -176,6 +215,7 @@ def link_storygraph(abs_id):
             storygraph_url=url or storygraph_client.book_url(book_id),
             storygraph_edition_id=edition_id or None,
             storygraph_pages=pages,
+            **_storygraph_rating_fields(storygraph_client, book_id),
             isbn=(meta or {}).get("isbn"),
             asin=(meta or {}).get("asin"),
             matched_by="manual",
@@ -209,6 +249,7 @@ def link_storygraph(abs_id):
         abs_id=abs_id,
         storygraph_book_id=str(resolved["book_id"]),
         storygraph_url=resolved.get("url") or storygraph_client.book_url(str(resolved["book_id"])),
+        **_storygraph_rating_fields(storygraph_client, str(resolved["book_id"])),
         isbn=(meta or {}).get("isbn"),
         asin=(meta or {}).get("asin"),
         matched_by="manual",
