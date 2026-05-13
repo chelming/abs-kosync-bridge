@@ -64,6 +64,14 @@ class EbookParser:
         "li", "header", "footer", "aside",
         "td", "th", "dt", "dd", "figcaption", "pre"
     }
+    # Direct-child tags whose presence inside a <p> splits its direct text nodes
+    # so that /p[M]/text().0 resolves to only the first fragment. Union of
+    # CRENGINE_FRAGILE_INLINE_TAGS and the extra tags rejected by
+    # kosync_sync_client._FRAGILE_INLINE_SEGMENT_RE — keeps the generator
+    # and the downstream sanitizer in agreement on what counts as fragile.
+    KOREADER_FRAGMENTING_P_CHILD_TAGS = CRENGINE_FRAGILE_INLINE_TAGS | {
+        "mark", "abbr", "cite", "code", "q", "time", "s", "del", "ins"
+    }
 
     def __init__(self, books_dir, epub_cache_dir=None):
         self.books_dir = Path(books_dir)
@@ -684,6 +692,66 @@ class EbookParser:
             current = self._get_parent_node(current)
         return node
 
+    def _p_has_fragmenting_inline_children(self, p_element) -> bool:
+        if p_element is None:
+            return False
+        iterchildren = getattr(p_element, "iterchildren", None)
+        if callable(iterchildren):
+            children = iterchildren()
+        else:
+            children = getattr(p_element, "children", [])
+        for child in children:
+            if self._local_tag_name(child) in self.KOREADER_FRAGMENTING_P_CHILD_TAGS:
+                return True
+        return False
+
+    def _iter_siblings(self, element, forward: bool):
+        if element is None:
+            return
+        itersiblings = getattr(element, "itersiblings", None)
+        if callable(itersiblings):
+            for sib in itersiblings(preceding=not forward):
+                yield sib
+            return
+        attr = "next_sibling" if forward else "previous_sibling"
+        sib = getattr(element, attr, None)
+        while sib is not None:
+            yield sib
+            sib = getattr(sib, attr, None)
+
+    def _element_text_length(self, element) -> int:
+        if element is None:
+            return 0
+        text_content = getattr(element, "text_content", None)
+        if callable(text_content):
+            try:
+                return len((text_content() or "").strip())
+            except Exception:
+                return 0
+        get_text = getattr(element, "get_text", None)
+        if callable(get_text):
+            try:
+                return len(get_text(strip=True) or "")
+            except Exception:
+                return 0
+        return 0
+
+    def _is_clean_p_substitute(self, element) -> bool:
+        if self._local_tag_name(element) != "p":
+            return False
+        if self._p_has_fragmenting_inline_children(element):
+            return False
+        return self._element_text_length(element) > 10
+
+    def _find_clean_p_substitute(self, p_element):
+        for sib in self._iter_siblings(p_element, forward=False):
+            if self._is_clean_p_substitute(sib):
+                return sib
+        for sib in self._iter_siblings(p_element, forward=True):
+            if self._is_clean_p_substitute(sib):
+                return sib
+        return None
+
     def _first_non_empty_direct_text_suffix(self, element) -> Optional[str]:
         if element is None:
             return None
@@ -726,6 +794,16 @@ class EbookParser:
     def _build_crengine_safe_text_xpath(self, element, spine_index, html_content) -> str:
         el_tag = self._local_tag_name(element)
         anchor = self._nearest_crengine_anchor(element)
+
+        if self._local_tag_name(anchor) == "p" and self._p_has_fragmenting_inline_children(anchor):
+            substitute = self._find_clean_p_substitute(anchor)
+            if substitute is not None:
+                logger.debug(
+                    f"KOReader XPath: <p> in DocFragment[{spine_index}] has fragmenting "
+                    f"inline children; substituting nearest clean <p> sibling"
+                )
+                anchor = substitute
+
         suffix = self._first_non_empty_direct_text_suffix(anchor)
 
         if not suffix:
@@ -920,6 +998,22 @@ class EbookParser:
                     current_occurrence += 1
 
             logger.warning(f"⚠️ Hybrid Anchor mapping failed for '{search_text}'. Falling back to BS4 structural path.")
+
+            ancestor_p = target_tag
+            while ancestor_p is not None and getattr(ancestor_p, "name", None) not in ("p", "body", "[document]", None):
+                ancestor_p = getattr(ancestor_p, "parent", None)
+            if (
+                ancestor_p is not None
+                and getattr(ancestor_p, "name", None) == "p"
+                and self._p_has_fragmenting_inline_children(ancestor_p)
+            ):
+                substitute = self._find_clean_p_substitute(ancestor_p)
+                if substitute is not None:
+                    logger.debug(
+                        f"KOReader XPath (BS4 fallback): <p> in DocFragment[{target_item['spine_index']}] "
+                        f"has fragmenting inline children; substituting nearest clean <p> sibling"
+                    )
+                    target_tag = substitute
 
             # Build KOReader-compatible strictly positional XPath using BS4 (Fallback)
             path_segments = []
