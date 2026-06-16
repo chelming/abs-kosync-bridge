@@ -64,6 +64,7 @@ class SyncManager:
     def __init__(self,
                  abs_client=None,
                  booklore_client=None,
+                 bookorbit_client=None,
                  hardcover_client=None,
                  transcriber=None,
                  ebook_parser=None,
@@ -74,6 +75,7 @@ class SyncManager:
                  library_service: LibraryService = None,
                  migration_service: MigrationService = None,
                  shelf_watch_service=None,
+                 shelf_watch_services=None,
                  audio_source_adapters: dict | None = None,
                  epub_cache_dir=None,
                  data_dir=None,
@@ -83,6 +85,7 @@ class SyncManager:
         # Use dependency injection
         self.abs_client = abs_client
         self.booklore_client = booklore_client
+        self.bookorbit_client = bookorbit_client
         self.hardcover_client = hardcover_client
         self.transcriber = transcriber
         self.ebook_parser = ebook_parser
@@ -94,6 +97,11 @@ class SyncManager:
         self.library_service = library_service
         self.migration_service = migration_service
         self.shelf_watch_service = shelf_watch_service
+        # Support multiple shelf watchers (Grimmory + BookOrbit). Fall back to the
+        # single legacy service when a list isn't provided (older tests / callers).
+        self.shelf_watch_services = list(shelf_watch_services) if shelf_watch_services else (
+            [shelf_watch_service] if shelf_watch_service else []
+        )
         self.audio_source_adapters = audio_source_adapters or {}
         
         self.data_dir = data_dir
@@ -121,6 +129,14 @@ class SyncManager:
         self._sync_cycle_ebook_cache: dict[str, tuple[str, int]] = {}
         self._sync_cycle_local_epub_cache: dict[str, Path | None] = {}
         self._post_cycle_callbacks: list = []
+        # StoryGraph idle-cooldown tracker: {abs_id: {'pct': float, 'changed_at': float}}.
+        # In-memory only; on restart the first observation reseeds 'changed_at', so a post
+        # is deferred at most one cooldown window (completion still bypasses).
+        self._storygraph_cooldown: dict[str, dict] = {}
+        self._storygraph_cooldown_lock = threading.Lock()
+        # Hardcover idle-cooldown tracker (same trailing-edge scheme as StoryGraph).
+        self._hardcover_cooldown: dict[str, dict] = {}
+        self._hardcover_cooldown_lock = threading.Lock()
 
         self._setup_sync_clients(sync_clients)
         self.startup_checks()
@@ -1623,6 +1639,104 @@ class SyncManager:
 
         return False
 
+    def _handle_storygraph_cooldown(self, book, config, now: float) -> None:
+        """Post StoryGraph progress on a trailing-edge idle cooldown."""
+        self._handle_tracker_cooldown(
+            book, config, now,
+            client_key='StoryGraph',
+            state_name='storygraph',
+            cooldown_env='STORYGRAPH_UPDATE_COOLDOWN_MINS',
+            cooldown_store_attr='_storygraph_cooldown',
+            cooldown_lock_attr='_storygraph_cooldown_lock',
+        )
+
+    def _handle_hardcover_cooldown(self, book, config, now: float) -> None:
+        """Post Hardcover progress on the same trailing-edge idle cooldown as StoryGraph."""
+        self._handle_tracker_cooldown(
+            book, config, now,
+            client_key='Hardcover',
+            state_name='hardcover',
+            cooldown_env='HARDCOVER_UPDATE_COOLDOWN_MINS',
+            cooldown_store_attr='_hardcover_cooldown',
+            cooldown_lock_attr='_hardcover_cooldown_lock',
+        )
+
+    def _handle_tracker_cooldown(self, book, config, now: float, *, client_key: str,
+                                 state_name: str, cooldown_env: str,
+                                 cooldown_store_attr: str, cooldown_lock_attr: str) -> None:
+        """Post a write-only tracker's progress on a trailing-edge idle cooldown.
+
+        The tracker (StoryGraph/Hardcover) is intentionally excluded from the normal
+        per-cycle dispatch and driven here instead. While a book keeps progressing the
+        timer resets and no write happens; once the book has been idle (no new progress)
+        for ``<cooldown_env>`` minutes we post the latest position. Completion (~100%)
+        bypasses the cooldown and posts at once.
+        """
+        EPS = 1e-4
+        COMPLETION_THRESHOLD = 0.99
+        try:
+            client = self.sync_clients.get(client_key)
+            if not client or not client.is_configured():
+                return
+
+            try:
+                cooldown_mins = int(os.environ.get(cooldown_env, '60'))
+            except (TypeError, ValueError):
+                cooldown_mins = 60
+
+            pcts = [
+                cfg.current.get('pct')
+                for cfg in config.values()
+                if cfg and cfg.current.get('pct') is not None
+            ]
+            if not pcts:
+                return
+            current_pct = max(pcts)
+
+            is_completion = current_pct >= COMPLETION_THRESHOLD
+            # Skip near-zero progress (reuses the 1% suggestion-eligibility floor),
+            # but completion always bypasses the floor.
+            if not is_completion and current_pct <= 0.01:
+                return
+
+            abs_id = book.abs_id
+            # Resolved lazily (only once the tracker is configured and progress is real)
+            # so callers without cooldown state still no-op cleanly.
+            cooldown_store = getattr(self, cooldown_store_attr)
+            cooldown_lock = getattr(self, cooldown_lock_attr)
+            with cooldown_lock:
+                rec = cooldown_store.get(abs_id)
+                if rec is None or abs(current_pct - rec['pct']) > EPS:
+                    # Progress moved (or first observation) → (re)start the cooldown.
+                    rec = {'pct': current_pct, 'changed_at': now}
+                    cooldown_store[abs_id] = rec
+                changed_at = rec['changed_at']
+
+            posted = self.database_service.get_state(abs_id, state_name)
+            posted_pct = posted.percentage if posted else None
+            if posted_pct is not None and abs(current_pct - posted_pct) <= EPS:
+                return  # Already in sync with the tracker.
+
+            settled = cooldown_mins <= 0 or (now - changed_at) >= cooldown_mins * 60
+            if not (is_completion or settled):
+                return
+
+            request = UpdateProgressRequest(LocatorResult(percentage=current_pct))
+            result = client.update_progress(book, request)
+            if result and result.success:
+                self.database_service.save_state(State(
+                    abs_id=abs_id,
+                    client_name=state_name,
+                    last_updated=now,
+                    percentage=current_pct,
+                ))
+                reason = 'completion' if is_completion else f'idle≥{cooldown_mins}m'
+                logger.info(
+                    f"📈 '{abs_id}' {client_key} cooldown post: {current_pct * 100:.1f}% ({reason})"
+                )
+        except Exception as e:
+            logger.warning(f"⚠️ '{getattr(book, 'abs_id', '?')}' {client_key} cooldown handler failed: {e}")
+
     def _determine_leader(self, config, book, abs_id, title_snip):
         """
         Determines which client should be the leader based on:
@@ -1706,12 +1820,33 @@ class SyncManager:
                         f"'{device}' despite source=percent_fallback{age_msg}"
                     )
                 elif changed_source == "percent_fallback" and primary_audio_client in vals:
-                    single_delta_low_conf = True
-                    low_conf_single_delta_client = changed_client
-                    logger.info(
-                        f"🔄 '{abs_id}' '{title_snip}' Ignoring single-client delta from "
-                        f"'{changed_client}' (low-confidence source=percent_fallback); evaluating all candidates"
+                    # Bounded forward-progress backstop. A lone percent_fallback mover is
+                    # normally demoted, which lets a stationary audio leader win and roll the
+                    # reader's position backward. Keep it as leader only when it is a genuine
+                    # forward move that already sits ahead of every peer on the normalized
+                    # timeline by more than the deadband. This can never move progress
+                    # backward (the mover is already the furthest point); a stale percent that
+                    # maps behind/ambiguous still demotes via the else branch.
+                    deadband = getattr(self, "cross_format_deadband_seconds", 2.0)
+                    moved_forward = vals[changed_client] > config[changed_client].previous_pct
+                    ahead_of_peers = (
+                        changed_ts is not None
+                        and other_ts
+                        and changed_ts > max(other_ts) + deadband
                     )
+                    if moved_forward and ahead_of_peers:
+                        logger.info(
+                            f"🛟 '{abs_id}' '{title_snip}' Keeping '{changed_client}' as leader: "
+                            f"genuine forward move ahead of stationary peer "
+                            f"(source=percent_fallback, {changed_ts:.1f}s vs max peer {max(other_ts):.1f}s)"
+                        )
+                    else:
+                        single_delta_low_conf = True
+                        low_conf_single_delta_client = changed_client
+                        logger.info(
+                            f"🔄 '{abs_id}' '{title_snip}' Ignoring single-client delta from "
+                            f"'{changed_client}' (low-confidence source=percent_fallback); evaluating all candidates"
+                        )
                 elif changed_ts is not None and other_ts:
                     max_other_ts = max(other_ts)
                     NORMALIZED_LEAD_EPSILON_SECONDS = 2.0
@@ -1890,20 +2025,26 @@ class SyncManager:
             self.library_service.sync_library_books()
             self._last_library_sync = time.time()
 
-        # Grimmory "Up Next" shelf watch — runs only in global poll mode and only
-        # on full cycles (not Instant Sync). Custom mode runs the check from
-        # ClientPoller instead so we don't double-fire.
+        # "Up Next" shelf watch (Grimmory + BookOrbit) — runs only in global poll
+        # mode and only on full cycles (not Instant Sync). Custom mode runs the
+        # check from ClientPoller instead so we don't double-fire.
         # getattr handles older tests that build SyncManager via __new__ and skip __init__.
-        shelf_watch = getattr(self, 'shelf_watch_service', None)
-        if (
-            shelf_watch
-            and not target_abs_id
-            and os.environ.get('BOOKLORE_POLL_MODE', 'global').lower() == 'global'
-        ):
-            try:
-                shelf_watch.process_watch_shelf()
-            except Exception as e:
-                logger.warning(f"Shelf-watch run failed: {e}")
+        shelf_watchers = getattr(self, 'shelf_watch_services', None)
+        if shelf_watchers is None:
+            legacy = getattr(self, 'shelf_watch_service', None)
+            shelf_watchers = [legacy] if legacy else []
+        if not target_abs_id:
+            for shelf_watch in shelf_watchers:
+                try:
+                    # Each watcher gates on its own source's poll mode.
+                    runs_global = getattr(shelf_watch, 'runs_in_global_cycle', None)
+                    if runs_global is not None and not runs_global():
+                        continue
+                    if runs_global is None and os.environ.get('BOOKLORE_POLL_MODE', 'global').lower() != 'global':
+                        continue
+                    shelf_watch.process_watch_shelf()
+                except Exception as e:
+                    logger.warning(f"Shelf-watch run failed: {e}")
 
         # Get active books directly from database service
         active_books = []
@@ -1975,6 +2116,13 @@ class SyncManager:
                 # Filtered config now only contains non-None states
                 if not config:
                     continue  # No valid states to process
+
+                # StoryGraph and Hardcover are driven by an idle cooldown rather than the
+                # per-cycle dispatch. Evaluate them for every active book each cycle
+                # (including idle books that early-skip below) so the trailing-edge post
+                # can fire.
+                self._handle_storygraph_cooldown(book, config, time.time())
+                self._handle_hardcover_cooldown(book, config, time.time())
 
                 # Check for ABS offline condition (only for audiobook mode)
                 # Check for ABS offline condition (only for audiobook mode)
@@ -2199,10 +2347,22 @@ class SyncManager:
                     f"original_epub='{sanitize_log_data(getattr(book, 'original_ebook_filename', None))}'"
                 )
 
-                # Update all other clients and store results
+                # Update all other clients and store results.
+                # When an audiobook companion (Storyteller) is the leader, its forward
+                # advance is treated as listening, so the ABS push credits the audio
+                # delta as listening time instead of zero (STORYTELLER_LISTENING_SESSIONS).
+                primary_audio_client = self._get_primary_audio_client_name(book)
+                credit_listening_leader = (
+                    leader == "Storyteller"
+                    and os.environ.get("STORYTELLER_LISTENING_SESSIONS", "true").strip().lower()
+                    in ("true", "1", "yes", "on")
+                )
                 results: dict[str, SyncResult] = {}
                 for client_name, client in self._iter_update_targets(active_clients, leader):
                     try:
+                        if client_name in ('StoryGraph', 'Hardcover'):
+                            # Driven by the idle-cooldown handlers, not the dispatch loop.
+                            continue
                         client_state = config.get(client_name)
                         if client_state and self._should_skip_deadband_rollback(
                             book, leader, leader_state, client_name, client_state, abs_id, title_snip
@@ -2213,6 +2373,7 @@ class SyncManager:
                             locator,
                             txt,
                             previous_location=client_state.previous_pct if client_state else None,
+                            credit_listening=(credit_listening_leader and client_name == primary_audio_client),
                         )
                         result = client.update_progress(book, request)
                         results[client_name] = result
@@ -2275,6 +2436,22 @@ class SyncManager:
                 ):
                     try:
                         self._record_grimmory_reading_session(
+                            book, leader, leader_state, prev_states_by_client, current_time
+                        )
+                    except Exception:
+                        pass  # Non-blocking: never prevent sync
+
+                # ── BookOrbit Reading Session Recording ──
+                if (
+                    os.environ.get("BOOKORBIT_READING_SESSIONS", "true").strip().lower() in ("true", "1", "yes", "on")
+                    and getattr(self, "bookorbit_client", None)
+                    and self.bookorbit_client.is_configured()
+                    and getattr(book, "ebook_source", None) == "BookOrbit"
+                    and leader_pct != leader_state.previous_pct
+                    and leader.lower() != 'kosync'  # kosync_server handles KOSync->BookOrbit
+                ):
+                    try:
+                        self._record_bookorbit_reading_session(
                             book, leader, leader_state, prev_states_by_client, current_time
                         )
                     except Exception:
@@ -2455,6 +2632,59 @@ class SyncManager:
                     )
                 except (TypeError, ValueError):
                     pass
+
+    def _record_bookorbit_reading_session(
+        self,
+        book,
+        leader: str,
+        leader_state,
+        prev_states_by_client: dict,
+        current_time: float,
+    ) -> None:
+        """Record a reading session to BookOrbit when progress changes on a
+        BookOrbit-hosted ebook. The session is logged against the BookOrbit book
+        (ebook_source_id); audio-leader sessions fall back to the ebook file."""
+        book_id = getattr(book, "ebook_source_id", None)
+        if not book_id:
+            return
+
+        leader_pct = leader_state.current.get('pct', 0)
+        prev_pct = leader_state.previous_pct or 0.0
+
+        duration_seconds = self._compute_session_duration(
+            book, leader, leader_state, prev_states_by_client, current_time
+        )
+        if duration_seconds is None or duration_seconds <= 0:
+            duration_seconds = 60
+        start_time = current_time - duration_seconds
+
+        primary_audio_client = self._get_primary_audio_client_name(book)
+        is_audio_leader = (leader == primary_audio_client)
+        end_location = None
+        if is_audio_leader:
+            book_type = "AUDIOBOOK"
+        else:
+            ebook_filename = getattr(book, 'ebook_filename', '') or ''
+            if ebook_filename.lower().endswith('.epub'):
+                book_type = "EPUB"
+            elif ebook_filename.lower().endswith('.pdf'):
+                book_type = "PDF"
+            else:
+                book_type = "EBOOK"
+            end_location = leader_state.current.get('cfi')
+
+        try:
+            self.bookorbit_client.create_reading_session(
+                book_id=int(book_id),
+                start_time=start_time,
+                end_time=current_time,
+                start_progress=prev_pct,
+                end_progress=leader_pct,
+                book_type=book_type,
+                end_location=end_location,
+            )
+        except (TypeError, ValueError):
+            pass
 
     def _resolve_grimmory_ebook_id(self, book):
         """Resolve the Grimmory book ID for a book's ebook. Returns int or None."""
