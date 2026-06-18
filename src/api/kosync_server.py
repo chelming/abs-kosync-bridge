@@ -1647,6 +1647,53 @@ def koreader_plugin_download():
     )
 
 
+@kosync_admin_bp.route('/api/kosync-plugin/version', methods=['GET'])
+def admin_plugin_version():
+    """Return the BridgeSync plugin version for the settings-page download card."""
+    if not _PLUGIN_DIR.is_dir():
+        return jsonify({"error": "Plugin directory not found"}), 404
+
+    version = _parse_meta_lua_version(_PLUGIN_DIR / "_meta.lua")
+    if not version:
+        return jsonify({"error": "Could not determine plugin version"}), 404
+
+    return jsonify({"version": version, "name": "bridgesync"}), 200
+
+
+@kosync_admin_bp.route('/api/kosync-plugin/download', methods=['GET'])
+def admin_plugin_download():
+    """Serve the BridgeSync plugin zip to the browser (settings-page download).
+
+    Unlike the device self-update route on kosync_sync_bp, this is a same-origin
+    dashboard route with no KOSync device auth, so the settings page can link to
+    it directly. Shares the plugin zip cache with the device-facing endpoint.
+    """
+    global _plugin_zip_cache
+
+    if not _PLUGIN_DIR.is_dir():
+        return jsonify({"error": "Plugin directory not found"}), 404
+
+    version = _parse_meta_lua_version(_PLUGIN_DIR / "_meta.lua")
+    if not version:
+        return jsonify({"error": "Could not determine plugin version"}), 404
+
+    current_mtime = _get_plugin_dir_max_mtime(_PLUGIN_DIR)
+
+    with _plugin_zip_cache_lock:
+        if _plugin_zip_cache is None or _plugin_zip_cache[1] < current_mtime:
+            logger.info("Plugin zip cache miss — rebuilding bridgesync plugin archive")
+            zip_bytes = _build_plugin_zip(_PLUGIN_DIR)
+            _plugin_zip_cache = (zip_bytes, current_mtime)
+        zip_bytes = _plugin_zip_cache[0]
+
+    return send_file(
+        io.BytesIO(zip_bytes),
+        mimetype="application/zip",
+        as_attachment=True,
+        download_name=f"bridgesync-{version}.zip",
+    )
+
+
 # ---------------- Helper Functions ----------------
 
 def _upsert_kosync_metadata(document_hash, filename, source, mtime=None, booklore_id=None):

@@ -653,6 +653,29 @@
                             get_bool('KOSYNC_USE_PERCENTAGE_FROM_SERVER') %}checked{% endif %}>
                         <label for="kosync_pct">Use Percentage from Server (Ignore Text Matching)</label>
                     </div>
+
+                    <!-- Separator -->
+                    <div class="full-width" style="margin: 10px 0; border-top: 1px solid rgba(255,255,255,0.1);"></div>
+                    <div class="full-width" id="bridgesync_plugin_group"
+                        style="background: rgba(102, 126, 234, 0.1); padding: 15px; border-radius: 8px; border: 1px solid rgba(102, 126, 234, 0.2); margin-bottom: 5px;">
+                        <h4 style="margin-bottom: 8px; color: #fff; font-size: 14px;">📥 BridgeSync KOReader Plugin
+                            <span id="bridgesync_plugin_version"
+                                style="font-weight: normal; color: rgba(255,255,255,0.5); font-size: 12px;"></span>
+                        </h4>
+                        <p class="help-text" style="margin: 0 0 10px 0;">Installs books from the bridge byte-for-byte
+                            (so KOReader progress auto-links with no manual matching) and syncs reading stats. Download
+                            below, unzip into your device's <code>koreader/plugins/</code> folder, then restart
+                            KOReader.</p>
+                        <a class="btn" href="/api/kosync-plugin/download" download>⬇️ Download plugin (.zip)</a>
+                    </div>
+                    <script>
+                        fetch('/api/kosync-plugin/version').then(function (r) { return r.ok ? r.json() : null; })
+                            .then(function (d) {
+                                if (d && d.version) {
+                                    document.getElementById('bridgesync_plugin_version').textContent = 'v' + d.version;
+                                }
+                            }).catch(function () { });
+                    </script>
                 </div>
             </div>
 

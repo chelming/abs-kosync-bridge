@@ -185,6 +185,28 @@ class TestKosyncEndpoints(unittest.TestCase):
         with kosync_server._kosync_debounce_lock:
             kosync_server._kosync_debounce.clear()
 
+    def test_admin_plugin_version_returns_version_without_auth(self):
+        """Settings-page version endpoint returns the plugin version, no KOSync auth."""
+        response = self.client.get('/api/kosync-plugin/version')
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertEqual(data.get('name'), 'bridgesync')
+        self.assertTrue(data.get('version'))
+
+    def test_admin_plugin_download_serves_zip_attachment(self):
+        """Settings-page download endpoint serves the plugin as a zip attachment."""
+        import io as _io
+        import zipfile as _zipfile
+        response = self.client.get('/api/kosync-plugin/download')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.mimetype, 'application/zip')
+        disposition = response.headers.get('Content-Disposition', '')
+        self.assertIn('attachment', disposition)
+        self.assertIn('bridgesync-', disposition)
+        with _zipfile.ZipFile(_io.BytesIO(response.data)) as zf:
+            names = zf.namelist()
+        self.assertIn('bridgesync.koplugin/_meta.lua', names)
+
     def test_put_progress_creates_document(self):
         """Test that PUT creates a new document."""
         # Case 1: Standard device (should return String timestamp)
