@@ -607,6 +607,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#bookorbit" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        BookOrbit
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#calibre-web-automated-cwa" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -666,6 +677,17 @@
     <span class="md-ellipsis">
       
         Shelfmark
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#ollama-local-llm-optional" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Ollama (Local LLM, Optional)
       
     </span>
   </a>
@@ -955,6 +977,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#bookorbit" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        BookOrbit
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#calibre-web-automated-cwa" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1014,6 +1047,17 @@
     <span class="md-ellipsis">
       
         Shelfmark
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#ollama-local-llm-optional" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Ollama (Local LLM, Optional)
       
     </span>
   </a>
@@ -1507,6 +1551,115 @@ Environment variables are mainly for first boot or advanced overrides. Once a va
 </tr>
 </tbody>
 </table>
+<h4 id="bookorbit">BookOrbit</h4>
+<p>BookOrbit is a newer ebook library manager (with audiobook support, like Grimmory). The bridge treats it as an alternative to Grimmory — you can use either one or both at the same time.</p>
+<table>
+<thead>
+<tr>
+<th>Setting</th>
+<th>Env Var</th>
+<th>Default</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Enable</td>
+<td><code>BOOKORBIT_ENABLED</code></td>
+<td><code>false</code></td>
+<td>Turns on BookOrbit support.</td>
+</tr>
+<tr>
+<td>Server URL</td>
+<td><code>BOOKORBIT_SERVER</code></td>
+<td>empty</td>
+<td>BookOrbit base URL.</td>
+</tr>
+<tr>
+<td>Username</td>
+<td><code>BOOKORBIT_USER</code></td>
+<td>empty</td>
+<td>BookOrbit username.</td>
+</tr>
+<tr>
+<td>Password</td>
+<td><code>BOOKORBIT_PASSWORD</code></td>
+<td>empty</td>
+<td>BookOrbit password.</td>
+</tr>
+<tr>
+<td>Collection Name</td>
+<td><code>BOOKORBIT_SHELF_NAME</code></td>
+<td><code>Kobo</code></td>
+<td>Collection that auto-matched books are moved to on success.</td>
+</tr>
+<tr>
+<td>Record Reading Sessions</td>
+<td><code>BOOKORBIT_READING_SESSIONS</code></td>
+<td><code>true</code></td>
+<td>Sends reading or listening session updates back to BookOrbit.</td>
+</tr>
+<tr>
+<td>Poll Mode</td>
+<td><code>BOOKORBIT_POLL_MODE</code></td>
+<td><code>global</code></td>
+<td><code>global</code> uses the main sync cycle. <code>custom</code> polls BookOrbit separately.</td>
+</tr>
+<tr>
+<td>Poll Interval</td>
+<td><code>BOOKORBIT_POLL_SECONDS</code></td>
+<td><code>300</code></td>
+<td>Used when Poll Mode is <code>custom</code>.</td>
+</tr>
+</tbody>
+</table>
+<p>Optional "Up Next" collection watch — drop a book onto a collection in BookOrbit and the bridge auto-matches it on the next poll:</p>
+<table>
+<thead>
+<tr>
+<th>Setting</th>
+<th>Env Var</th>
+<th>Default</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Watch a Collection</td>
+<td><code>BOOKORBIT_SHELF_WATCH_ENABLED</code></td>
+<td><code>false</code></td>
+<td>Turns on auto-matching from a watched collection.</td>
+</tr>
+<tr>
+<td>Collection Name</td>
+<td><code>BOOKORBIT_SHELF_WATCH_NAME</code></td>
+<td><code>Up Next</code></td>
+<td>Create this collection in BookOrbit. Books placed on it are auto-matched and moved to the collection above on success.</td>
+</tr>
+<tr>
+<td>Match Threshold</td>
+<td><code>BOOKORBIT_SHELF_WATCH_THRESHOLD</code></td>
+<td><code>95</code></td>
+<td>Minimum match confidence (60–100) before a book is auto-linked.</td>
+</tr>
+<tr>
+<td>Rescan Interval (Hours)</td>
+<td><code>BOOKORBIT_SHELF_WATCH_RESCAN_HOURS</code></td>
+<td><code>24</code></td>
+<td>How often a still-unmatched book on the watch collection is retried.</td>
+</tr>
+</tbody>
+</table>
+<p>BookOrbit notes:</p>
+<ul>
+<li>BookOrbit works like Grimmory across Match, Batch Match, Suggestions, and the dashboard — pick it as the ebook (or audio) source when you create a mapping.</li>
+<li>Use the <strong>Test</strong> button in Settings to check the connection before saving.</li>
+<li>
+<p><strong>Moving from Grimmory to BookOrbit?</strong> You do not need to rematch. A helper script, <code>scripts/migrate_grimmory_to_bookorbit.py</code>, re-points your existing Grimmory ebook links at BookOrbit by filename, leaving the audio link and reading progress untouched. Enable and scan BookOrbit first, then run it from inside the container (it is a dry run by default; add <code>--apply</code> to commit):</p>
+<div class="highlight"><pre><span></span><code>docker<span class="w"> </span><span class="nb">exec</span><span class="w"> </span>abs_kosync<span class="w"> </span>python<span class="w"> </span>-m<span class="w"> </span>scripts.migrate_grimmory_to_bookorbit<span class="w"> </span>--apply
+</code></pre></div>
+</li>
+</ul>
 <h4 id="calibre-web-automated-cwa">Calibre-Web Automated (CWA)</h4>
 <table>
 <thead>
@@ -1693,6 +1846,130 @@ Environment variables are mainly for first boot or advanced overrides. Once a va
 </tr>
 </tbody>
 </table>
+<h4 id="ollama-local-llm-optional">Ollama (Local LLM, Optional)</h4>
+<p>This is an advanced, opt-in feature. If you run a local <a href="https://ollama.com">Ollama</a> server, the bridge can use it to make smarter book-match suggestions and to rescue audio↔text alignments that plain text matching misses. Everything here is <strong>off until you enable it</strong>, and every feature falls back to the normal behavior if Ollama is unreachable — so it never blocks a sync.</p>
+<p>Connection:</p>
+<table>
+<thead>
+<tr>
+<th>Setting</th>
+<th>Env Var</th>
+<th>Default</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Enable</td>
+<td><code>OLLAMA_ENABLED</code></td>
+<td><code>false</code></td>
+<td>Master switch for all Ollama features.</td>
+</tr>
+<tr>
+<td>Server URL</td>
+<td><code>OLLAMA_URL</code></td>
+<td><code>http://ollama:11434</code></td>
+<td>Your Ollama server. Use container DNS (<code>http://ollama:11434</code>) or <code>http://localhost:11434</code>.</td>
+</tr>
+<tr>
+<td>Embedding Model</td>
+<td><code>OLLAMA_EMBED_MODEL</code></td>
+<td><code>nomic-embed-text</code></td>
+<td>Used for similarity. Pull it first: <code>ollama pull nomic-embed-text</code>.</td>
+</tr>
+<tr>
+<td>Chat / Judge Model</td>
+<td><code>OLLAMA_CHAT_MODEL</code></td>
+<td><code>qwen2.5:14b</code></td>
+<td>Used to judge ambiguous matches.</td>
+</tr>
+<tr>
+<td>Keep Alive</td>
+<td><code>OLLAMA_KEEP_ALIVE</code></td>
+<td><code>5m</code></td>
+<td>How long models stay loaded after a request (<code>5m</code>, <code>1h</code>, <code>-1</code> = forever, <code>0</code> = unload now).</td>
+</tr>
+<tr>
+<td>Chat Context Length</td>
+<td><code>OLLAMA_NUM_CTX</code></td>
+<td>empty</td>
+<td>Context window for judge calls. Empty = server default.</td>
+</tr>
+</tbody>
+</table>
+<p>What it can do — each is a separate toggle, and the defaults below only take effect once <strong>Enable</strong> is on:</p>
+<table>
+<thead>
+<tr>
+<th>Feature</th>
+<th>Env Var</th>
+<th>Default</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Re-rank suggestions</td>
+<td><code>OLLAMA_RERANK_SUGGESTIONS</code></td>
+<td><code>true</code></td>
+<td>Re-scores borderline suggestions by meaning, not just fuzzy text.</td>
+</tr>
+<tr>
+<td>Suppress weak suggestions</td>
+<td><code>OLLAMA_SUGGEST_JUDGE_GATE</code></td>
+<td><code>true</code></td>
+<td>Drops candidates the model can't confirm as a real match.</td>
+</tr>
+<tr>
+<td>Judge ambiguous matches</td>
+<td><code>OLLAMA_JUDGE_SUGGESTIONS</code></td>
+<td><code>true</code></td>
+<td>Asks the chat model to resolve close calls.</td>
+</tr>
+<tr>
+<td>Alignment fallback</td>
+<td><code>OLLAMA_ALIGN_FALLBACK</code></td>
+<td><code>true</code></td>
+<td>Locates a position by meaning when fuzzy text matching fails.</td>
+</tr>
+<tr>
+<td>Ebook position rescue</td>
+<td><code>OLLAMA_EBOOK_TEXT_FALLBACK</code></td>
+<td><code>true</code></td>
+<td>The same idea for KoSync/Storyteller ebook lookups.</td>
+</tr>
+<tr>
+<td>Anchor rescue</td>
+<td><code>OLLAMA_ALIGN_ANCHOR_RESCUE</code></td>
+<td><code>true</code></td>
+<td>Builds a real audio↔text map when n-gram alignment fails.</td>
+</tr>
+<tr>
+<td>Content guard</td>
+<td><code>OLLAMA_ALIGN_CONTENT_GUARD</code></td>
+<td><code>true</code></td>
+<td>Refuses to store an alignment when the audio and ebook are clearly different content (wrong edition, abridged, translation).</td>
+</tr>
+<tr>
+<td>Tracker match verify</td>
+<td><code>OLLAMA_TRACKER_MATCH</code></td>
+<td><code>true</code></td>
+<td>Double-checks Hardcover/StoryGraph matches before writing.</td>
+</tr>
+<tr>
+<td>Library match rescue</td>
+<td><code>OLLAMA_LIBRARY_MATCH</code></td>
+<td><code>true</code></td>
+<td>When a Grimmory/BookOrbit ebook won't match by name, shortlists the library and lets the model pick the right book.</td>
+</tr>
+</tbody>
+</table>
+<p>Ollama notes:</p>
+<ul>
+<li>The model never runs on hot sync paths — only on linking, suggestion scans, and alignment work — so day-to-day syncing stays fast.</li>
+<li>Use the <strong>Test</strong> button to confirm the server is reachable. It reports each model's context length and capabilities, and warns if your embedding model can't actually embed.</li>
+<li>Finer tuning knobs (score bands, judge margins, similarity thresholds) are available in the Settings UI if you want them, but the defaults are a sensible starting point.</li>
+</ul>
 <h3 id="suggestions">Suggestions</h3>
 <p>The Suggestions page is a review workspace, not an auto-linker. It always waits for your approval before creating mappings.</p>
 <table>
