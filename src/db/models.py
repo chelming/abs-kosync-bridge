@@ -717,6 +717,9 @@ class DatabaseManager:
 
     def __init__(self, db_path: str):
         self.db_path = os.path.abspath(db_path)
+        self._filesystem_type = self._filesystem_type_for_path(self.db_path)
+        self._journal_mode_logged = False
+        self._journal_mode_warned = False
         # Increase timeout to reduce lock errors, allow multi-thread access.
         # Using 4 slashes guarantees an absolute path in SQLAlchemy
         self.engine = create_engine(
@@ -726,13 +729,43 @@ class DatabaseManager:
         )
 
         journal_mode = self._resolve_journal_mode()
+        unsafe_filesystem = (
+            self._filesystem_type
+            and self._filesystem_type.lower() in self._WAL_UNSAFE_FILESYSTEMS
+        )
 
         from sqlalchemy import event
         @event.listens_for(self.engine, "connect")
         def set_sqlite_pragma(dbapi_connection, connection_record):
             cursor = dbapi_connection.cursor()
             cursor.execute(f"PRAGMA journal_mode={journal_mode}")
+            actual_journal_mode = (cursor.fetchone() or [""])[0]
             cursor.execute("PRAGMA synchronous=NORMAL")
+            if not self._journal_mode_logged:
+                logger.info(
+                    "SQLite journal mode for '%s': requested=%s actual=%s filesystem=%s",
+                    self.db_path,
+                    journal_mode,
+                    actual_journal_mode,
+                    self._filesystem_type or "unknown",
+                )
+                self._journal_mode_logged = True
+            # On a WAL-unsafe filesystem (e.g. 9p) the DELETE journal must take, or writes
+            # can silently fail to persist. Log loudly rather than crash — a noisy DB beats
+            # a connection that raises on every attempt (which would take the app down).
+            if (
+                unsafe_filesystem
+                and journal_mode.upper() == "DELETE"
+                and str(actual_journal_mode).lower() != "delete"
+                and not self._journal_mode_warned
+            ):
+                logger.error(
+                    "⚠️ Database '%s' is on '%s', but SQLite reported journal_mode=%r after "
+                    "requesting DELETE. WAL is unsafe here — writes may not persist. "
+                    "Set DB_JOURNAL_MODE=DELETE or move the DB off this filesystem.",
+                    self.db_path, self._filesystem_type, actual_journal_mode,
+                )
+                self._journal_mode_warned = True
             cursor.close()
 
         self.SessionLocal = sessionmaker(bind=self.engine)
