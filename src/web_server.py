@@ -3,6 +3,7 @@ import glob
 import html
 import logging
 import json
+import contextvars
 import os
 import queue
 import re
@@ -21,11 +22,12 @@ from zoneinfo import ZoneInfo
 import requests
 import schedule
 from dependency_injector import providers
-from flask import Flask, render_template, render_template_string, request, redirect, url_for, jsonify, session, send_from_directory, make_response, g, current_app
+from flask import Flask, render_template, render_template_string, request, redirect, url_for, jsonify, session, send_from_directory, make_response, g, current_app, flash
 from functools import wraps
 from src.utils.user_context import (
     set_current_user_id, reset_current_user_id,
     set_current_user_credentials, reset_current_user_credentials,
+    get_current_user_credentials,
 )
 
 from src.utils.config_loader import ConfigLoader, env_truthy
@@ -490,11 +492,25 @@ class _GlobalClients:
 _global_clients = _GlobalClients()
 
 
+# Lets background work (e.g. batch-match processing) re-bind the request's client
+# bundle onto its own thread, so uc()-internal helpers resolve the right user's
+# clients instead of silently falling back to the global bundle (current_user()
+# reads the Flask request context, which a worker thread doesn't have).
+_active_bundle: "contextvars.ContextVar" = contextvars.ContextVar("active_client_bundle", default=None)
+
+# When True, _spawn_user_background runs inline instead of on a daemon thread. Set by
+# create_app() under a test container so integration tests stay deterministic.
+_BACKGROUND_TASKS_SYNCHRONOUS = False
+
+
 def uc():
     """The active client bundle for this request: the logged-in user's own
     clients (per-user credentials/library) when available, else the global
     singletons. Use this in user-facing flows (match/forge/search) so they act
     on the user's library, not the admin's."""
+    override = _active_bundle.get()
+    if override is not None:
+        return override
     try:
         user = current_user()
     except RuntimeError:
@@ -571,6 +587,50 @@ def _enqueue_tracker_automatch(sync_clients, book):
             threading.Thread(target=_tracker_automatch_worker, daemon=True, name="tracker-automatch").start()
             _tracker_automatch_worker_started = True
     _TRACKER_AUTOMATCH_QUEUE.put((snapshot, book))
+
+
+def _spawn_user_background(fn, *args, label="background"):
+    """Run `fn(*args)` on a daemon thread with the request's user context re-bound.
+
+    Batch-match processing (artifact downloads, hash, transcript ingest, save,
+    collection/shelf) is slow and N×, but none of it needs the response. We capture
+    the active bundle + ambient user id/credentials in the request and re-bind them in
+    the worker so `uc()` / `user_setting` / DB ownership resolve for the same user
+    off-thread (a worker thread has no Flask request context). Errors are logged.
+
+    In test mode (`create_app(test_container=...)`) it runs inline so integration
+    tests observe the side effects right after the request — the request context is
+    still active there, so `uc()` resolves normally without the re-bind.
+    """
+    if _BACKGROUND_TASKS_SYNCHRONOUS:
+        try:
+            fn(*args)
+        except Exception as e:
+            logger.error("%s failed: %s", label, e)
+        return
+
+    bundle = uc()
+    try:
+        user = current_user()
+        user_id = user.id if user is not None else None
+    except Exception:
+        user_id = None
+    creds = get_current_user_credentials()
+
+    def runner():
+        tok_bundle = _active_bundle.set(bundle)
+        tok_uid = set_current_user_id(user_id)
+        tok_creds = set_current_user_credentials(creds)
+        try:
+            fn(*args)
+        except Exception as e:
+            logger.error("%s failed: %s", label, e)
+        finally:
+            reset_current_user_credentials(tok_creds)
+            reset_current_user_id(tok_uid)
+            _active_bundle.reset(tok_bundle)
+
+    threading.Thread(target=runner, daemon=True, name=label).start()
 
 
 def _request_wants_json() -> bool:
@@ -4252,6 +4312,425 @@ def match():
     return render_template('match.html', audiobooks=audiobooks, ebooks=ebooks, storyteller_books=storyteller_books, search=search)
 
 
+def _process_batch_queue(queue_items):
+    """Background processor for the batch-match 'Process Queue' action.
+
+    Runs each item's onboarding (artifact download, hash, transcript ingest, save,
+    collection/shelf) off the request thread via _spawn_user_background, so the page
+    redirects immediately and books appear on the dashboard as each finishes.
+    """
+    from src.db.models import Book
+    clients = uc()
+    for item in queue_items:
+        audio_source = item.get('audio_source') or 'ABS'
+        if audio_source == 'BookLore':
+            saved_book, err_msg, _err_code = _create_or_update_booklore_audio_mapping(
+                audio_source_id=item.get('audio_source_id'),
+                audio_title=item.get('audio_title'),
+                audio_cover_url=item.get('audio_cover_url'),
+                audio_duration=_parse_audio_duration(item.get('audio_duration')),
+                audio_provider_book_id=item.get('audio_provider_book_id'),
+                audio_provider_file_id=item.get('audio_provider_file_id'),
+                ebook_filename=item.get('ebook_filename'),
+                ebook_source=item.get('ebook_source'),
+                ebook_source_id=item.get('ebook_source_id'),
+                storyteller_uuid=item.get('storyteller_uuid'),
+            )
+            if err_msg:
+                logger.warning(
+                    "⚠️ Batch Match skipped Grimmory audiobook '%s': %s",
+                    sanitize_log_data(item.get('audio_title') or item.get('audio_source_id')),
+                    err_msg,
+                )
+            continue
+
+        ebook_filename = item['ebook_filename']
+        storyteller_uuid = item.get('storyteller_uuid', '')
+        original_ebook_filename = item['ebook_filename']
+        duration = item['duration']
+        booklore_id = None
+        kosync_doc_id = None
+
+        if storyteller_uuid:
+            # Storyteller Tri-Link Logic (mirrors match POST handler)
+            try:
+                logger.info(f"🔍 Batch Match: Using Storyteller Artifact '{storyteller_uuid}' for '{item['abs_title']}'")
+
+                target_filename, _target_path = _download_storyteller_artifact(
+                    storyteller_uuid,
+                    item.get('abs_title'),
+                    original_ebook_filename=ebook_filename,
+                )
+                if target_filename:
+                    original_ebook_filename = ebook_filename  # Preserve original (may be empty for storyteller-only)
+                    ebook_filename = target_filename  # Override filename (artifact or original under NO_EPUB_CACHE)
+
+                    kosync_doc_id = _compute_storyteller_trilink_kosync_id(
+                        original_ebook_filename,
+                        target_filename,
+                        "Batch Match Tri-Link",
+                    )
+                else:
+                    logger.warning(f"⚠️ Failed to obtain Storyteller artifact '{storyteller_uuid}' for '{item['abs_title']}', skipping")
+                    continue
+            except Exception as e:
+                logger.error(f"❌ Storyteller Tri-Link failed for '{item['abs_title']}': {e}")
+                continue
+        else:
+            # Standard path: Get booklore_id if available for API-based hash computation
+            if clients.booklore_client.is_configured():
+                book = clients.booklore_client.find_book_by_filename(ebook_filename)
+                if book:
+                    booklore_id = book.get('id')
+
+            # Compute KOSync ID (Grimmory API first, filesystem fallback)
+            kosync_doc_id = get_kosync_id_for_ebook(ebook_filename, booklore_id)
+
+        if not kosync_doc_id:
+            logger.warning(f"⚠️ Could not compute KOSync ID for {sanitize_log_data(ebook_filename)}, skipping")
+            continue
+
+        # Hash Preservation for Batch Match: respect existing hash
+        # (including manual overrides) to prevent re-match from reverting.
+        current_book_entry = database_service.get_book(item['abs_id'])
+        if current_book_entry and current_book_entry.kosync_doc_id:
+            logger.info(f"🔄 Preserving existing hash '{current_book_entry.kosync_doc_id}' for '{item['abs_id']}' instead of new hash '{kosync_doc_id}'")
+            kosync_doc_id = current_book_entry.kosync_doc_id
+
+        item_details = clients.abs_client.get_item_details(item['abs_id'])
+        chapters = item_details.get('media', {}).get('chapters', []) if item_details else []
+        storyteller_manifest = ingest_storyteller_transcripts(
+            item['abs_id'],
+            item.get('abs_title', ''),
+            chapters
+        )
+        transcript_source = _storyteller_transcript_source(storyteller_uuid, storyteller_manifest)
+
+        # Create Book object and save to database service
+        book = Book(
+            abs_id=item['abs_id'],
+            abs_title=item['abs_title'],
+            audio_source="ABS",
+            audio_source_id=item['abs_id'],
+            audio_title=item['abs_title'],
+            audio_cover_url=item.get('cover_url'),
+            audio_duration=duration,
+            audio_provider_book_id=item['abs_id'],
+            ebook_filename=ebook_filename,
+            kosync_doc_id=kosync_doc_id,
+            transcript_file=storyteller_manifest,
+            status="pending",
+            duration=duration,
+            transcript_source=transcript_source,
+            storyteller_uuid=storyteller_uuid or None,
+            original_ebook_filename=original_ebook_filename,
+            ebook_source=item.get('ebook_source'),
+            ebook_source_id=item.get('ebook_source_id'),
+        )
+
+        database_service.save_book(book)
+
+        # Trigger Hardcover/StoryGraph automatch in the background.
+        _enqueue_tracker_automatch(clients.sync_clients, book)
+
+        if not str(item['abs_id']).startswith('booklore:'):
+            clients.abs_client.add_to_collection(item['abs_id'], ABS_COLLECTION_NAME)
+        shelf_filename = original_ebook_filename or ebook_filename
+        if shelf_filename:
+            _shelve_matched_ebook(shelf_filename, item.get('ebook_source'),
+                                  item.get('ebook_source_id'))
+        if clients.storyteller_client.is_configured():
+            if book.storyteller_uuid:
+                clients.storyteller_client.add_to_collection_by_uuid(book.storyteller_uuid)
+
+        # Auto-dismiss any pending suggestion
+        database_service.dismiss_suggestion(item['abs_id'])
+        database_service.dismiss_suggestion(kosync_doc_id)
+
+        # [NEW] Robust Dismissal
+        try:
+            device_doc = database_service.get_kosync_doc_by_filename(ebook_filename)
+            if device_doc and device_doc.document_hash != kosync_doc_id:
+                 database_service.dismiss_suggestion(device_doc.document_hash)
+        except Exception: pass
+
+
+def _process_forge_match_queue(queue_items):
+    """Background processor for the batch-match 'Forge & Match' action.
+
+    Like _process_batch_queue but for the forge path; runs off the request thread
+    via _spawn_user_background so the page redirects immediately.
+    """
+    from src.db.models import Book
+    clients = uc()
+    for item in queue_items:
+        audio_source = item.get('audio_source') or 'ABS'
+        storyteller_uuid = item.get('storyteller_uuid', '')
+
+        # If Storyteller is selected, keep the current direct-match path.
+        if storyteller_uuid:
+            if audio_source == 'BookLore':
+                saved_book, err_msg, _err_code = _create_or_update_booklore_audio_mapping(
+                    audio_source_id=item.get('audio_source_id'),
+                    audio_title=item.get('audio_title'),
+                    audio_cover_url=item.get('audio_cover_url'),
+                    audio_duration=_parse_audio_duration(item.get('audio_duration')),
+                    audio_provider_book_id=item.get('audio_provider_book_id'),
+                    audio_provider_file_id=item.get('audio_provider_file_id'),
+                    ebook_filename=item.get('ebook_filename'),
+                    ebook_source=item.get('ebook_source'),
+                    ebook_source_id=item.get('ebook_source_id'),
+                    storyteller_uuid=storyteller_uuid,
+                )
+                if err_msg:
+                    logger.warning(
+                        "Batch Forge skipped Grimmory audiobook '%s': %s",
+                        sanitize_log_data(item.get('audio_title') or item.get('audio_source_id')),
+                        err_msg,
+                    )
+                continue
+
+            ebook_filename = item['ebook_filename']
+            original_ebook_filename = item['ebook_filename']
+            duration = item['duration']
+            kosync_doc_id = None
+
+            try:
+                logger.info(
+                    "Batch Forge: Using Storyteller Artifact '%s' for '%s'",
+                    sanitize_log_data(storyteller_uuid),
+                    sanitize_log_data(item.get('abs_title')),
+                )
+
+                target_filename, _target_path = _download_storyteller_artifact(
+                    storyteller_uuid,
+                    item.get('abs_title'),
+                    original_ebook_filename=ebook_filename,
+                )
+                if target_filename:
+                    original_ebook_filename = ebook_filename
+                    ebook_filename = target_filename
+
+                    kosync_doc_id = _compute_storyteller_trilink_kosync_id(
+                        original_ebook_filename,
+                        target_filename,
+                        "Batch Forge Tri-Link",
+                    )
+                else:
+                    logger.warning(
+                        "Batch Forge: Failed to obtain Storyteller artifact '%s' for '%s', skipping",
+                        sanitize_log_data(storyteller_uuid),
+                        sanitize_log_data(item.get('abs_title')),
+                    )
+                    continue
+            except Exception as e:
+                logger.error(
+                    "Batch Forge: Storyteller Tri-Link failed for '%s': %s",
+                    sanitize_log_data(item.get('abs_title')),
+                    e,
+                )
+                continue
+
+            if not kosync_doc_id:
+                logger.warning(
+                    "Batch Forge: Could not compute KOSync ID for %s, skipping",
+                    sanitize_log_data(ebook_filename),
+                )
+                continue
+
+            current_book_entry = database_service.get_book(item['abs_id'])
+            if current_book_entry and current_book_entry.kosync_doc_id:
+                kosync_doc_id = current_book_entry.kosync_doc_id
+
+            item_details = clients.abs_client.get_item_details(item['abs_id'])
+            chapters = item_details.get('media', {}).get('chapters', []) if item_details else []
+            storyteller_manifest = ingest_storyteller_transcripts(
+                item['abs_id'],
+                item.get('abs_title', ''),
+                chapters
+            )
+            transcript_source = _storyteller_transcript_source(storyteller_uuid, storyteller_manifest)
+
+            book = Book(
+                abs_id=item['abs_id'],
+                abs_title=item['abs_title'],
+                audio_source="ABS",
+                audio_source_id=item['abs_id'],
+                audio_title=item['abs_title'],
+                audio_cover_url=item.get('cover_url'),
+                audio_duration=duration,
+                audio_provider_book_id=item['abs_id'],
+                ebook_filename=ebook_filename,
+                kosync_doc_id=kosync_doc_id,
+                transcript_file=storyteller_manifest,
+                status="pending",
+                duration=duration,
+                transcript_source=transcript_source,
+                storyteller_uuid=storyteller_uuid or None,
+                original_ebook_filename=original_ebook_filename,
+                ebook_source=item.get('ebook_source'),
+                ebook_source_id=item.get('ebook_source_id'),
+            )
+
+            database_service.save_book(book)
+
+            _enqueue_tracker_automatch(clients.sync_clients, book)
+
+            if not str(item['abs_id']).startswith('booklore:'):
+                clients.abs_client.add_to_collection(item['abs_id'], ABS_COLLECTION_NAME)
+            if clients.booklore_client.is_configured():
+                shelf_filename = original_ebook_filename or ebook_filename
+                _shelve_matched_ebook(shelf_filename)
+            if clients.storyteller_client.is_configured() and book.storyteller_uuid:
+                clients.storyteller_client.add_to_collection_by_uuid(book.storyteller_uuid)
+
+            database_service.dismiss_suggestion(item['abs_id'])
+            database_service.dismiss_suggestion(kosync_doc_id)
+
+            try:
+                device_doc = database_service.get_kosync_doc_by_filename(ebook_filename)
+                if device_doc and device_doc.document_hash != kosync_doc_id:
+                    database_service.dismiss_suggestion(device_doc.document_hash)
+            except Exception:
+                pass
+            continue
+
+        original_filename = (item.get('ebook_filename') or '').strip()
+        if not original_filename:
+            logger.warning(
+                "Batch Forge skipped '%s': missing ebook filename",
+                sanitize_log_data(item.get('audio_title') or item.get('abs_title') or item.get('abs_id')),
+            )
+            continue
+
+        source_type = _normalize_text_source_type(item.get('ebook_source'))
+        source_id = str(item.get('ebook_source_id') or '').strip()
+        source_path = str(item.get('ebook_source_path') or '').strip()
+
+        if not source_type:
+            if source_id:
+                source_type = 'Booklore'
+            else:
+                source_type = 'Local File'
+        if source_type == 'Local File' and not source_path:
+            resolved_path = find_ebook_file(original_filename)
+            source_path = str(resolved_path) if resolved_path else ''
+
+        if source_type in ('ABS', 'Booklore', 'BookOrbit', 'CWA') and not source_id:
+            logger.warning(
+                "Batch Forge skipped '%s': missing source id for source type '%s'",
+                sanitize_log_data(item.get('audio_title') or item.get('abs_title') or item.get('abs_id')),
+                sanitize_log_data(source_type),
+            )
+            continue
+        if source_type == 'Local File' and not source_path:
+            logger.warning(
+                "Batch Forge skipped '%s': local file path unavailable",
+                sanitize_log_data(item.get('audio_title') or item.get('abs_title') or item.get('abs_id')),
+            )
+            continue
+
+        text_item = _build_forge_text_item(source_type, source_id, source_path, original_filename)
+        initial_booklore_id = source_id if text_item.get('source') == 'Booklore' else None
+        kosync_doc_id = get_kosync_id_for_ebook(original_filename, initial_booklore_id)
+        if not kosync_doc_id:
+            logger.warning(
+                "Batch Forge: Could not compute KOSync ID for '%s', continuing with forge fallback hash",
+                sanitize_log_data(original_filename),
+            )
+
+        audio_duration = _parse_audio_duration(item.get('audio_duration'))
+        if audio_duration is None:
+            audio_duration = _parse_audio_duration(item.get('duration'))
+
+        if audio_source == 'BookLore':
+            audio_source_id = (item.get('audio_source_id') or '').strip()
+            forge_id = _build_bridge_key('BookLore', audio_source_id)
+            if not forge_id:
+                logger.warning(
+                    "Batch Forge skipped '%s': missing Grimmory source id",
+                    sanitize_log_data(item.get('audio_title') or item.get('abs_title') or item.get('abs_id')),
+                )
+                continue
+
+            forge_title = item.get('audio_title') or item.get('abs_title') or Path(original_filename).stem
+            book = Book(
+                abs_id=forge_id,
+                abs_title=forge_title,
+                ebook_filename=original_filename,
+                original_ebook_filename=original_filename,
+                kosync_doc_id=kosync_doc_id or f"forging_{forge_id}",
+                status="forging",
+                duration=audio_duration or 0.0,
+                audio_source='BookLore',
+                audio_source_id=audio_source_id,
+                audio_provider_book_id=item.get('audio_provider_book_id') or audio_source_id,
+                audio_provider_file_id=item.get('audio_provider_file_id'),
+                audio_title=forge_title,
+                audio_cover_url=item.get('audio_cover_url') or item.get('cover_url'),
+                audio_duration=audio_duration,
+                ebook_source=item.get('ebook_source'),
+                ebook_source_id=item.get('ebook_source_id'),
+            )
+            database_service.save_book(book)
+
+            container.forge_service().start_auto_forge_match(
+                abs_id=forge_id,
+                text_item=text_item,
+                title=forge_title,
+                author=None,
+                original_filename=original_filename,
+                original_hash=kosync_doc_id,
+                audio_source='BookLore',
+                audio_source_id=audio_source_id,
+                **_client_bundle_kwargs(clients),
+            )
+        else:
+            forge_id = item.get('abs_id')
+            if not forge_id:
+                logger.warning(
+                    "Batch Forge skipped '%s': missing ABS id",
+                    sanitize_log_data(item.get('audio_title') or item.get('abs_title')),
+                )
+                continue
+
+            forge_title = item.get('abs_title') or item.get('audio_title') or forge_id
+            book = Book(
+                abs_id=forge_id,
+                abs_title=forge_title,
+                ebook_filename=original_filename,
+                original_ebook_filename=original_filename,
+                kosync_doc_id=kosync_doc_id or f"forging_{forge_id}",
+                status="forging",
+                duration=audio_duration or 0.0,
+                audio_source='ABS',
+                audio_source_id=forge_id,
+                audio_provider_book_id=item.get('audio_provider_book_id') or forge_id,
+                audio_provider_file_id=item.get('audio_provider_file_id'),
+                audio_title=forge_title,
+                audio_cover_url=item.get('audio_cover_url') or item.get('cover_url'),
+                audio_duration=audio_duration,
+                ebook_source=item.get('ebook_source'),
+                ebook_source_id=item.get('ebook_source_id'),
+            )
+            database_service.save_book(book)
+
+            container.forge_service().start_auto_forge_match(
+                abs_id=forge_id,
+                text_item=text_item,
+                title=forge_title,
+                author=None,
+                original_filename=original_filename,
+                original_hash=kosync_doc_id,
+                **_client_bundle_kwargs(clients),
+            )
+
+        database_service.dismiss_suggestion(forge_id)
+        if kosync_doc_id:
+            database_service.dismiss_suggestion(kosync_doc_id)
+
+
+
 def batch_match():
     clients = uc()
     if request.method == 'POST':
@@ -4325,415 +4804,18 @@ def batch_match():
             session.modified = True
             return redirect(url_for('batch_match'))
         elif action == 'forge_and_match_queue':
-            from src.db.models import Book
-
-            for item in session.get('queue', []):
-                audio_source = item.get('audio_source') or 'ABS'
-                storyteller_uuid = item.get('storyteller_uuid', '')
-
-                # If Storyteller is selected, keep the current direct-match path.
-                if storyteller_uuid:
-                    if audio_source == 'BookLore':
-                        saved_book, err_msg, _err_code = _create_or_update_booklore_audio_mapping(
-                            audio_source_id=item.get('audio_source_id'),
-                            audio_title=item.get('audio_title'),
-                            audio_cover_url=item.get('audio_cover_url'),
-                            audio_duration=_parse_audio_duration(item.get('audio_duration')),
-                            audio_provider_book_id=item.get('audio_provider_book_id'),
-                            audio_provider_file_id=item.get('audio_provider_file_id'),
-                            ebook_filename=item.get('ebook_filename'),
-                            ebook_source=item.get('ebook_source'),
-                            ebook_source_id=item.get('ebook_source_id'),
-                            storyteller_uuid=storyteller_uuid,
-                        )
-                        if err_msg:
-                            logger.warning(
-                                "Batch Forge skipped Grimmory audiobook '%s': %s",
-                                sanitize_log_data(item.get('audio_title') or item.get('audio_source_id')),
-                                err_msg,
-                            )
-                        continue
-
-                    ebook_filename = item['ebook_filename']
-                    original_ebook_filename = item['ebook_filename']
-                    duration = item['duration']
-                    kosync_doc_id = None
-
-                    try:
-                        logger.info(
-                            "Batch Forge: Using Storyteller Artifact '%s' for '%s'",
-                            sanitize_log_data(storyteller_uuid),
-                            sanitize_log_data(item.get('abs_title')),
-                        )
-
-                        target_filename, _target_path = _download_storyteller_artifact(
-                            storyteller_uuid,
-                            item.get('abs_title'),
-                            original_ebook_filename=ebook_filename,
-                        )
-                        if target_filename:
-                            original_ebook_filename = ebook_filename
-                            ebook_filename = target_filename
-
-                            kosync_doc_id = _compute_storyteller_trilink_kosync_id(
-                                original_ebook_filename,
-                                target_filename,
-                                "Batch Forge Tri-Link",
-                            )
-                        else:
-                            logger.warning(
-                                "Batch Forge: Failed to obtain Storyteller artifact '%s' for '%s', skipping",
-                                sanitize_log_data(storyteller_uuid),
-                                sanitize_log_data(item.get('abs_title')),
-                            )
-                            continue
-                    except Exception as e:
-                        logger.error(
-                            "Batch Forge: Storyteller Tri-Link failed for '%s': %s",
-                            sanitize_log_data(item.get('abs_title')),
-                            e,
-                        )
-                        continue
-
-                    if not kosync_doc_id:
-                        logger.warning(
-                            "Batch Forge: Could not compute KOSync ID for %s, skipping",
-                            sanitize_log_data(ebook_filename),
-                        )
-                        continue
-
-                    current_book_entry = database_service.get_book(item['abs_id'])
-                    if current_book_entry and current_book_entry.kosync_doc_id:
-                        kosync_doc_id = current_book_entry.kosync_doc_id
-
-                    item_details = clients.abs_client.get_item_details(item['abs_id'])
-                    chapters = item_details.get('media', {}).get('chapters', []) if item_details else []
-                    storyteller_manifest = ingest_storyteller_transcripts(
-                        item['abs_id'],
-                        item.get('abs_title', ''),
-                        chapters
-                    )
-                    transcript_source = _storyteller_transcript_source(storyteller_uuid, storyteller_manifest)
-
-                    book = Book(
-                        abs_id=item['abs_id'],
-                        abs_title=item['abs_title'],
-                        audio_source="ABS",
-                        audio_source_id=item['abs_id'],
-                        audio_title=item['abs_title'],
-                        audio_cover_url=item.get('cover_url'),
-                        audio_duration=duration,
-                        audio_provider_book_id=item['abs_id'],
-                        ebook_filename=ebook_filename,
-                        kosync_doc_id=kosync_doc_id,
-                        transcript_file=storyteller_manifest,
-                        status="pending",
-                        duration=duration,
-                        transcript_source=transcript_source,
-                        storyteller_uuid=storyteller_uuid or None,
-                        original_ebook_filename=original_ebook_filename,
-                        ebook_source=item.get('ebook_source'),
-                        ebook_source_id=item.get('ebook_source_id'),
-                    )
-
-                    database_service.save_book(book)
-
-                    _enqueue_tracker_automatch(clients.sync_clients, book)
-
-                    if not str(item['abs_id']).startswith('booklore:'):
-                        clients.abs_client.add_to_collection(item['abs_id'], ABS_COLLECTION_NAME)
-                    if clients.booklore_client.is_configured():
-                        shelf_filename = original_ebook_filename or ebook_filename
-                        _shelve_matched_ebook(shelf_filename)
-                    if clients.storyteller_client.is_configured() and book.storyteller_uuid:
-                        clients.storyteller_client.add_to_collection_by_uuid(book.storyteller_uuid)
-
-                    database_service.dismiss_suggestion(item['abs_id'])
-                    database_service.dismiss_suggestion(kosync_doc_id)
-
-                    try:
-                        device_doc = database_service.get_kosync_doc_by_filename(ebook_filename)
-                        if device_doc and device_doc.document_hash != kosync_doc_id:
-                            database_service.dismiss_suggestion(device_doc.document_hash)
-                    except Exception:
-                        pass
-                    continue
-
-                original_filename = (item.get('ebook_filename') or '').strip()
-                if not original_filename:
-                    logger.warning(
-                        "Batch Forge skipped '%s': missing ebook filename",
-                        sanitize_log_data(item.get('audio_title') or item.get('abs_title') or item.get('abs_id')),
-                    )
-                    continue
-
-                source_type = _normalize_text_source_type(item.get('ebook_source'))
-                source_id = str(item.get('ebook_source_id') or '').strip()
-                source_path = str(item.get('ebook_source_path') or '').strip()
-
-                if not source_type:
-                    if source_id:
-                        source_type = 'Booklore'
-                    else:
-                        source_type = 'Local File'
-                if source_type == 'Local File' and not source_path:
-                    resolved_path = find_ebook_file(original_filename)
-                    source_path = str(resolved_path) if resolved_path else ''
-
-                if source_type in ('ABS', 'Booklore', 'BookOrbit', 'CWA') and not source_id:
-                    logger.warning(
-                        "Batch Forge skipped '%s': missing source id for source type '%s'",
-                        sanitize_log_data(item.get('audio_title') or item.get('abs_title') or item.get('abs_id')),
-                        sanitize_log_data(source_type),
-                    )
-                    continue
-                if source_type == 'Local File' and not source_path:
-                    logger.warning(
-                        "Batch Forge skipped '%s': local file path unavailable",
-                        sanitize_log_data(item.get('audio_title') or item.get('abs_title') or item.get('abs_id')),
-                    )
-                    continue
-
-                text_item = _build_forge_text_item(source_type, source_id, source_path, original_filename)
-                initial_booklore_id = source_id if text_item.get('source') == 'Booklore' else None
-                kosync_doc_id = get_kosync_id_for_ebook(original_filename, initial_booklore_id)
-                if not kosync_doc_id:
-                    logger.warning(
-                        "Batch Forge: Could not compute KOSync ID for '%s', continuing with forge fallback hash",
-                        sanitize_log_data(original_filename),
-                    )
-
-                audio_duration = _parse_audio_duration(item.get('audio_duration'))
-                if audio_duration is None:
-                    audio_duration = _parse_audio_duration(item.get('duration'))
-
-                if audio_source == 'BookLore':
-                    audio_source_id = (item.get('audio_source_id') or '').strip()
-                    forge_id = _build_bridge_key('BookLore', audio_source_id)
-                    if not forge_id:
-                        logger.warning(
-                            "Batch Forge skipped '%s': missing Grimmory source id",
-                            sanitize_log_data(item.get('audio_title') or item.get('abs_title') or item.get('abs_id')),
-                        )
-                        continue
-
-                    forge_title = item.get('audio_title') or item.get('abs_title') or Path(original_filename).stem
-                    book = Book(
-                        abs_id=forge_id,
-                        abs_title=forge_title,
-                        ebook_filename=original_filename,
-                        original_ebook_filename=original_filename,
-                        kosync_doc_id=kosync_doc_id or f"forging_{forge_id}",
-                        status="forging",
-                        duration=audio_duration or 0.0,
-                        audio_source='BookLore',
-                        audio_source_id=audio_source_id,
-                        audio_provider_book_id=item.get('audio_provider_book_id') or audio_source_id,
-                        audio_provider_file_id=item.get('audio_provider_file_id'),
-                        audio_title=forge_title,
-                        audio_cover_url=item.get('audio_cover_url') or item.get('cover_url'),
-                        audio_duration=audio_duration,
-                        ebook_source=item.get('ebook_source'),
-                        ebook_source_id=item.get('ebook_source_id'),
-                    )
-                    database_service.save_book(book)
-
-                    container.forge_service().start_auto_forge_match(
-                        abs_id=forge_id,
-                        text_item=text_item,
-                        title=forge_title,
-                        author=None,
-                        original_filename=original_filename,
-                        original_hash=kosync_doc_id,
-                        audio_source='BookLore',
-                        audio_source_id=audio_source_id,
-                        **_client_bundle_kwargs(clients),
-                    )
-                else:
-                    forge_id = item.get('abs_id')
-                    if not forge_id:
-                        logger.warning(
-                            "Batch Forge skipped '%s': missing ABS id",
-                            sanitize_log_data(item.get('audio_title') or item.get('abs_title')),
-                        )
-                        continue
-
-                    forge_title = item.get('abs_title') or item.get('audio_title') or forge_id
-                    book = Book(
-                        abs_id=forge_id,
-                        abs_title=forge_title,
-                        ebook_filename=original_filename,
-                        original_ebook_filename=original_filename,
-                        kosync_doc_id=kosync_doc_id or f"forging_{forge_id}",
-                        status="forging",
-                        duration=audio_duration or 0.0,
-                        audio_source='ABS',
-                        audio_source_id=forge_id,
-                        audio_provider_book_id=item.get('audio_provider_book_id') or forge_id,
-                        audio_provider_file_id=item.get('audio_provider_file_id'),
-                        audio_title=forge_title,
-                        audio_cover_url=item.get('audio_cover_url') or item.get('cover_url'),
-                        audio_duration=audio_duration,
-                        ebook_source=item.get('ebook_source'),
-                        ebook_source_id=item.get('ebook_source_id'),
-                    )
-                    database_service.save_book(book)
-
-                    container.forge_service().start_auto_forge_match(
-                        abs_id=forge_id,
-                        text_item=text_item,
-                        title=forge_title,
-                        author=None,
-                        original_filename=original_filename,
-                        original_hash=kosync_doc_id,
-                        **_client_bundle_kwargs(clients),
-                    )
-
-                database_service.dismiss_suggestion(forge_id)
-                if kosync_doc_id:
-                    database_service.dismiss_suggestion(kosync_doc_id)
-
+            _queue_items = list(session.get('queue', []))
             session['queue'] = []
             session.modified = True
+            _spawn_user_background(_process_forge_match_queue, _queue_items, label="batch-forge-match")
+            flash(f"Forging + matching {len(_queue_items)} book(s) in the background…", "info")
             return redirect(url_for('index'))
         elif action == 'process_queue':
-            from src.db.models import Book
-
-            for item in session.get('queue', []):
-                audio_source = item.get('audio_source') or 'ABS'
-                if audio_source == 'BookLore':
-                    saved_book, err_msg, _err_code = _create_or_update_booklore_audio_mapping(
-                        audio_source_id=item.get('audio_source_id'),
-                        audio_title=item.get('audio_title'),
-                        audio_cover_url=item.get('audio_cover_url'),
-                        audio_duration=_parse_audio_duration(item.get('audio_duration')),
-                        audio_provider_book_id=item.get('audio_provider_book_id'),
-                        audio_provider_file_id=item.get('audio_provider_file_id'),
-                        ebook_filename=item.get('ebook_filename'),
-                        ebook_source=item.get('ebook_source'),
-                        ebook_source_id=item.get('ebook_source_id'),
-                        storyteller_uuid=item.get('storyteller_uuid'),
-                    )
-                    if err_msg:
-                        logger.warning(
-                            "⚠️ Batch Match skipped Grimmory audiobook '%s': %s",
-                            sanitize_log_data(item.get('audio_title') or item.get('audio_source_id')),
-                            err_msg,
-                        )
-                    continue
-
-                ebook_filename = item['ebook_filename']
-                storyteller_uuid = item.get('storyteller_uuid', '')
-                original_ebook_filename = item['ebook_filename']
-                duration = item['duration']
-                booklore_id = None
-                kosync_doc_id = None
-
-                if storyteller_uuid:
-                    # Storyteller Tri-Link Logic (mirrors match POST handler)
-                    try:
-                        logger.info(f"🔍 Batch Match: Using Storyteller Artifact '{storyteller_uuid}' for '{item['abs_title']}'")
-
-                        target_filename, _target_path = _download_storyteller_artifact(
-                            storyteller_uuid,
-                            item.get('abs_title'),
-                            original_ebook_filename=ebook_filename,
-                        )
-                        if target_filename:
-                            original_ebook_filename = ebook_filename  # Preserve original (may be empty for storyteller-only)
-                            ebook_filename = target_filename  # Override filename (artifact or original under NO_EPUB_CACHE)
-
-                            kosync_doc_id = _compute_storyteller_trilink_kosync_id(
-                                original_ebook_filename,
-                                target_filename,
-                                "Batch Match Tri-Link",
-                            )
-                        else:
-                            logger.warning(f"⚠️ Failed to obtain Storyteller artifact '{storyteller_uuid}' for '{item['abs_title']}', skipping")
-                            continue
-                    except Exception as e:
-                        logger.error(f"❌ Storyteller Tri-Link failed for '{item['abs_title']}': {e}")
-                        continue
-                else:
-                    # Standard path: Get booklore_id if available for API-based hash computation
-                    if clients.booklore_client.is_configured():
-                        book = clients.booklore_client.find_book_by_filename(ebook_filename)
-                        if book:
-                            booklore_id = book.get('id')
-
-                    # Compute KOSync ID (Grimmory API first, filesystem fallback)
-                    kosync_doc_id = get_kosync_id_for_ebook(ebook_filename, booklore_id)
-
-                if not kosync_doc_id:
-                    logger.warning(f"⚠️ Could not compute KOSync ID for {sanitize_log_data(ebook_filename)}, skipping")
-                    continue
-
-                # Hash Preservation for Batch Match: respect existing hash
-                # (including manual overrides) to prevent re-match from reverting.
-                current_book_entry = database_service.get_book(item['abs_id'])
-                if current_book_entry and current_book_entry.kosync_doc_id:
-                    logger.info(f"🔄 Preserving existing hash '{current_book_entry.kosync_doc_id}' for '{item['abs_id']}' instead of new hash '{kosync_doc_id}'")
-                    kosync_doc_id = current_book_entry.kosync_doc_id
-
-                item_details = clients.abs_client.get_item_details(item['abs_id'])
-                chapters = item_details.get('media', {}).get('chapters', []) if item_details else []
-                storyteller_manifest = ingest_storyteller_transcripts(
-                    item['abs_id'],
-                    item.get('abs_title', ''),
-                    chapters
-                )
-                transcript_source = _storyteller_transcript_source(storyteller_uuid, storyteller_manifest)
-
-                # Create Book object and save to database service
-                book = Book(
-                    abs_id=item['abs_id'],
-                    abs_title=item['abs_title'],
-                    audio_source="ABS",
-                    audio_source_id=item['abs_id'],
-                    audio_title=item['abs_title'],
-                    audio_cover_url=item.get('cover_url'),
-                    audio_duration=duration,
-                    audio_provider_book_id=item['abs_id'],
-                    ebook_filename=ebook_filename,
-                    kosync_doc_id=kosync_doc_id,
-                    transcript_file=storyteller_manifest,
-                    status="pending",
-                    duration=duration,
-                    transcript_source=transcript_source,
-                    storyteller_uuid=storyteller_uuid or None,
-                    original_ebook_filename=original_ebook_filename,
-                    ebook_source=item.get('ebook_source'),
-                    ebook_source_id=item.get('ebook_source_id'),
-                )
-
-                database_service.save_book(book)
-
-                # Trigger Hardcover/StoryGraph automatch in the background.
-                _enqueue_tracker_automatch(clients.sync_clients, book)
-
-                if not str(item['abs_id']).startswith('booklore:'):
-                    clients.abs_client.add_to_collection(item['abs_id'], ABS_COLLECTION_NAME)
-                shelf_filename = original_ebook_filename or ebook_filename
-                if shelf_filename:
-                    _shelve_matched_ebook(shelf_filename, item.get('ebook_source'),
-                                          item.get('ebook_source_id'))
-                if clients.storyteller_client.is_configured():
-                    if book.storyteller_uuid:
-                        clients.storyteller_client.add_to_collection_by_uuid(book.storyteller_uuid)
-
-                # Auto-dismiss any pending suggestion
-                database_service.dismiss_suggestion(item['abs_id'])
-                database_service.dismiss_suggestion(kosync_doc_id)
-                
-                # [NEW] Robust Dismissal
-                try:
-                    device_doc = database_service.get_kosync_doc_by_filename(ebook_filename)
-                    if device_doc and device_doc.document_hash != kosync_doc_id:
-                         database_service.dismiss_suggestion(device_doc.document_hash)
-                except Exception: pass
-
+            _queue_items = list(session.get('queue', []))
             session['queue'] = []
             session.modified = True
+            _spawn_user_background(_process_batch_queue, _queue_items, label="batch-match-process")
+            flash(f"Processing {len(_queue_items)} book(s) in the background…", "info")
             return redirect(url_for('index'))
 
     search = request.args.get('search', '').strip().lower()
@@ -7881,6 +7963,11 @@ def _resolve_web_secret_key() -> str:
 
 # --- Application Factory ---
 def create_app(test_container=None):
+    # Under a test container, run deferred work inline so integration tests are
+    # deterministic (no background thread races).
+    if test_container is not None:
+        global _BACKGROUND_TASKS_SYNCHRONOUS
+        _BACKGROUND_TASKS_SYNCHRONOUS = True
     STATIC_DIR = os.environ.get('STATIC_DIR', '/app/static')
     TEMPLATE_DIR = os.environ.get('TEMPLATE_DIR', '/app/templates')
     app = Flask(__name__, static_folder=STATIC_DIR, static_url_path='/static', template_folder=TEMPLATE_DIR)

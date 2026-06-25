@@ -58,5 +58,31 @@ class TestDeferredTrackerAutomatch(unittest.TestCase):
         _drain()
 
 
+class TestSpawnUserBackground(unittest.TestCase):
+    """Batch processing runs on a daemon thread (real run) but inline under tests."""
+
+    def tearDown(self):
+        ws._BACKGROUND_TASKS_SYNCHRONOUS = False
+
+    def test_inline_when_synchronous_flag_set(self):
+        ws._BACKGROUND_TASKS_SYNCHRONOUS = True
+        called = []
+        ws._spawn_user_background(lambda *a: called.append(a), 1, 2, label="t")
+        self.assertEqual(called, [(1, 2)])  # ran inline, no thread
+
+    def test_async_runs_on_thread(self):
+        ws._BACKGROUND_TASKS_SYNCHRONOUS = False
+        import threading
+        done = threading.Event()
+        seen = {}
+        # uc()/current_user touch request context; tolerate their absence off-thread.
+        try:
+            ws._spawn_user_background(lambda: (seen.update(ran=True), done.set()), label="t")
+        except RuntimeError:
+            self.skipTest("no app/request context available for background spawn")
+        self.assertTrue(done.wait(timeout=5))
+        self.assertTrue(seen.get("ran"))
+
+
 if __name__ == "__main__":
     unittest.main()
