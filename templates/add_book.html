@@ -938,10 +938,17 @@
         <div class="layout">
             <!-- Selection Area -->
             <div class="selection-area">
-                <form method="GET" action="{{ url_for(self_endpoint) }}">
+                <form method="GET" action="{{ url_for(self_endpoint) }}" id="searchForm">
                     <input type="text" name="search" placeholder="🔍 Search by title, author, or filename..."
                         class="search-box" value="{{ search }}" autofocus>
-                    <button type="submit" class="btn btn-primary">Search</button>
+                    <button type="submit" class="btn btn-primary" id="searchBtn"
+                        data-primary-action="search"
+                        data-working-label="Searching..."
+                        data-working-message="Searching the library..."
+                        data-feedback-target="searchFeedback">
+                        Search
+                    </button>
+                    <div id="searchFeedback" class="submit-feedback" aria-live="polite"></div>
                 </form>
 
                 <form method="POST" action="{{ url_for(self_endpoint) }}" id="addToQueueForm">
