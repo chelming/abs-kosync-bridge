@@ -513,6 +513,62 @@
             border-color: rgba(102, 126, 234, 0.6);
         }
 
+        /* User menu (account + logout dropdown) */
+        .user-menu {
+            position: relative;
+            display: inline-flex;
+        }
+
+        .user-menu-caret {
+            font-size: 10px;
+            opacity: 0.7;
+            transition: transform 0.2s;
+        }
+
+        .user-menu.open .user-menu-caret {
+            transform: rotate(180deg);
+        }
+
+        .user-menu-dropdown {
+            position: absolute;
+            top: calc(100% + 8px);
+            right: 0;
+            min-width: 180px;
+            background: rgba(28, 28, 30, 0.98);
+            -webkit-backdrop-filter: blur(20px);
+            backdrop-filter: blur(20px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 10px;
+            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+            padding: 6px;
+            display: none;
+            flex-direction: column;
+            gap: 2px;
+            z-index: 200;
+        }
+
+        .user-menu.open .user-menu-dropdown {
+            display: flex;
+        }
+
+        .user-menu-item {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 10px 14px;
+            border-radius: 8px;
+            color: rgba(255, 255, 255, 0.85);
+            text-decoration: none;
+            font-size: 14px;
+            font-weight: 600;
+            transition: background 0.2s, color 0.2s;
+        }
+
+        .user-menu-item:hover {
+            background: rgba(102, 126, 234, 0.2);
+            color: #ffffff;
+        }
+
         /* Main Container */
         .container {
             max-width: 1800px;
@@ -2017,18 +2073,49 @@
             {% if is_admin %}
             <a href="/settings" class="btn">⚙️ Settings</a>
             <a href="/stats" class="btn">📊 Stats</a>
-            <a href="/logs" class="btn">📊 Logs</a>
             {% endif %}
             <a href="{{ url_for('add_book') }}" class="btn btn-primary">Add Book</a>
             {% if is_admin %}
             <a href="/suggestions" class="btn">💡 Suggestions</a>
             {% endif %}
             {% if current_user %}
-            <a href="/account" class="btn" title="Account: {{ current_user.username }}">👤 {{ current_user.username }}</a>
-            <a href="/logout" class="btn">🚪 Logout</a>
+            <div class="user-menu" id="user-menu">
+                <button type="button" class="btn user-menu-toggle" id="user-menu-toggle"
+                    aria-haspopup="true" aria-expanded="false" title="Account: {{ current_user.username }}">
+                    👤 {{ current_user.username }} <span class="user-menu-caret">▾</span>
+                </button>
+                <div class="user-menu-dropdown" role="menu">
+                    <a href="/account" class="user-menu-item" role="menuitem">👤 Account</a>
+                    <a href="/logout" class="user-menu-item" role="menuitem">🚪 Logout</a>
+                </div>
+            </div>
             {% endif %}
         </div>
     </div>
+    <script>
+        (function () {
+            const menu = document.getElementById('user-menu');
+            if (!menu) return;
+            const toggle = document.getElementById('user-menu-toggle');
+            toggle.addEventListener('click', function (e) {
+                e.stopPropagation();
+                const open = menu.classList.toggle('open');
+                toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+            });
+            document.addEventListener('click', function (e) {
+                if (!menu.contains(e.target)) {
+                    menu.classList.remove('open');
+                    toggle.setAttribute('aria-expanded', 'false');
+                }
+            });
+            document.addEventListener('keydown', function (e) {
+                if (e.key === 'Escape') {
+                    menu.classList.remove('open');
+                    toggle.setAttribute('aria-expanded', 'false');
+                }
+            });
+        })();
+    </script>
 
     <div class="container">
         <!-- Forge Status Banner -->

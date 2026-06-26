@@ -7166,8 +7166,12 @@ def api_status():
 
 
 def logs_view():
-    """Display logs frontend with filtering capabilities."""
-    return render_template('logs.html')
+    """Display logs frontend with filtering capabilities.
+
+    `?embed=1` renders without the page chrome so the viewer can be hosted
+    inside an iframe (the Settings → Logs tab)."""
+    embed = request.args.get('embed') in ('1', 'true', 'yes')
+    return render_template('logs.html', embed=embed)
 
 
 def api_logs():
