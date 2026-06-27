@@ -331,13 +331,22 @@ class ABSSocketListener:
         for abs_id in to_fire:
             book = self._db.get_book(abs_id)
             title = book.abs_title if book else abs_id[:12]
-            if is_own_write(abs_id, user_id=self._user_id):
+            # Resolve the user this event belongs to. A per-user listener already
+            # knows its user; the global listener (user_id=None) falls back to the
+            # book's owner so the triggered cycle's pushes record write-suppression
+            # under the same namespace the per-user client poller reads — otherwise
+            # our own ebook pushes echo back as "external" changes (a feedback
+            # loop). A legacy/admin book with no owner stays None (unchanged).
+            target_user_id = self._user_id
+            if target_user_id is None and book is not None:
+                target_user_id = getattr(book, "user_id", None)
+            if is_own_write(abs_id, user_id=target_user_id):
                 logger.debug(f"ABS Socket.IO: Ignoring self-triggered event for '{title}'{self._scope_suffix}")
                 continue
             logger.info(f"⚡ Socket.IO: ABS progress changed for '{title}'{self._scope_suffix} — triggering sync")
             threading.Thread(
                 target=self._sync_manager.sync_cycle,
-                kwargs={"target_abs_id": abs_id, "user_id": self._user_id},
+                kwargs={"target_abs_id": abs_id, "user_id": target_user_id},
                 daemon=True,
             ).start()
 

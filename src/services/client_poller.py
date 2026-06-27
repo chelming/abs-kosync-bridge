@@ -210,11 +210,26 @@ class ClientPoller:
             f"📡 {client_name} poll: checked {total_checked} across {len(targets)} target(s)"
         )
 
+    def _recent_self_write(self, client_name: str, abs_id: str, user_id):
+        """Return BookBridge's recent write for this client/book, if any.
+
+        Consults the polled user's namespace and — for a per-user poll — the
+        global (``user_id=None``) namespace, because a sync triggered by the
+        global ABS socket listener (the admin, whose token equals ``ABS_KEY``)
+        runs unscoped and records its pushes under ``None``. Without the fallback
+        a per-user poll mistakes that push for an external change and bounces a
+        sync straight back — an instant-sync feedback loop.
+        """
+        from src.services.write_tracker import get_recent_write
+
+        recent = get_recent_write(client_name, abs_id, user_id=user_id)
+        if recent is None and user_id is not None:
+            recent = get_recent_write(client_name, abs_id, user_id=None)
+        return recent
+
     def _poll_client_for_user(self, client_name, sync_client, user_id, active_books, wait_for_settle) -> int:
         """Fetch current position for each active book for one user and trigger
         sync on change. Returns the number of books checked."""
-        from src.services.write_tracker import get_recent_write, is_own_write
-
         if not sync_client or not sync_client.is_configured():
             return 0
 
@@ -240,10 +255,10 @@ class ClientPoller:
                         f"📡 {client_name} poll: '{book.abs_title}' initial position cached ({current_pct:.1%})"
                     )
                 elif abs(current_pct - last_pct) > 0.001:
-                    # Check write-suppression before acting
-                    if is_own_write(client_name, book.abs_id, user_id=user_id):
-                        recent = get_recent_write(client_name, book.abs_id, user_id=user_id)
-                        recent_pct = recent.get("pct") if recent else None
+                    # Check write-suppression before acting.
+                    recent = self._recent_self_write(client_name, book.abs_id, user_id)
+                    if recent is not None:
+                        recent_pct = recent.get("pct")
                         if (
                             recent_pct is not None
                             and abs(current_pct - recent_pct) > self._echo_tolerance
@@ -261,16 +276,31 @@ class ClientPoller:
                             client_name, book, last_pct, current_pct, wait_for_settle, user_id=user_id
                         )
                 elif self._pending_sync.pop((user_id, client_name, book.abs_id), None) is not None:
-                    # A change was deferred and the position has now settled.
-                    logger.info(
-                        f"📡 {client_name} poll: '{book.abs_title}' position settled at "
-                        f"{current_pct:.1%} — triggering sync"
+                    # A deferred change has settled. Re-check write-suppression: a
+                    # settle wait spans two poll intervals and can outlast the 60s
+                    # suppression window, so a position that is still just an echo of
+                    # our own push must not bounce a sync back.
+                    recent = self._recent_self_write(client_name, book.abs_id, user_id)
+                    recent_pct = recent.get("pct") if recent else None
+                    still_self_echo = recent is not None and (
+                        recent_pct is None
+                        or abs(current_pct - recent_pct) <= self._echo_tolerance
                     )
-                    threading.Thread(
-                        target=self._sync_manager.sync_cycle,
-                        kwargs={'target_abs_id': book.abs_id, 'user_id': user_id},
-                        daemon=True,
-                    ).start()
+                    if still_self_echo:
+                        logger.debug(
+                            f"📡 {client_name} poll: '{book.abs_title}' settled at "
+                            f"{current_pct:.1%} but still self-write — skipping"
+                        )
+                    else:
+                        logger.info(
+                            f"📡 {client_name} poll: '{book.abs_title}' position settled at "
+                            f"{current_pct:.1%} — triggering sync"
+                        )
+                        threading.Thread(
+                            target=self._sync_manager.sync_cycle,
+                            kwargs={'target_abs_id': book.abs_id, 'user_id': user_id},
+                            daemon=True,
+                        ).start()
 
                 self._last_known[cache_key] = current_pct
 

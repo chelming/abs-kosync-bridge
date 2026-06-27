@@ -28,11 +28,12 @@ class TestABSSocketListenerDebounce(unittest.TestCase):
         # Override debounce window to 1s for fast tests
         self.listener._debounce_window = 1
 
-    def _make_active_book(self, abs_id: str, title: str = "Test Book"):
+    def _make_active_book(self, abs_id: str, title: str = "Test Book", user_id=None):
         book = MagicMock()
         book.abs_id = abs_id
         book.abs_title = title
         book.status = "active"
+        book.user_id = user_id
         return book
 
     def test_ignores_non_active_books(self):
@@ -182,6 +183,38 @@ class TestABSSocketListenerDebounce(unittest.TestCase):
         self.mock_sync.sync_cycle.assert_called_once_with(
             target_abs_id="crawler-carl", user_id=7
         )
+
+    def test_global_listener_fires_under_book_owner(self):
+        """The global listener (user_id=None) scopes the cycle to the book's
+        owner so its pushes share the per-user poller's suppression namespace."""
+        book = self._make_active_book("owned-book", "Owned Book", user_id=3)
+        self.mock_db.get_book.return_value = book
+
+        self.listener._pending["owned-book"] = time.time() - 2
+        self.listener._check_and_fire()
+
+        time.sleep(0.1)
+        self.mock_sync.sync_cycle.assert_called_once_with(
+            target_abs_id="owned-book", user_id=3
+        )
+
+    def test_global_listener_suppresses_owner_scoped_self_write(self):
+        """A self-write recorded under the resolved owner is suppressed by the
+        global listener (the is_own_write check uses the same owner namespace)."""
+        from src.services import write_tracker
+
+        with write_tracker._writes_lock:
+            write_tracker._recent_writes.clear()
+        write_tracker.record_write("ABS", "owned-book", user_id=3)
+
+        book = self._make_active_book("owned-book", "Owned Book", user_id=3)
+        self.mock_db.get_book.return_value = book
+
+        self.listener._pending["owned-book"] = time.time() - 2
+        self.listener._check_and_fire()
+
+        time.sleep(0.1)
+        self.mock_sync.sync_cycle.assert_not_called()
 
 
 class TestKosyncPutInstantSync(unittest.TestCase):
