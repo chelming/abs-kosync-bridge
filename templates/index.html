@@ -16,8 +16,7 @@
         data-last-sync="{{ mapping.last_sync }}" data-status="{{ mapping.status }}" data-title="{{ full_display_title }}"
         data-author="{{ mapping.display_author }}" data-filename="{{ mapping.display_filename }}"
         data-sync-mode="{{ mapping.sync_mode }}" data-abs-id="{{ mapping.abs_id }}"
-        data-rating="{% if mapping.storygraph_rating is not none and mapping.goodreads_rating is not none %}{{ ((mapping.storygraph_rating + mapping.goodreads_rating) / 2) }}{% elif mapping.storygraph_rating is not none %}{{ mapping.storygraph_rating }}{% elif mapping.goodreads_rating is not none %}{{ mapping.goodreads_rating }}{% endif %}"
-        {% if mapping.display_filename %}title="{{ mapping.display_filename }}"{% endif %}>
+        data-rating="{% if mapping.storygraph_rating is not none and mapping.goodreads_rating is not none %}{{ ((mapping.storygraph_rating + mapping.goodreads_rating) / 2) }}{% elif mapping.storygraph_rating is not none %}{{ mapping.storygraph_rating }}{% elif mapping.goodreads_rating is not none %}{{ mapping.goodreads_rating }}{% endif %}">
 
         {# Cover image section - prioritize ebook cover, fallback to ABS cover #}
         <div class="book-media-column">
