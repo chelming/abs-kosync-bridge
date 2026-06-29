@@ -27,8 +27,8 @@ def _build_service(audiobooks=None):
     )
 
 
-def _ab(audio_source_id, title, author=None, duration=3600.0):
-    return {
+def _ab(audio_source_id, title, author=None, duration=3600.0, path=""):
+    record = {
         "audio_source": "ABS",
         "audio_source_id": audio_source_id,
         "audio_title": title,
@@ -36,6 +36,9 @@ def _ab(audio_source_id, title, author=None, duration=3600.0):
         "audio_duration": duration,
         "audio_cover_url": "",
     }
+    if path:
+        record["audio_path"] = path
+    return record
 
 
 def test_build_pool_filters_titleless():
@@ -138,6 +141,33 @@ def test_scan_single_ebook_sorts_by_score():
     scores = [m["score"] for m in result["matches"]]
     assert scores == sorted(scores, reverse=True)
     assert result["matches"][0]["audio_source_id"] == "high"
+
+
+def test_scan_single_ebook_scores_same_folder_as_exact_match():
+    svc = _build_service()
+    pool = [{
+        "audio_source": "ABS",
+        "audio_source_id": "abs-1",
+        "bridge_key": "abs-1",
+        "audio_title": "Totally Different Audio Title",
+        "audio_author": "Different Author",
+        "audio_duration": 3600.0,
+        "audio_cover_url": "",
+        "audio_path": "/books/Alice/Series/Shared Folder/audio.m4b",
+    }]
+    result = svc._scan_single_ebook(
+        {
+            "title": "Unrelated Ebook Title",
+            "authors": "Another Author",
+            "filename": "book.epub",
+            "path": "/books/Alice/Series/Shared Folder/book.epub",
+            "id": "2",
+        },
+        pool,
+    )
+    assert result is not None
+    assert result["matches"][0]["score"] == 100.0
+    assert result["matches"][0]["match_reason"] == "same_folder"
 
 
 def test_ebook_anchor_fields_normalises_authors_list():
