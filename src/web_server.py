@@ -5801,6 +5801,14 @@ def suggestions_page():
                     _match_queue_add(item)
             return _match_queue_response()
 
+        elif action == 'forge_and_match_queue':
+            # Same forge/match-all path as the Add Book page: Storyteller items just match,
+            # ebook-only items run the forge (transcribe + align) pipeline in the background.
+            _queue_items = _match_queue_drain()
+            _spawn_user_background(_process_forge_match_queue, _queue_items, label="batch-forge-match")
+            flash(f"Forging + matching {len(_queue_items)} book(s) in the background…", "info")
+            return redirect(url_for('index'))
+
         elif action == 'process_queue':
             from src.db.models import Book
 

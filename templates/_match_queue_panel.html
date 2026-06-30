@@ -19,8 +19,12 @@
 {% endfor %}
 <div class="queue-actions">
     <form method="POST" action="/suggestions">
+        <input type="hidden" name="action" value="forge_and_match_queue">
+        <button type="submit" class="btn btn-success w-100">⚒️ Forge &amp; Match All ({{ queue|length }})</button>
+    </form>
+    <form method="POST" action="/suggestions">
         <input type="hidden" name="action" value="process_queue">
-        <button type="submit" class="btn btn-success w-100">✅ Process All ({{ queue|length }})</button>
+        <button type="submit" class="btn w-100">✅ Match All ({{ queue|length }})</button>
     </form>
     <div id="queueFeedback" class="submit-feedback block" aria-live="polite"></div>
     <form method="POST" action="/suggestions">

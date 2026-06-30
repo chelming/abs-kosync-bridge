@@ -714,7 +714,7 @@ class TestMatchPathsRegression(unittest.TestCase):
         self.assertEqual(add_response.status_code, 200)
         body = add_response.get_data(as_text=True)
         self.assertIn("Regression Book", body)
-        self.assertIn("Process All", body)
+        self.assertIn("Match All", body)
         self.assertEqual(len(web_server._load_match_queue()), 1)
 
         clear_response = self.client.post(
@@ -779,6 +779,31 @@ class TestMatchPathsRegression(unittest.TestCase):
         self.assertEqual(exact_item["ebook_source"], "Grimmory")
         self.assertEqual(exact_item["ebook_source_path"], "/books/x/exact.epub")
         self.assertEqual(exact_item["storyteller_uuid"], "")
+
+    @patch("src.web_server.get_kosync_id_for_ebook", return_value="hash-sugg-forge-1")
+    def test_suggestions_forge_and_match_queue(self, _mock_kosync):
+        # The Suggestions page can run the same forge/match-all path as Add Book, so the
+        # user no longer has to switch pages to process the queue.
+        self.client.post(
+            "/suggestions",
+            data={
+                "action": "add_to_queue",
+                "audiobook_id": "ab-1",
+                "audio_source": "ABS",
+                "audio_source_id": "ab-1",
+                "ebook_filename": "sugg-forge.epub",
+                "ebook_display_name": "Sugg Forge",
+                "ebook_source": "Booklore",
+                "ebook_source_id": "55",
+            },
+        )
+        self.assertEqual(len(web_server._load_match_queue()), 1)
+
+        response = self.client.post("/suggestions", data={"action": "forge_and_match_queue"})
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(response.location.endswith("/"))
+        self.assertEqual(web_server._load_match_queue(), [])
+        self.mock_container.mock_forge_service.start_auto_forge_match.assert_called_once()
 
     @patch("src.web_server._start_suggestions_scan_job", return_value="job-1")
     def test_suggestions_scan_ajax_and_status(self, _mock_start_job):
