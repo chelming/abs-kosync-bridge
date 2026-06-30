@@ -74,6 +74,8 @@ class SuggestionsService:
             candidate_author = self._candidate_author(candidate)
             candidate_source = (getattr(candidate, 'source', None) or '').strip()
             source_id = getattr(candidate, 'source_id', None) or getattr(candidate, 'booklore_id', None)
+            raw_path = getattr(candidate, 'path', None)
+            path = str(raw_path) if raw_path else None
 
             abs_identifier = getattr(candidate, 'abs_identifier', None)
             if not abs_identifier and resolver_enabled and candidate_source.upper() == 'CWA' and source_id:
@@ -91,7 +93,7 @@ class SuggestionsService:
                 "name": getattr(candidate, 'name', ''),
                 "display_name": getattr(candidate, 'display_name', None) or getattr(candidate, 'name', ''),
                 "abs_identifier": abs_identifier,
-                "path": getattr(candidate, 'path', None),
+                "path": path,
             })
 
         return prepared
@@ -571,10 +573,27 @@ class SuggestionsService:
         """
         if not matches or not self._ollama_ready():
             return matches
+        matches = self._pin_exact_same_folder_match(matches)
+        if self._has_exact_same_folder_match(matches):
+            return matches
 
         matches = self._ollama_rerank_band(audio_title, audio_author, matches)
         matches = self._ollama_judge_and_resolve(audio_title, audio_author, matches)
         return matches
+
+    @staticmethod
+    def _has_exact_same_folder_match(matches: List[dict]) -> bool:
+        return bool(matches and matches[0].get("match_reason") == "same_folder")
+
+    @staticmethod
+    def _pin_exact_same_folder_match(matches: List[dict]) -> List[dict]:
+        """Keep the unique same-folder match ahead of optional LLM reranking."""
+        if not matches:
+            return matches
+        exact = next((m for m in matches if m.get("match_reason") == "same_folder"), None)
+        if exact is None:
+            return matches
+        return [exact] + [m for m in matches if m is not exact]
 
     def _apply_ollama_reranking_batch(self, suggestions: List[dict]) -> Set[str]:
         """Re-rank (embeddings) then judge-gate (chat) all fresh suggestions, batched by
@@ -596,8 +615,16 @@ class SuggestionsService:
         if not rerank_on and not judge_on:
             return suppressed
 
-        # Phase A — embedding re-rank (nomic loads once).
-        rerankable = [s for s in suggestions if len(s.get("matches") or []) >= 2]
+        for s in suggestions:
+            s["matches"] = self._pin_exact_same_folder_match(s.get("matches") or [])
+
+        # Phase A — embedding re-rank (nomic loads once). Exact same-folder matches
+        # are deterministic and must not be demoted by semantic title/author scoring.
+        rerankable = [
+            s for s in suggestions
+            if len(s.get("matches") or []) >= 2
+            and not self._has_exact_same_folder_match(s.get("matches") or [])
+        ]
         if rerank_on and rerankable:
             self._prewarm_rerank_embeddings(rerankable)
             for s in rerankable:
@@ -617,6 +644,8 @@ class SuggestionsService:
         for s in suggestions:
             matches = s.get("matches") or []
             if not matches:
+                continue
+            if self._has_exact_same_folder_match(matches):
                 continue
             # A strong fuzzy+semantic top match is almost certainly correct — trust it
             # and spend no chat call.
