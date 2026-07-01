@@ -36,12 +36,23 @@ def _get_dependencies():
 
 def _active_user_clients(container):
     user = getattr(g, "current_user", None)
-    if user is not None:
-        try:
-            return container.user_client_registry().get_clients(user.id)
-        except Exception as exc:
-            logger.debug("Falling back to global StoryGraph route clients: %s", exc)
-    return None
+    if user is None:
+        return None
+    try:
+        return container.user_client_registry().get_clients(user.id)
+    except Exception as exc:
+        # A logged-in NON-admin whose per-user bundle can't be built must NOT
+        # silently fall through to the global (admin) client — that would land
+        # their StoryGraph write on the admin's account. Admins share the global
+        # config, so for them the fallback is safe.
+        if getattr(user, "is_admin", False):
+            logger.debug("Falling back to global StoryGraph route clients for admin: %s", exc)
+            return None
+        logger.error(
+            "Could not build per-user StoryGraph clients for user %s: %s",
+            getattr(user, "id", "?"), exc,
+        )
+        raise
 
 
 def _storygraph_client(container):

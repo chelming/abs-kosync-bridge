@@ -154,6 +154,39 @@ class TestMultiUserAuth(unittest.TestCase):
         # session recognized: hitting /login now redirects to index (no dashboard render needed)
         self.assertEqual(self.client.get('/login', follow_redirects=False).status_code, 302)
 
+    def test_login_rejects_protocol_relative_open_redirect(self):
+        resp = self.client.post(
+            '/login?next=//evil.example.com/x',
+            data={'username': 'admin', 'password': 'secret'},
+            follow_redirects=False,
+        )
+        self.assertEqual(resp.status_code, 302)
+        self.assertNotIn('evil.example.com', resp.headers.get('Location', ''))
+
+    def test_bind_request_user_context_scopes_global_fallback_flag(self):
+        """Regular users must NOT inherit the admin's global env config; admins
+        may. The ambient creds carry the resolve_setting fallback flag."""
+        import src.web_server as web_server
+        from src.utils.user_context import get_current_user_credentials
+        from src.utils.user_config import _ALLOW_GLOBAL_FALLBACK_KEY
+
+        admin = self.svc.get_user_by_username('admin')
+        reg = self.svc.create_user('reg-iso', 'pw', role='user')
+
+        with self.app.test_request_context('/'):
+            web_server._bind_request_user_context(reg)
+            self.assertIs(
+                get_current_user_credentials().get(_ALLOW_GLOBAL_FALLBACK_KEY), False
+            )
+            web_server._release_request_user_context()
+
+        with self.app.test_request_context('/'):
+            web_server._bind_request_user_context(admin)
+            self.assertIs(
+                get_current_user_credentials().get(_ALLOW_GLOBAL_FALLBACK_KEY), True
+            )
+            web_server._release_request_user_context()
+
     def test_logout_clears_session(self):
         self.client.post('/login', data={'username': 'admin', 'password': 'secret'})
         self.client.post('/logout')

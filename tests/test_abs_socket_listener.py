@@ -216,6 +216,29 @@ class TestABSSocketListenerDebounce(unittest.TestCase):
         time.sleep(0.1)
         self.mock_sync.sync_cycle.assert_not_called()
 
+    def test_global_listener_fans_out_to_all_claimants(self):
+        """The global listener fires for EVERY user that claimed a shared book,
+        not just the single owner column — otherwise co-claimants on the shared
+        ABS token wait for the slow poll."""
+        from src.services import write_tracker
+
+        with write_tracker._writes_lock:
+            write_tracker._recent_writes.clear()
+
+        book = self._make_active_book("shared-book", "Shared Book", user_id=3)
+        self.mock_db.get_book.return_value = book
+        self.mock_db.get_book_user_ids.return_value = [3, 5]
+
+        self.listener._pending["shared-book"] = time.time() - 2
+        self.listener._check_and_fire()
+
+        time.sleep(0.1)
+        fired = {
+            (c.kwargs["target_abs_id"], c.kwargs["user_id"])
+            for c in self.mock_sync.sync_cycle.call_args_list
+        }
+        self.assertEqual(fired, {("shared-book", 3), ("shared-book", 5)})
+
 
 class TestKosyncPutInstantSync(unittest.TestCase):
     """Test that KoSync PUT records debounce events for active linked books.
@@ -289,11 +312,13 @@ class TestKosyncPutInstantSync(unittest.TestCase):
             with self._make_put_context('x' * 32):
                 ks.kosync_put_progress.__wrapped__()
 
-            # Event should be queued for the debounce loop to fire
+            # Event should be queued for the debounce loop to fire. The debounce
+            # map is keyed by (abs_id, user_id); match on the stored abs_id.
             with ks._kosync_debounce_lock:
-                self.assertIn("test-instant-sync", ks._kosync_debounce)
-                self.assertFalse(ks._kosync_debounce["test-instant-sync"]["synced"])
-                self.assertEqual(ks._kosync_debounce["test-instant-sync"]["title"], "Instant Sync Book")
+                entries = [v for v in ks._kosync_debounce.values() if v["abs_id"] == "test-instant-sync"]
+                self.assertEqual(len(entries), 1)
+                self.assertFalse(entries[0]["synced"])
+                self.assertEqual(entries[0]["title"], "Instant Sync Book")
 
         finally:
             ks._database_service = original_db
@@ -334,7 +359,7 @@ class TestKosyncPutInstantSync(unittest.TestCase):
 
             # No debounce event should have been recorded
             with ks._kosync_debounce_lock:
-                self.assertNotIn("test-disabled", ks._kosync_debounce)
+                self.assertFalse(any(v["abs_id"] == "test-disabled" for v in ks._kosync_debounce.values()))
 
         finally:
             ks._database_service = original_db
@@ -370,7 +395,7 @@ class TestKosyncPutInstantSync(unittest.TestCase):
                 ks.kosync_put_progress.__wrapped__()
 
             with ks._kosync_debounce_lock:
-                self.assertNotIn("test-inactive", ks._kosync_debounce)
+                self.assertFalse(any(v["abs_id"] == "test-inactive" for v in ks._kosync_debounce.values()))
 
         finally:
             ks._database_service = original_db
@@ -405,21 +430,47 @@ class TestKosyncPutInstantSync(unittest.TestCase):
             mock_db.get_book_by_kosync_id.return_value = None
 
             with ks._kosync_debounce_lock:
-                ks._kosync_debounce["test-clear-stale"] = {
+                ks._kosync_debounce[("test-clear-stale", None)] = {
                     "last_event": time.time(),
                     "title": "Clear Stale Book",
                     "synced": False,
+                    "user_id": None,
+                    "abs_id": "test-clear-stale",
                 }
 
             with self._make_put_context('z' * 32, percentage=0.0, device='abs-sync-bot'):
                 ks.kosync_put_progress.__wrapped__()
 
             with ks._kosync_debounce_lock:
-                self.assertNotIn("test-clear-stale", ks._kosync_debounce)
+                self.assertFalse(any(v["abs_id"] == "test-clear-stale" for v in ks._kosync_debounce.values()))
 
         finally:
             ks._database_service = original_db
             ks._manager = original_manager
+
+    def test_record_kosync_event_keys_per_user_for_shared_book(self):
+        """Two users PUT-ing the same shared book must each get their own
+        debounced sync — a bare abs_id key let the second overwrite the first."""
+        import src.api.kosync_server as ks
+
+        with ks._kosync_debounce_lock:
+            ks._kosync_debounce.clear()
+        started = ks._debounce_thread_started
+        ks._debounce_thread_started = True  # suppress the real loop thread
+        try:
+            ks._record_kosync_event("shared-abs", "Shared", user_id=1)
+            ks._record_kosync_event("shared-abs", "Shared", user_id=2)
+            with ks._kosync_debounce_lock:
+                users = {
+                    v["user_id"]
+                    for v in ks._kosync_debounce.values()
+                    if v["abs_id"] == "shared-abs"
+                }
+            self.assertEqual(users, {1, 2})
+        finally:
+            ks._debounce_thread_started = started
+            with ks._kosync_debounce_lock:
+                ks._kosync_debounce.clear()
 
 
 if __name__ == "__main__":

@@ -355,6 +355,25 @@ class TestKOReaderDeviceSyncService(unittest.TestCase):
 
         self.assertEqual(self.db.get_book("abs-1").kosync_doc_id, "hash-kavita_187")
 
+    def test_zero_percent_device_counts_as_active(self):
+        # A real device freshly opened at exactly 0% is still actively syncing —
+        # it must protect its hash from being demoted (falsy-zero regression: a
+        # bare `percentage > 0` test treated the 0% device as idle).
+        self.db.save_kosync_document(
+            KosyncDocument(
+                document_hash="fresh-device-hash",
+                percentage=0.0,
+                device="kobo",
+                device_id="kobo-1",
+            )
+        )
+        self.assertTrue(self.service._hash_actively_used_by_device("fresh-device-hash"))
+
+    def test_bare_stub_without_device_not_active(self):
+        # A bare stub (no device, no progress) is not in active use.
+        self.db.save_kosync_document(KosyncDocument(document_hash="bare-stub-hash"))
+        self.assertFalse(self.service._hash_actively_used_by_device("bare-stub-hash"))
+
     def test_ensure_linked_kosync_document_upserts_and_relinks(self):
         # Creates a row when missing.
         self.assertTrue(self.db.ensure_linked_kosync_document("h1", "abs-1"))

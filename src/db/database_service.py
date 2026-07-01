@@ -240,11 +240,24 @@ class DatabaseService:
 
     def create_user(self, username: str, password: str = None, role: str = 'user',
                     active: int = 1) -> User:
-        """Create a user with an optional plaintext password (hashed here)."""
+        """Create a user with an optional plaintext password (hashed here).
+
+        Enforces case-insensitive username uniqueness. Every lookup (login,
+        KoSync auth, rename) compares via ``func.lower()``, but the DB unique
+        index is case-sensitive, so 'Admin' and 'admin' could otherwise coexist
+        and make those lookups resolve ambiguously. Raises ValueError on a clash.
+        """
         from werkzeug.security import generate_password_hash
+        from sqlalchemy import func
+        username = (username or "").strip()
         password_hash = generate_password_hash(password) if password else None
         with self.get_session() as session:
-            user = User(username=username.strip(), password_hash=password_hash,
+            existing = session.query(User).filter(
+                func.lower(User.username) == username.lower()
+            ).first()
+            if existing is not None:
+                raise ValueError(f"Username '{username}' already exists")
+            user = User(username=username, password_hash=password_hash,
                         role=role, active=active)
             session.add(user)
             session.flush()
@@ -295,6 +308,10 @@ class DatabaseService:
             if not user:
                 return False
             session.delete(user)
+            # The default-user id (owner of un-scoped state) is cached for the
+            # process lifetime; deleting a user — especially the original admin —
+            # can make it stale, so recompute it on next access.
+            self._default_uid = None
             return True
 
     def touch_user_login(self, user_id: int) -> None:

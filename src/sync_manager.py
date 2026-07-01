@@ -457,7 +457,15 @@ class SyncManager:
             logger.warning("Could not resolve claimant for pending job '%s': %s", abs_id, exc)
             return None
 
-        for user_id in user_ids or []:
+        # Prefer the book's designated owner when it is among the claimants so a
+        # background job runs under a deterministic user's credentials instead of
+        # an arbitrary (DB-order) claimant's tokens.
+        ordered_ids = list(user_ids or [])
+        owner_id = getattr(book, "user_id", None)
+        if owner_id is not None and owner_id in ordered_ids:
+            ordered_ids = [owner_id] + [u for u in ordered_ids if u != owner_id]
+
+        for user_id in ordered_ids:
             try:
                 return registry.get_clients(user_id)
             except Exception as exc:
@@ -1001,7 +1009,14 @@ class SyncManager:
 
     def _dispatch_pending_syncs(self) -> None:
         with self._pending_sync_lock:
-            pending = sorted(self._pending_sync_books)
+            # Sort by abs_id (always a str) first; user_id may be None (global
+            # cycle) or int (per-user instant sync), and sorting a mixed set of
+            # those directly raises TypeError — which, because .clear() is below,
+            # would strand the queue and stop every future replay.
+            pending = sorted(
+                self._pending_sync_books,
+                key=lambda t: (t[1], t[0] is not None),
+            )
             self._pending_sync_books.clear()
 
         if pending:
@@ -2443,12 +2458,17 @@ class SyncManager:
                         user_id,
                     )
             except Exception as exc:
+                # Transient ABS error (timeout/5xx) — the ownership link already
+                # passed, so keep the book rather than silently dropping a real
+                # update the user just made. Fail-open is isolation-safe here
+                # because the user↔book link, not the token check, is the gate.
                 logger.debug(
-                    "Skipping ABS item '%s' for user_id=%s after access check failed: %s",
+                    "Keeping ABS item '%s' for user_id=%s despite access-check error: %s",
                     abs_id,
                     user_id,
                     exc,
                 )
+                visible.append(book)
 
         return visible
 

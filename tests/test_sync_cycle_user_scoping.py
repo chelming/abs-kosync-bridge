@@ -407,6 +407,14 @@ class TestSyncCycleUserScoping(unittest.TestCase):
         self.assertEqual(global_bo.session_calls, [])
 
     def test_user_scoped_suggestion_uses_user_provider_clients(self):
+        # Isolate from ambient env leaked by other suites (create_app loads DB
+        # settings into os.environ); this path requires suggestions enabled.
+        import os
+        from unittest.mock import patch as _patch
+        _env = _patch.dict(os.environ, {"SUGGESTIONS_ENABLED": "true"})
+        _env.start()
+        self.addCleanup(_env.stop)
+
         class _SuggestionDB:
             def __init__(self):
                 self.saved = []
@@ -704,6 +712,22 @@ class TestPendingSyncUserScope(unittest.TestCase):
             thread_cls.call_args.kwargs["kwargs"],
             {'target_abs_id': 'book-1', 'user_id': 2},
         )
+
+    def test_dispatch_handles_mixed_none_and_int_user_ids(self):
+        # A global cycle (user_id=None) and a per-user instant sync (user_id=int)
+        # can queue in the same busy window. Sorting the mixed set must not raise
+        # TypeError — which, because the clear() is on the next line, would strand
+        # the queue and stop every future replay until a restart.
+        mgr = SyncManager.__new__(SyncManager)
+        mgr._pending_sync_lock = threading.Lock()
+        mgr._pending_sync_books = {(None, "book-a"), (2, "book-b"), (1, "book-a")}
+
+        from unittest.mock import patch
+        with patch("src.sync_manager.threading.Thread") as thread_cls:
+            mgr._dispatch_pending_syncs()
+
+        self.assertEqual(mgr._pending_sync_books, set())
+        self.assertEqual(thread_cls.call_count, 3)
 
 
 if __name__ == "__main__":

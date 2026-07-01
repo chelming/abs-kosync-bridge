@@ -117,9 +117,15 @@ class EbookParser:
             except StopIteration:
                 continue
 
-        for f in self.books_dir.rglob("*"):
-            if f.name == filename:
-                return f
+        for d in self.search_dirs():
+            try:
+                if not d.exists():
+                    continue
+            except OSError:
+                continue
+            for f in d.rglob("*"):
+                if f.name == filename:
+                    return f
 
         if self.epub_cache_dir.exists():
             cached_path = self.epub_cache_dir / filename
@@ -2108,9 +2114,12 @@ def resolve_ebook_identifiers(ebook_parser, book, booklore_client=None, bookorbi
         except Exception as exc:
             logger.warning("Local EPUB metadata read failed for '%s': %s", filename, exc)
 
-    # A local read that already has a precise id or an author is enough; skip the
-    # network round-trip (auto-match only runs once per book, but downloads aren't free).
-    if meta.get("isbn") or meta.get("asin") or meta.get("author"):
+    # A precise identifier (ISBN/ASIN) from the local read is enough — skip the
+    # network round-trip. An author alone is NOT precise: fall through to the
+    # library download to fetch the real ISBN, the exact precise-match path this
+    # resolver was built for. Auto-match runs once per book so the fetch is bounded,
+    # and non-library-hosted books still short-circuit at the source check below.
+    if meta.get("isbn") or meta.get("asin"):
         return meta
 
     source = (getattr(book, "ebook_source", None) or "").strip().lower()

@@ -258,10 +258,19 @@ class KOReaderDeviceSyncService:
             "abs-kosync-bridge",
         ):
             return False
+        # A real (non-internal) device is attached to this hash — it is in active
+        # use even at exactly 0% (freshly opened at the start of the book). A bare
+        # `doc.percentage > 0` test treats that 0% device as idle and lets the
+        # reconcile repoint off a hash the device is actively syncing. Only fall
+        # back to a progress signal when no device was recorded (a bare stub row).
+        if device or device_id:
+            return True
         try:
-            return bool(doc.percentage and float(doc.percentage) > 0)
+            if doc.percentage is not None and float(doc.percentage) > 0:
+                return True
         except (TypeError, ValueError):
-            return False
+            pass
+        return bool(str(getattr(doc, "progress", "") or "").strip())
 
     def _reconcile_stored_content_hash(self, book, stored_hash: str, content_hash: str) -> None:
         """Persist the served file's hash as the book's kosync_doc_id when it drifts.

@@ -233,9 +233,24 @@ class ClientPoller:
         if not sync_client or not sync_client.is_configured():
             return 0
 
+        # Per-user poll: restrict to the books this user actually claimed. The
+        # catalog is shared, so scanning every active book wastes a network call
+        # per book and — where two users share a client (same KoSync account) —
+        # lets a delta be attributed to whichever bundle observed it first. A
+        # global/None poll (single-user) keeps scanning everything.
+        linked_ids = None
+        if user_id is not None:
+            try:
+                linked_ids = self._db.get_linked_abs_ids(user_id)
+            except Exception as e:
+                logger.debug(f"ClientPoller: could not resolve linked books for user {user_id}: {e}")
+                linked_ids = None
+
         checked = 0
         for book in active_books:
             try:
+                if linked_ids is not None and book.abs_id not in linked_ids:
+                    continue
                 if hasattr(sync_client, "supports_book") and not sync_client.supports_book(book):
                     continue
                 current_state = sync_client.get_service_state(book, prev_state=None)

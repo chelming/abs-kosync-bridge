@@ -53,7 +53,10 @@ class StorytellerAPIClient:
         enabled_val = str(resolve_setting(self._creds, "STORYTELLER_ENABLED", "")).lower()
         if enabled_val == 'false':
             return False
-        return bool(self.username and self.password)
+        # A blank STORYTELLER_API_URL leaves base_url empty; without this guard the
+        # client reports configured and builds requests against an empty base URL
+        # instead of being cleanly skipped.
+        return bool(self.base_url and self.username and self.password)
 
     def _get_fresh_token(self) -> Optional[str]:
         if self._token and time.time() < self._token_expire_timestamp:

@@ -26,6 +26,14 @@ class TestUserDb(unittest.TestCase):
         self.assertEqual(self.svc.get_user_by_username("admin").id, u.id)
         self.assertEqual(self.svc.get_user_by_username("ADMIN").id, u.id)
 
+    def test_create_user_rejects_case_insensitive_duplicate(self):
+        # All lookups are case-insensitive; creating 'admin' after 'Admin' would
+        # make login/KoSync auth ambiguous, so it must be rejected.
+        self.svc.create_user("Admin", "secret", role="admin")
+        with self.assertRaises(ValueError):
+            self.svc.create_user("admin", "pw", role="user")
+        self.assertEqual(self.svc.count_users(), 1)
+
     def test_verify_credentials(self):
         self.svc.create_user("alice", "pw")
         self.assertIsNotNone(self.svc.verify_user_credentials("alice", "pw"))

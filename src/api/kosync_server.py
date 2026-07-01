@@ -53,7 +53,7 @@ _manifest_rebuild_event = threading.Event()
 _manifest_prebuilder_started = False
 
 # KoSync PUT debounce state
-_kosync_debounce: dict = {}  # {abs_id: {'last_event': float, 'title': str, 'synced': bool}}
+_kosync_debounce: dict = {}  # {(abs_id, user_id): {'last_event': float, 'title': str, 'synced': bool, 'user_id', 'abs_id'}}
 _kosync_debounce_lock = threading.Lock()
 _debounce_thread_started = False
 _kosync_open_sessions: dict = {}  # {session_key: session_dict}
@@ -263,6 +263,26 @@ def _get_koreader_device_sync_service():
         return None
 
 
+def _spawn_user_scoped_thread(target, args=(), user_id=None, name=None) -> None:
+    """Spawn a daemon thread that runs ``target`` with the KoSync device's user
+    bound as the ambient user.
+
+    contextvars are NOT inherited by newly-created threads, so a raw
+    ``threading.Thread`` running auto-discovery resolves ``get_current_user_id()``
+    to ``None`` on the worker and mis-attributes any ``save_book`` /
+    ``link_kosync_document`` to the default admin. Rebinding the id inside the
+    worker keeps the auto-created mapping owned by the reader who triggered it.
+    """
+    def runner():
+        token = set_current_user_id(user_id)
+        try:
+            target(*args)
+        finally:
+            reset_current_user_id(token)
+
+    threading.Thread(target=runner, daemon=True, name=name).start()
+
+
 def _record_kosync_event(abs_id: str, title: str, user_id=None) -> None:
     """Record a KoSync PUT event for debounced sync triggering.
 
@@ -270,11 +290,15 @@ def _record_kosync_event(abs_id: str, title: str, user_id=None) -> None:
     sync runs for that user only (a device PUT is one person's progress)."""
     global _debounce_thread_started
     with _kosync_debounce_lock:
-        _kosync_debounce[abs_id] = {
+        # Key by (abs_id, user_id): two users reading the same shared book must
+        # each get their own debounced sync — a bare abs_id key lets the second
+        # PUT overwrite the first, dropping that user's cross-service propagation.
+        _kosync_debounce[(abs_id, user_id)] = {
             'last_event': time.time(),
             'title': title,
             'synced': False,
             'user_id': user_id,
+            'abs_id': abs_id,
         }
     if not _debounce_thread_started:
         _debounce_thread_started = True
@@ -632,10 +656,10 @@ def _kosync_debounce_loop() -> None:
         to_sync = []
 
         with _kosync_debounce_lock:
-            for abs_id, info in _kosync_debounce.items():
+            for _key, info in _kosync_debounce.items():
                 if not info['synced'] and (now - info['last_event']) > debounce_seconds:
                     info['synced'] = True
-                    to_sync.append((abs_id, info['title'], info.get('user_id')))
+                    to_sync.append((info['abs_id'], info['title'], info.get('user_id')))
 
         for abs_id, title, user_id in to_sync:
             if _manager:
@@ -868,11 +892,15 @@ def kosync_get_progress(doc_id):
     if book:
         return _respond_from_book_states(doc_id, book)
 
-    # Step 3: Sibling hash resolution — find the book via other linked hashes
-    resolved_book = _resolve_book_by_sibling_hash(doc_id, existing_doc=kosync_doc)
-    if resolved_book:
-        _register_hash_for_book(doc_id, resolved_book)
-        return _respond_from_book_states(doc_id, resolved_book)
+    # Step 3: Sibling hash resolution — find the book via other linked hashes.
+    # Skip when a kosync_doc existed: Step 1 already ran this identical resolution
+    # (same doc_id/existing_doc) above with no intervening state change, so a
+    # second call is deterministically redundant.
+    if kosync_doc is None:
+        resolved_book = _resolve_book_by_sibling_hash(doc_id, existing_doc=kosync_doc)
+        if resolved_book:
+            _register_hash_for_book(doc_id, resolved_book)
+            return _respond_from_book_states(doc_id, resolved_book)
 
     # Step 4: Unknown hash — register stub and start background discovery
     auto_create = os.environ.get('AUTO_CREATE_EBOOK_MAPPING', 'true').lower() == 'true'
@@ -882,7 +910,12 @@ def kosync_get_progress(doc_id):
         stub = KD(document_hash=doc_id, user_id=getattr(g, "kosync_user_id", None))
         _database_service.save_kosync_document(stub)
         logger.info(f"🔍 KOSync: Created stub for unknown hash {doc_id}, starting background discovery")
-        threading.Thread(target=_run_get_auto_discovery, args=(doc_id,), daemon=True).start()
+        _spawn_user_scoped_thread(
+            _run_get_auto_discovery,
+            args=(doc_id,),
+            user_id=getattr(g, "kosync_user_id", None),
+            name=f"kosync-get-discovery-{doc_id[:8]}",
+        )
 
     logger.warning(
         f"⚠️ KOSync: Document not found: {doc_id} (GET from {request.remote_addr}). "
@@ -1381,7 +1414,12 @@ def kosync_put_progress():
                         if doc_hash_val in _active_scans:
                             _active_scans.remove(doc_hash_val)
 
-                threading.Thread(target=run_auto_discovery, args=(doc_hash,), daemon=True).start()
+                _spawn_user_scoped_thread(
+                    run_auto_discovery,
+                    args=(doc_hash,),
+                    user_id=request_user_id,
+                    name=f"kosync-put-discovery-{doc_hash[:8]}",
+                )
 
     if linked_book:
         # NOTE: We intentionally do NOT update book_states here.
@@ -1410,8 +1448,10 @@ def kosync_put_progress():
             # Internal writes (sync/reset flows) should cancel any pending user debounce
             # event for this book so we don't replay stale progress right after a reset.
             with _kosync_debounce_lock:
-                if linked_book.abs_id in _kosync_debounce:
-                    del _kosync_debounce[linked_book.abs_id]
+                cleared = [k for k in _kosync_debounce if k[0] == linked_book.abs_id]
+                for k in cleared:
+                    del _kosync_debounce[k]
+                if cleared:
                     logger.debug(f"KOSync PUT: Cleared pending debounce for internal update on '{linked_book.abs_title}'")
         if linked_book.status == 'active' and _manager and not is_internal and instant_sync_enabled:
             logger.debug(f"KOSync PUT: Progress event recorded for '{linked_book.abs_title}'")

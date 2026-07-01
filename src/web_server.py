@@ -455,12 +455,6 @@ _ADMIN_ONLY_ENDPOINTS = {
     'kosync_admin.api_delete_kosync_document',
 }
 
-# Phase II: admin-only endpoints a (global) setting can open up to regular users.
-# Endpoint stays admin-only unless its toggle is on. Default-off, so behavior is
-# unchanged until an admin opts in. Reuse the same pattern for future features.
-_USER_UNLOCKABLE_ENDPOINTS = {
-}
-
 
 def current_user():
     """Return the logged-in User for this request (cached on g), or None."""
@@ -686,14 +680,11 @@ def require_login_guard():
     # Scope this request to the user: their per-user settings (library id, enable
     # flags, search scope) and clients. Reset in teardown (threads are reused).
     _bind_request_user_context(user)
-    # Logged in — enforce admin-only areas, unless a per-feature toggle has opened
-    # this endpoint to regular users.
+    # Logged in — enforce admin-only areas.
     if endpoint in _ADMIN_ONLY_ENDPOINTS and not user.is_admin:
-        unlock_setting = _USER_UNLOCKABLE_ENDPOINTS.get(endpoint)
-        if not (unlock_setting and env_truthy(unlock_setting)):
-            if _request_wants_json():
-                return jsonify({"error": "admin access required"}), 403
-            return ("Forbidden: admin access required", 403)
+        if _request_wants_json():
+            return jsonify({"error": "admin access required"}), 403
+        return ("Forbidden: admin access required", 403)
     return None
 
 
@@ -813,10 +804,18 @@ def inject_csrf_script(response):
 def _bind_request_user_context(user):
     """Set the ambient per-user id + credentials for this request (reset in
     teardown). Tokens are stashed on g."""
+    from src.utils.user_config import _ALLOW_GLOBAL_FALLBACK_KEY
     try:
         creds = database_service.get_user_credentials(user.id) if database_service else {}
     except Exception:
         creds = {}
+    # Mark whether global (admin) env fallback is permitted. Without this flag,
+    # resolve_setting's `... is False` guard reads None on a non-admin's creds
+    # and silently falls back to the admin's global values (per-user leak). Only
+    # admins inherit the global config; regular users are isolated. This ambient
+    # dict is also what _spawn_user_background copies onto worker threads.
+    creds = dict(creds)
+    creds[_ALLOW_GLOBAL_FALLBACK_KEY] = bool(getattr(user, "is_admin", False))
     g._uctx_id_token = set_current_user_id(user.id)
     g._uctx_creds_token = set_current_user_credentials(creds)
 
@@ -845,6 +844,34 @@ def admin_required(f):
     return wrapper
 
 
+def _safe_next_url(default=None):
+    """Resolve the post-auth redirect target, allowing only same-site relative
+    paths. Absolute (`http://…`) and protocol-relative (`//host`, `/\\host`)
+    values are rejected to prevent an open redirect."""
+    fallback = default or url_for('index')
+    next_url = request.args.get('next') or fallback
+    if (
+        not next_url.startswith('/')
+        or next_url.startswith('//')
+        or next_url.startswith('/\\')
+    ):
+        return fallback
+    return next_url
+
+
+def _establish_session_and_redirect(user):
+    """Set up an authenticated session for `user` and redirect to a safe next."""
+    session['user_id'] = user.id
+    session['username'] = user.username
+    session['role'] = user.role
+    session.permanent = True
+    try:
+        database_service.touch_user_login(user.id)
+    except Exception:
+        pass
+    return redirect(_safe_next_url())
+
+
 def login():
     """Render/handle the login form."""
     if database_service is not None:
@@ -864,19 +891,7 @@ def login():
         if database_service is not None:
             user = database_service.verify_user_credentials(username, password)
         if user:
-            session['user_id'] = user.id
-            session['username'] = user.username
-            session['role'] = user.role
-            session.permanent = True
-            try:
-                database_service.touch_user_login(user.id)
-            except Exception:
-                pass
-            next_url = request.args.get('next') or url_for('index')
-            # Only allow relative redirects (avoid open-redirect).
-            if not next_url.startswith('/'):
-                next_url = url_for('index')
-            return redirect(next_url)
+            return _establish_session_and_redirect(user)
         error = "Invalid username or password"
         logger.warning("Failed login attempt for username '%s' from %s", username, request.remote_addr)
 
@@ -911,18 +926,7 @@ def setup():
                 from src.db.user_bootstrap import create_initial_admin_user
                 user, _counts = create_initial_admin_user(database_service, username, password)
                 session.clear()
-                session['user_id'] = user.id
-                session['username'] = user.username
-                session['role'] = user.role
-                session.permanent = True
-                try:
-                    database_service.touch_user_login(user.id)
-                except Exception:
-                    pass
-                next_url = request.args.get('next') or url_for('index')
-                if not next_url.startswith('/'):
-                    next_url = url_for('index')
-                return redirect(next_url)
+                return _establish_session_and_redirect(user)
             except ValueError:
                 return redirect(url_for('login'))
             except Exception as e:
