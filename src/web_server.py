@@ -2726,6 +2726,7 @@ def settings():
             'KOSYNC_USE_PERCENTAGE_FROM_SERVER',
             'KOSYNC_AUTO_MAP_ON_AGREEMENT',
             'KOREADER_ANNOTATION_SYNC',
+            'SYNC_FRESHNESS_GUARDS',
             'SYNC_ABS_EBOOK',
             'XPATH_FALLBACK_TO_PREVIOUS_SEGMENT',
             'KOSYNC_ENABLED',

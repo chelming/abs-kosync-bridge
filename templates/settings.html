@@ -1578,6 +1578,22 @@
                         <small>Idle gap that splits KOReader page events into separate reading sessions on the stats page.</small>
                     </div>
                     <div class="checkbox-wrapper full-width">
+                        <input type="checkbox" id="sync_freshness_guards" name="SYNC_FRESHNESS_GUARDS" {% if
+                            get_bool('SYNC_FRESHNESS_GUARDS') %}checked{% endif %}>
+                        <label for="sync_freshness_guards">Freshness Guards (recommended)</label>
+                        <div class="help-text">Use each service's own "position last changed" timestamp to (1) ignore
+                            stale re-readings that pretend to be fresh movement and (2) block a client that is
+                            materially behind a much newer position from rolling everyone back. Disable only to
+                            restore pure percentage-delta leader selection.</div>
+                    </div>
+                    <div class="form-group">
+                        <label>Rollback Veto Tolerance (Seconds)</label>
+                        <input type="number" min="0" name="SYNC_ROLLBACK_VETO_SECONDS"
+                            value="{{ get_val('SYNC_ROLLBACK_VETO_SECONDS') or '600' }}">
+                        <small>A behind client is only vetoed when the peer's position is at least this much newer —
+                            keep generous to absorb clock differences between services.</small>
+                    </div>
+                    <div class="checkbox-wrapper full-width">
                         <input type="checkbox" id="xpath_fallback" name="XPATH_FALLBACK_TO_PREVIOUS_SEGMENT" {% if
                             get_bool('XPATH_FALLBACK_TO_PREVIOUS_SEGMENT') %}checked{% endif %}>
                         <label for="xpath_fallback">XPath Fallback (Try previous segment if match fails)</label>

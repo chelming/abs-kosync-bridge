@@ -282,6 +282,22 @@ class SyncManager:
             return None
         return self.active_audio_source_adapters.get(source)
 
+    @staticmethod
+    def _freshness_guards_enabled() -> bool:
+        """Kill switch for the Phase 2 freshness guards (staleness suppression +
+        rollback veto). Read per call so the settings UI applies immediately."""
+        return os.environ.get("SYNC_FRESHNESS_GUARDS", "true").strip().lower() in ("true", "1", "yes", "on")
+
+    @staticmethod
+    def _rollback_veto_tolerance_seconds() -> float:
+        """How much newer a peer's service timestamp must be before a behind
+        candidate is vetoed. Generous by default to absorb clock skew between
+        services — this is a veto threshold, not an arbitration signal."""
+        try:
+            return float(os.environ.get("SYNC_ROLLBACK_VETO_SECONDS", "600") or 600)
+        except (TypeError, ValueError):
+            return 600.0
+
     def _build_text_anchors(self, full_text: str, char_offset: int):
         if not full_text:
             return "", "", ""
@@ -868,6 +884,15 @@ class SyncManager:
                 try:
                     state = future.result()
                     if state is not None:
+                        # Stamp the previously persisted service timestamp so the
+                        # freshness guards can ask "does the service itself say the
+                        # position changed since we last saved it?" — a same-clock
+                        # comparison, immune to cross-service clock skew. Private
+                        # key: excluded from locator_json persistence.
+                        prev_state = prev_states_by_client.get(client_name.lower())
+                        state.current['_service_prev_updated_at'] = getattr(
+                            prev_state, 'service_updated_at', None
+                        )
                         config[client_name] = state
                 except Exception as e:
                     logger.warning(f"⚠️ '{client_name}' state fetch failed: {e}")
@@ -2059,6 +2084,57 @@ class SyncManager:
                 )
                 vals[client_name] = locator_pct
                 clients_with_delta.pop(client_name, None)
+
+        # Freshness guards (rich progress metadata, Phase 2). Both only shrink
+        # the candidate set — a guarded client still participates as a follower
+        # and in furthest-wins fallbacks — and both no-op without timestamps.
+        if self._freshness_guards_enabled():
+            # Guard 1 — staleness suppression: the service's own clock says this
+            # position hasn't changed since we last persisted it, so the "delta"
+            # is a stale value re-surfacing (e.g. a static sibling-hash reading),
+            # not fresh movement. Same-clock comparison; skew-free.
+            for client_name in list(clients_with_delta.keys()):
+                current = config[client_name].current
+                fresh_ts = current.get('service_updated_at')
+                prev_ts = current.get('_service_prev_updated_at')
+                if fresh_ts is None or prev_ts is None:
+                    continue
+                if fresh_ts <= prev_ts:
+                    logger.info(
+                        f"⏸️ '{abs_id}' '{title_snip}' Suppressing '{client_name}' delta: "
+                        f"service reports no position change since last sync "
+                        f"(service_updated_at unchanged at {fresh_ts:.0f})"
+                    )
+                    clients_with_delta.pop(client_name, None)
+
+            # Guard 2 — rollback veto: a candidate sitting materially BEHIND a
+            # peer whose position the service stamped materially NEWER cannot
+            # lead (it would roll the true position back). The generous time
+            # tolerance absorbs cross-service clock skew; a genuine re-read has
+            # a fresh timestamp and passes. Forward movement is never vetoed.
+            veto_tolerance = self._rollback_veto_tolerance_seconds()
+            regression_margin = getattr(self, "sync_delta_between_clients", 0.005)
+            for client_name in list(clients_with_delta.keys()):
+                candidate_pct = vals.get(client_name)
+                candidate_ts = config[client_name].current.get('service_updated_at')
+                if candidate_pct is None or candidate_ts is None:
+                    continue
+                for other_name, other_pct in vals.items():
+                    if other_name == client_name or other_pct is None:
+                        continue
+                    other_ts = config[other_name].current.get('service_updated_at')
+                    if other_ts is None:
+                        continue
+                    if (other_pct > candidate_pct + regression_margin
+                            and (other_ts - candidate_ts) > veto_tolerance):
+                        logger.info(
+                            f"🛑 '{abs_id}' '{title_snip}' Rollback veto: '{client_name}' "
+                            f"({candidate_pct:.2%}) is behind '{other_name}' ({other_pct:.2%}) "
+                            f"whose position is {other_ts - candidate_ts:.0f}s newer "
+                            f"(> {veto_tolerance:.0f}s tolerance) — not eligible to lead"
+                        )
+                        clients_with_delta.pop(client_name, None)
+                        break
 
         leader = None
         leader_pct = None
