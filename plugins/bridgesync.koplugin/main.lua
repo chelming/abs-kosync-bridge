@@ -2017,7 +2017,10 @@ function BridgeSync:_captureAnnotationsOnClose()
                 if not captured.hash then
                     return nil, "no hash"
                 end
-                return BridgeAnnotations.exchangeBooks(self, { captured })
+                -- upload_only: push this session's highlights on close; received
+                -- changes for the just-closed book are applied by the next
+                -- periodic sync, not a sidecar write that races KOReader's flush.
+                return BridgeAnnotations.exchangeBooks(self, { captured }, { upload_only = true })
             end)
             self.annotation_close_sync_in_flight = false
             if run_ok and type(result) == "table" then

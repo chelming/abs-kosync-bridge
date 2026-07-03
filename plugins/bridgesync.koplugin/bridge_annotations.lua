@@ -238,7 +238,7 @@ end
 -- keys_complete=false marks the key list as non-authoritative for deletion
 -- detection (the sweep uses this — a backfill must never delete server data
 -- just because a sidecar was momentarily empty/partial).
-function BridgeAnnotations.buildBookPayload(book, watermark, keys_complete)
+function BridgeAnnotations.buildBookPayload(book, watermark, keys_complete, ignore_watermark)
     local keys, changes = {}, {}
     local max_seen = ""
     for _, raw in ipairs(book.annotations or {}) do
@@ -247,7 +247,10 @@ function BridgeAnnotations.buildBookPayload(book, watermark, keys_complete)
             table.insert(keys, { k = BridgeAnnotations.buildKey(entry.datetime, entry.pos0), dt = entry.datetime })
             local stamp = entryTimestamp(entry)
             if stamp > max_seen then max_seen = stamp end
-            if stamp > (watermark or "") and #changes < MAX_CHANGES_PER_BOOK then
+            -- ignore_watermark: the sweep re-uploads EVERYTHING so a device whose
+            -- watermark drifted ahead of the server (e.g. server data was reset)
+            -- can resync its whole back-catalogue.
+            if (ignore_watermark or stamp > (watermark or "")) and #changes < MAX_CHANGES_PER_BOOK then
                 table.insert(changes, entry)
             end
         end
@@ -327,9 +330,105 @@ function BridgeAnnotations.applyToSidecar(book, to_apply)
     if changed then
         doc_settings:saveSetting("annotations", annotations)
         -- The KOHighlights-compatible flag: KOReader re-validates, re-sorts and
-        -- re-pages external annotation edits on the next open.
-        doc_settings:saveSetting("annotations_externally_modified", true)
+        -- re-pages external annotation edits on the next open. makeTrue mirrors
+        -- the reference plugins (a plain saveSetting(...,true) also works, but
+        -- makeTrue is the documented idiom for boolean flags).
+        if type(doc_settings.makeTrue) == "function" then
+            doc_settings:makeTrue("annotations_externally_modified")
+        else
+            doc_settings:saveSetting("annotations_externally_modified", true)
+        end
         doc_settings:flush()
+    end
+    return applied, deleted
+end
+
+-- Apply server changes into the CURRENTLY-OPEN book's live annotation list via
+-- KOReader's own annotation module, so they render immediately AND persist
+-- through KOReader's own close-flush (writing the sidecar directly races that
+-- flush and loses — the bug this replaces). The book must be the open one.
+function BridgeAnnotations.applyLive(to_apply)
+    local ok_rui, ReaderUI = pcall(require, "apps/reader/readerui")
+    if not ok_rui or not ReaderUI or not ReaderUI.instance then
+        return nil  -- no open book; caller falls back to sidecar/defer
+    end
+    local ui = ReaderUI.instance
+    if not ui.annotation or type(ui.annotation.annotations) ~= "table"
+        or not ui.document or not ui.rolling then
+        return nil
+    end
+    local Event = require("ui/event")
+    local UIManager = require("ui/uimanager")
+    local annotations = ui.annotation.annotations
+
+    local applied, deleted = {}, {}
+    local touched = 0
+
+    local function resolves(pos)
+        if type(pos) ~= "string" or pos == "" then return false end
+        local ok, inside = pcall(function() return ui.document:isXPointerInDocument(pos) end)
+        -- Treat "unknown" (call failed) as resolvable — don't drop on a probe error.
+        return (not ok) or inside ~= false
+    end
+
+    for _, entry in ipairs(to_apply.add or {}) do
+        if findByDatetime(annotations, entry.datetime) then
+            table.insert(applied, { serverId = entry.serverId, version = entry.version, status = "applied" })
+        elseif entry.posFormat == "xpointer" and resolves(entry.pos0) then
+            local item = {
+                datetime = entry.datetime,
+                datetime_updated = entry.datetimeUpdated,
+                drawer = entry.drawer or "lighten",
+                color = entry.color,
+                text = entry.text,
+                note = entry.note,
+                chapter = entry.chapter,
+                page = entry.pos0,
+                pos0 = entry.pos0,
+                pos1 = entry.pos1,
+            }
+            local ok_add = pcall(function() ui.annotation:addItem(item) end)
+            if ok_add then
+                pcall(function()
+                    ui:handleEvent(Event:new("AnnotationsModified", { item, nb_highlights_added = 1 }))
+                end)
+                touched = touched + 1
+                table.insert(applied, { serverId = entry.serverId, version = entry.version, status = "applied" })
+            end
+            -- unresolvable / failed add: do NOT ack, so it retries later
+        end
+    end
+
+    for _, entry in ipairs(to_apply.edit or {}) do
+        local idx = findByDatetime(annotations, entry.datetime)
+        if idx then
+            local a = annotations[idx]
+            a.drawer = entry.drawer or a.drawer
+            a.color = entry.color or a.color
+            if entry.text and entry.text ~= "" then a.text = entry.text end
+            a.note = entry.note
+            if entry.chapter then a.chapter = entry.chapter end
+            if entry.datetimeUpdated then a.datetime_updated = entry.datetimeUpdated end
+            pcall(function()
+                ui:handleEvent(Event:new("AnnotationsModified", { a, index_modified = idx }))
+            end)
+            touched = touched + 1
+        end
+        -- Ack edits either way so a missing target doesn't loop forever.
+        table.insert(applied, { serverId = entry.serverId, version = entry.version, status = "applied" })
+    end
+
+    for _, entry in ipairs(to_apply.delete or {}) do
+        local idx = findByDatetime(annotations, entry.datetime)
+        if idx and ui.bookmark and type(ui.bookmark.removeItemByIndex) == "function" then
+            pcall(function() ui.bookmark:removeItemByIndex(idx) end)
+            touched = touched + 1
+        end
+        table.insert(deleted, { serverId = entry.serverId, status = "applied" })
+    end
+
+    if touched > 0 then
+        pcall(function() UIManager:setDirty("all", "ui") end)
     end
     return applied, deleted
 end
@@ -349,6 +448,7 @@ function BridgeAnnotations.exchangeBooks(bridge, books, opts)
     opts = opts or {}
     local keys_complete = opts.keys_complete
     if keys_complete == nil then keys_complete = true end
+    local ignore_watermark = opts.ignore_watermark
     local device, device_id = bridge:_currentDeviceIdentity()
     local watermarks = bridge.state:readSetting("annotation_watermarks") or {}
 
@@ -364,7 +464,7 @@ function BridgeAnnotations.exchangeBooks(bridge, books, opts)
         -- future watermark would swallow every new highlight forever.
         local watermark = watermarks[book.hash] or ""
         if watermark > deviceNow() then watermark = "" end
-        local book_payload, max_seen = BridgeAnnotations.buildBookPayload(book, watermark, keys_complete)
+        local book_payload, max_seen = BridgeAnnotations.buildBookPayload(book, watermark, keys_complete, ignore_watermark)
         max_seen_by_hash[book.hash] = max_seen
         uploaded = uploaded + #book_payload.changes
         table.insert(payload_books, book_payload)
@@ -408,18 +508,34 @@ function BridgeAnnotations.exchangeBooks(bridge, books, opts)
         local to_apply = result.toApply or {}
         local pending = #(to_apply.add or {}) + #(to_apply.edit or {}) + #(to_apply.delete or {})
         if book and pending > 0 then
-            if book.live then
-                bridge:logInfo("Annotation sync: book is open, deferring", tostring(pending), "server change(s)")
+            local applied, deleted
+            if opts.upload_only then
+                -- Close snapshot: only push this session's highlights. Received
+                -- changes for the just-closed book are applied by the next
+                -- periodic sync (its live/closed path), never a sidecar write
+                -- that races KOReader's own close-flush.
+                bridge:logInfo("Annotation sync: close snapshot, deferring", tostring(pending), "server change(s)")
+            elseif book.live then
+                -- Open book: apply into KOReader's live list (instant + survives
+                -- the close-flush). If the reader vanished mid-cycle, leave it
+                -- for the next round rather than racing the sidecar.
+                applied, deleted = BridgeAnnotations.applyLive(to_apply)
+                if applied == nil then
+                    bridge:logInfo("Annotation sync: open book but no live reader, deferring", tostring(pending))
+                end
             else
-                local ok_apply, applied, deleted = pcall(BridgeAnnotations.applyToSidecar, book, to_apply)
+                local ok_apply, a, d = pcall(BridgeAnnotations.applyToSidecar, book, to_apply)
                 if ok_apply then
-                    applied_total = applied_total + #applied
-                    deleted_total = deleted_total + #deleted
-                    if #applied > 0 or #deleted > 0 then
-                        table.insert(ack_books, { hash = result.hash, applied = applied, deleted = deleted })
-                    end
+                    applied, deleted = a, d
                 else
-                    bridge:logWarn("Annotation sync: sidecar apply failed:", tostring(applied))
+                    bridge:logWarn("Annotation sync: sidecar apply failed:", tostring(a))
+                end
+            end
+            if applied or deleted then
+                applied_total = applied_total + #(applied or {})
+                deleted_total = deleted_total + #(deleted or {})
+                if (applied and #applied > 0) or (deleted and #deleted > 0) then
+                    table.insert(ack_books, { hash = result.hash, applied = applied or {}, deleted = deleted or {} })
                 end
             end
         end
