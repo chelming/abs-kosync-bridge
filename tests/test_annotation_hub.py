@@ -316,6 +316,124 @@ class TestBookOrbitSpokeDb(AnnotationHubBase):
         self.assertEqual(len(state["pending_delete_acks"]), 1)
 
 
+class TestLossyPositionSpokeDb(AnnotationHubBase):
+    """Grimmory-style spokes (trust_positions=False): CFI round-trips never
+    reproduce the device's xpointer serialization, so a pull echo must not
+    rewrite canonical identity — that made the device's next complete key
+    list look like a deletion and tombstoned the row everywhere."""
+
+    BOOKLORE_KW = dict(
+        server_id_field="booklore_server_id",
+        version_field="booklore_version",
+        synced_at_field="booklore_synced_at",
+    )
+
+    def _echo(self, server_id=501, **kw):
+        # What _entry_from_booklore_annotation produces for an annotation the
+        # bridge itself pushed: Grimmory's createdAt as datetime and a
+        # reconstructed (mangled) xpointer — both differ from the canonical row.
+        return dict(_entry(
+            datetime="2026-07-01 10:05:09",
+            pos0="/body/DocFragment[7]/p[3]/text().1",
+            pos1="/body/DocFragment[7]/p[3]/text().41",
+        ), serverId=server_id, version=1, **kw)
+
+    def _seed_device_annotation(self):
+        change = _entry()
+        self.db.exchange_koreader_annotations(
+            user_id=None, device_key="kobo",
+            books=[_book(changes=[change], keys=_keys_for(self.db, [change]))],
+        )
+        state = self.db.get_annotation_spoke_state(
+            None, DOC, "@booklore",
+            server_id_field="booklore_server_id", version_field="booklore_version",
+        )
+        ann_id = state["changes"][0]["_id"]
+        self.db.mark_spoke_annotations_uploaded(
+            None, "@booklore", [ann_id],
+            server_ids_by_annotation_id={str(ann_id): 501},
+            **self.BOOKLORE_KW,
+        )
+        return change, ann_id
+
+    def _fresh_device_adds(self):
+        result = self.db.exchange_koreader_annotations(
+            user_id=None, device_key="fresh", books=[_book()],
+        )
+        return result["books"][0]["toApply"]["add"]
+
+    def test_pull_echo_preserves_identity_key(self):
+        change, _ = self._seed_device_annotation()
+        self.db.apply_spoke_annotations(
+            None, DOC, "@booklore",
+            adds=[self._echo()], edits=[], deletes=[],
+            trust_positions=False, **self.BOOKLORE_KW,
+        )
+        # The originating device syncs with its complete key list — the echo
+        # must not have rewritten the key, or this tombstones the row.
+        self.db.exchange_koreader_annotations(
+            user_id=None, device_key="kobo",
+            books=[_book(keys=_keys_for(self.db, [change]))],
+        )
+        adds = self._fresh_device_adds()
+        self.assertEqual(len(adds), 1)
+        self.assertEqual(adds[0]["pos0"], change["pos0"])
+        self.assertEqual(adds[0]["datetime"], change["datetime"])
+        self.assertEqual(adds[0]["version"], 1)  # echo is not an edit
+
+    def test_remote_note_edit_merges_content_only(self):
+        change, _ = self._seed_device_annotation()
+        self.db.apply_spoke_annotations(
+            None, DOC, "@booklore",
+            adds=[self._echo(note="from grimmory")], edits=[], deletes=[],
+            trust_positions=False, **self.BOOKLORE_KW,
+        )
+        adds = self._fresh_device_adds()
+        self.assertEqual(len(adds), 1)
+        self.assertEqual(adds[0]["note"], "from grimmory")
+        self.assertEqual(adds[0]["version"], 2)
+        # position and identity stay canonical
+        self.assertEqual(adds[0]["pos0"], change["pos0"])
+        self.assertEqual(adds[0]["datetime"], change["datetime"])
+
+    def test_unrecorded_server_id_matches_by_text(self):
+        # Server id never recorded (e.g. restart mid-push): the echo must
+        # attach by text-within-fragment instead of creating a duplicate.
+        change = _entry()
+        self.db.exchange_koreader_annotations(
+            user_id=None, device_key="kobo",
+            books=[_book(changes=[change], keys=_keys_for(self.db, [change]))],
+        )
+        self.db.apply_spoke_annotations(
+            None, DOC, "@booklore",
+            adds=[self._echo(server_id=777)], edits=[], deletes=[],
+            trust_positions=False, **self.BOOKLORE_KW,
+        )
+        adds = self._fresh_device_adds()
+        self.assertEqual(len(adds), 1)
+        self.assertEqual(adds[0]["pos0"], change["pos0"])
+
+    def test_stale_echo_does_not_revive_tombstone(self):
+        self._seed_device_annotation()
+        # kobo deletes the highlight (complete empty key list)
+        self.db.exchange_koreader_annotations(
+            user_id=None, device_key="kobo", books=[_book(keys=[], keys_complete=True)],
+        )
+        # Grimmory still echoes its copy — the remote delete hasn't run yet
+        self.db.apply_spoke_annotations(
+            None, DOC, "@booklore",
+            adds=[self._echo()], edits=[], deletes=[],
+            trust_positions=False, **self.BOOKLORE_KW,
+        )
+        self.assertEqual(self._fresh_device_adds(), [])
+        state = self.db.get_annotation_spoke_state(
+            None, DOC, "@booklore",
+            server_id_field="booklore_server_id", version_field="booklore_version",
+        )
+        self.assertEqual(len(state["pending_deletes"]), 1)
+        self.assertEqual(state["pending_deletes"][0]["serverId"], 501)
+
+
 class TestAnnotationSyncService(unittest.TestCase):
     def _service_with_db(self, db):
         from src.services.annotation_sync_service import AnnotationSyncService

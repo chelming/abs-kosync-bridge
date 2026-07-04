@@ -6,6 +6,7 @@ Direct model-based interface without dictionary conversions.
 import json
 import logging
 import os
+import re
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1872,6 +1873,34 @@ class DatabaseService:
         return False
 
     @staticmethod
+    def _doc_fragment_index(pos0) -> Optional[int]:
+        match = re.search(r"/DocFragment\[(\d+)\]", str(pos0 or ""))
+        return int(match.group(1)) if match else None
+
+    def _match_spoke_row_by_content(self, session, user_id, doc_md5: str, fields: dict) -> Optional[KoreaderAnnotation]:
+        """Fallback identity match for lossy-position spokes: a CFI round-trip
+        never reproduces the device's xpointer serialization, so ann_key
+        lookups miss. Match by the highlighted text within the same
+        DocFragment instead — only when the match is unambiguous."""
+        text = fields.get("text")
+        if not text:
+            return None
+        candidates = (
+            session.query(KoreaderAnnotation)
+            .filter(
+                KoreaderAnnotation.md5 == doc_md5,
+                KoreaderAnnotation.user_id == user_id,
+                KoreaderAnnotation.deleted == False,  # noqa: E712
+                KoreaderAnnotation.text == text,
+            )
+            .all()
+        )
+        fragment = self._doc_fragment_index(fields.get("pos0"))
+        if fragment is not None:
+            candidates = [r for r in candidates if self._doc_fragment_index(r.pos0) == fragment]
+        return candidates[0] if len(candidates) == 1 else None
+
+    @staticmethod
     def _annotation_response_entry(row: KoreaderAnnotation) -> dict:
         return {
             "serverId": row.id,
@@ -2169,8 +2198,19 @@ class DatabaseService:
                                 adds: list[dict], edits: list[dict], deletes: list[dict],
                                 server_id_field: str = "bookorbit_server_id",
                                 version_field: str = "bookorbit_version",
-                                synced_at_field: str = "bookorbit_synced_at") -> dict:
+                                synced_at_field: str = "bookorbit_synced_at",
+                                trust_positions: bool = True) -> dict:
         """Apply a spoke's (e.g. BookOrbit's) toApply delta into the canonical store.
+
+        ``trust_positions=False`` is for spokes whose positions are lossy
+        projections (Grimmory converts xpointer<->CFI, so a pulled pos0 never
+        matches the device's serialization byte-for-byte). For those, a pull
+        must never rewrite a matched row's identity (datetime/pos0/pos1/
+        ann_key) — rewriting the key makes the device's next complete key list
+        look like a deletion and the row gets tombstoned everywhere. Only the
+        spoke-editable content (note/color/drawer) is merged, unmatched rows
+        fall back to a text-within-fragment match before creating anything,
+        and tombstoned rows are never revived by a stale remote echo.
 
         Returns the ack payload data: applied [{serverId, version}] and deleted
         [{serverId}] to report back to the spoke."""
@@ -2208,6 +2248,14 @@ class DatabaseService:
                         )
                         .first()
                     )
+                if row is None and not trust_positions:
+                    row = self._match_spoke_row_by_content(session, user_id, doc_md5, fields)
+
+                if row is not None and row.deleted and not trust_positions:
+                    # Stale remote echo of a locally tombstoned annotation —
+                    # never revive through a lossy spoke; the push loop deletes
+                    # the remote copy instead.
+                    continue
 
                 if row is None:
                     row = KoreaderAnnotation(
@@ -2229,14 +2277,28 @@ class DatabaseService:
                     if row.deleted:
                         row.deleted = False
                         row.deleted_at = None
-                    if self._annotation_content_differs(row, fields):
-                        for key, value in fields.items():
-                            setattr(row, key, value)
-                        row.source_device = spoke_key
-                        row.version = int(row.version or 1) + 1
-                        row.updated_at = utcnow()
-                    # The ann_key follows pos0 edits so device key lists stay consistent.
-                    row.ann_key = ann_key
+                    if trust_positions:
+                        if self._annotation_content_differs(row, fields):
+                            for key, value in fields.items():
+                                setattr(row, key, value)
+                            row.source_device = spoke_key
+                            row.version = int(row.version or 1) + 1
+                            row.updated_at = utcnow()
+                        # The ann_key follows pos0 edits so device key lists stay consistent.
+                        row.ann_key = ann_key
+                    else:
+                        # Identity (datetime/pos0/pos1/ann_key) stays canonical:
+                        # the spoke's round-tripped position is a lossy
+                        # projection, not an edit. Merge only what the spoke
+                        # can legitimately change.
+                        content_keys = ("drawer", "color", "note")
+                        if any(getattr(row, key) != fields.get(key) for key in content_keys):
+                            for key in content_keys:
+                                setattr(row, key, fields.get(key))
+                            row.datetime_updated = fields.get("datetime_updated") or row.datetime_updated
+                            row.source_device = spoke_key
+                            row.version = int(row.version or 1) + 1
+                            row.updated_at = utcnow()
                     self._set_device_state(session, row.id, spoke_key, acked_version=row.version)
                 applied_acks.append({
                     "serverId": int(spoke_id),

@@ -591,6 +591,9 @@ class AnnotationSyncService:
                 server_id_field="booklore_server_id",
                 version_field="booklore_version",
                 synced_at_field="booklore_synced_at",
+                # Grimmory positions are CFI round-trips — never let a pull
+                # rewrite canonical identity (the ann_key cascade bug).
+                trust_positions=False,
             )
         return bool(uploaded_ids or tombstone_acks or adds or deletes)
 
