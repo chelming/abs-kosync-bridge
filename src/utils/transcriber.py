@@ -426,6 +426,9 @@ class AudioTranscriber:
 
         MAX_DURATION_SECONDS = 45 * 60
 
+        provider = get_transcription_provider()
+        raw_audio = getattr(provider, 'supports_raw_audio', False)
+
         downloaded_files = []
         full_transcript = []
         chunks_completed = 0
@@ -481,38 +484,48 @@ class AudioTranscriber:
                     book_cache_dir.mkdir(parents=True, exist_ok=True)
                     downloaded_files = []
 
-                    logger.info(f"📥 Phase 1: Downloading {len(audio_urls)} audio files...")
+                    logger.info(f"📥 Phase 1: {'Queuing' if raw_audio else 'Downloading'} {len(audio_urls)} audio file(s)...")
                     for idx, audio_data in enumerate(audio_urls):
                         raise_if_cancelled()
                         stream_url = audio_data.get('stream_url')
                         local_source_path = audio_data.get('local_path')
                         extension = audio_data.get('ext', '.mp3')
                         if not extension.startswith('.'): extension = f".{extension}"
-                        local_path = book_cache_dir / f"part_{idx:03d}{extension}"
 
-                        if local_source_path:
-                            logger.info(f"   Copying Part {idx + 1}/{len(audio_urls)} from local cache...")
-                            shutil.copy2(local_source_path, local_path)
+                        if raw_audio:
+                            # Raw-audio provider: pass the original source through — no
+                            # WAV normalization or local splitting; the server decodes
+                            # and chunks the audio itself.
+                            source = local_source_path or stream_url
+                            if not source:
+                                raise ValueError(f"No source URL or local path for part {idx + 1}")
+                            downloaded_files.append(source)
+                            logger.info(f"   Part {idx + 1}/{len(audio_urls)}: {'local' if local_source_path else 'stream'} → sent as-is to provider")
                         else:
-                            logger.info(f"   Downloading Part {idx + 1}/{len(audio_urls)}...")
-                            with requests.get(stream_url, stream=True, timeout=300) as r:
-                                r.raise_for_status()
-                                with open(local_path, 'wb') as f:
-                                    for chunk in r.iter_content(chunk_size=8192):
-                                        raise_if_cancelled()
-                                        f.write(chunk)
+                            local_path = book_cache_dir / f"part_{idx:03d}{extension}"
+                            if local_source_path:
+                                logger.info(f"   Copying Part {idx + 1}/{len(audio_urls)} from local cache...")
+                                shutil.copy2(local_source_path, local_path)
+                            else:
+                                logger.info(f"   Downloading Part {idx + 1}/{len(audio_urls)}...")
+                                with requests.get(stream_url, stream=True, timeout=300) as r:
+                                    r.raise_for_status()
+                                    with open(local_path, 'wb') as f:
+                                        for chunk in r.iter_content(chunk_size=8192):
+                                            raise_if_cancelled()
+                                            f.write(chunk)
 
-                        if not local_path.exists() or local_path.stat().st_size == 0:
-                            raise ValueError(f"File {local_path} is empty or missing.")
+                            if not local_path.exists() or local_path.stat().st_size == 0:
+                                raise ValueError(f"File {local_path} is empty or missing.")
 
-                        # Normalize to WAV
-                        raise_if_cancelled()
-                        normalized_path = self.normalize_audio_to_wav(local_path)
-                        if not normalized_path:
-                            raise ValueError(f"Normalization failed for part {idx+1}")
+                            # Normalize to WAV
+                            raise_if_cancelled()
+                            normalized_path = self.normalize_audio_to_wav(local_path)
+                            if not normalized_path:
+                                raise ValueError(f"Normalization failed for part {idx+1}")
 
-                        # Split if needed
-                        downloaded_files.extend(self.split_audio_file(normalized_path, MAX_DURATION_SECONDS))
+                            # Split if needed
+                            downloaded_files.extend(self.split_audio_file(normalized_path, MAX_DURATION_SECONDS))
 
                     if not downloaded_files:
                         raise ValueError("No audio files were successfully downloaded and normalized")
@@ -522,7 +535,6 @@ class AudioTranscriber:
 
             # Phase 2: Transcribe
             logger.info(f"✅ All parts cached. Starting transcription ({len(downloaded_files)} chunks)...")
-            provider = get_transcription_provider()
             logger.info(f"🧠 Phase 2: Transcribing using {provider.get_name()}...")
 
             total_chunks = len(downloaded_files)
