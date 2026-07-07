@@ -920,7 +920,7 @@ def kosync_get_progress(doc_id):
     logger.warning(
         f"⚠️ KOSync: Document not found: {doc_id} (GET from {request.remote_addr}). "
         "If auto-discovery can't match it (e.g. the device's copy isn't byte-identical to "
-        "the library file), link it manually in Settings → KOSync Documents, or re-deliver "
+        "the library file), link it manually from the dashboard KOSync Documents button, or re-deliver "
         "the book via the BridgeSync plugin's 'Sync books' so the hash matches."
     )
     return jsonify({"message": "Document not found on server"}), 502
