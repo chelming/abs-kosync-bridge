@@ -8443,17 +8443,27 @@ def _test_storyteller(enabled: bool, url: str, user: str, pwd: str) -> dict:
         return {"ok": False, "message": "Storyteller is disabled"}
     if not url or not user or not pwd:
         return {"ok": False, "message": "Missing URL, username, or password"}
-    r = requests.post(
-        f"{url}/api/token",
-        data={"username": user, "password": pwd},
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-        timeout=10,
-    )
-    if r.status_code == 200:
-        return {"ok": True, "message": "Authenticated successfully"}
-    if r.status_code in (401, 403, 422):
+    responses = []
+    for endpoint, payload in (
+        ("/api/v2/token", {"usernameOrEmail": user, "password": pwd}),
+        ("/api/token", {"username": user, "password": pwd}),
+    ):
+        r = requests.post(
+            f"{url}{endpoint}",
+            data=payload,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=10,
+        )
+        responses.append(r.status_code)
+        if r.status_code == 200:
+            return {"ok": True, "message": "Authenticated successfully"}
+        if r.status_code in (401, 403):
+            return {"ok": False, "message": "Invalid username or password"}
+        if r.status_code not in (400, 404, 405, 422):
+            break
+    if any(status == 422 for status in responses):
         return {"ok": False, "message": "Invalid username or password"}
-    return {"ok": False, "message": f"Login returned {r.status_code}"}
+    return {"ok": False, "message": f"Login returned {responses[-1]}"}
 
 
 def _test_booklore(enabled: bool, url: str, user: str, pwd: str) -> dict:

@@ -1801,8 +1801,8 @@ class CleanFlaskIntegrationTest(unittest.TestCase):
     @patch('src.web_server.requests.post')
     def test_test_connection_storyteller_uses_post_payload_not_saved_env(self, mock_post):
         def fake_post(url, data=None, headers=None, timeout=None):
-            self.assertEqual(url, 'http://typed-storyteller/api/token')
-            self.assertEqual(data, {'username': 'typed-user', 'password': 'wrong-pass'})
+            self.assertEqual(url, 'http://typed-storyteller/api/v2/token')
+            self.assertEqual(data, {'usernameOrEmail': 'typed-user', 'password': 'wrong-pass'})
             self.assertEqual(headers, {'Content-Type': 'application/x-www-form-urlencoded'})
             self.assertEqual(timeout, 10)
             return _http_response(401)
