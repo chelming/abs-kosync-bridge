@@ -22,19 +22,25 @@ Highlight and note sync requires the **BridgeSync KOReader plugin from this rele
 
 - **Progress decisions use richer service metadata.** The bridge now persists service-native update timestamps, status, and locator metadata. Leader selection uses that data to suppress stale reappearing states and veto obvious rollback candidates while still allowing genuine rereads or forward movement.
 
+- **KOSync document linking lives in Add / Update Book.** Readers can now review recent unlinked KOSync document hashes, connect them to one of their books, copy the hash, unlink it, or delete stale entries from the same place they already match and repair book links.
+
 ### What Changed
 
 - **Annotation sync is source-aware and account-aware.** BookOrbit ownership is guarded before web-reader annotations are relayed, Grimmory web notes use their own sub-spoke so notes survive round trips, and lossy spoke pulls no longer rewrite identity keys.
 
-- **Add Book clears after queueing.** The search box now empties when you add a book to the queue, so you can go straight into your next search.
+- **Storyteller sync understands the newer API shape.** BookBridge now talks to Storyteller's current v2 token and position endpoints while keeping a legacy fallback, and the poller notices meaningful locator changes even when the rounded percentage has not changed.
 
-- **Settings point users to the right place.** Grimmory highlight sync is configured in each reader's Integrations, matching the per-user credential model introduced in 7.0.0.
+- **Alignment lookups are faster on repeat syncs.** Parsed alignment maps are cached and refreshed when a map is rebuilt, which avoids repeatedly reparsing large books during the same sync cycle.
+
+- **Add / Update Book clears after queueing.** The search box now empties when you add a book to the queue, so you can go straight into your next search.
+
+- **Settings point users to the right place.** Grimmory highlight sync is configured in each reader's Integrations, matching the per-user credential model introduced in 7.0.0. The admin integrations view also gives clearer KOReader and BookOrbit setup notes.
 
 ### Fixed
 
 - **Audiobookshelf listeners recover on their own.** A dropped Audiobookshelf Socket.IO connection now revives itself instead of quietly going silent until the next restart.
 
-- **Same-folder suggestions are stricter.** Split-root libraries no longer create misleading same-folder suggestions when the folder context is not actually the same book.
+- **Same-folder suggestions are stricter.** Split-root libraries no longer create misleading same-folder suggestions when the folder context is not actually the same book, and selected source paths stay anchored so duplicate-looking filenames do not drift to the wrong file.
 
 - **Connection tests live where the credentials do.** The test buttons on the general settings gave inconsistent results because logins are now per-reader; they have been removed, and each reader tests connections from their own Integrations page.
 

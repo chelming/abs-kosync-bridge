@@ -189,7 +189,7 @@ CWA is a supported ebook source and optional Kobo-sync progress source. Use it t
 
 CWA notes:
 
-- CWA appears as a standard ebook source in Add Book, Batch Match, Suggestions, and Forge.
+- CWA appears as a standard ebook source in Add / Update Book, Batch Match, Suggestions, and Forge.
 - Kobo sync lets CWA-sourced ebook progress participate alongside KOReader, Grimmory, BookOrbit, Storyteller, and ABS ebook progress.
 - The CWA username/password and Kobo sync token are per-reader integration credentials.
 - If you use the Audiobookshelf Calibre plugin, the bridge can read the `audiobookshelf_id` identifier from Calibre metadata or CWA as a fallback to avoid fuzzy matching already-linked books.

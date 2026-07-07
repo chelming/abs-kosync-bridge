@@ -1455,6 +1455,17 @@ class CleanFlaskIntegrationTest(unittest.TestCase):
         self.assertIn('previewMatchSubmit(', html)
         self.assertIn('mappingForm.requestSubmit(forgeBtn);', html)
 
+    def test_kosync_document_review_lives_on_add_update_book(self):
+        index_html = self._read_template_source('index.html')
+        add_book_html = self._read_template_source('add_book.html')
+
+        self.assertIn('Add / Update Book', index_html)
+        self.assertNotIn('Reader Docs', index_html)
+        self.assertNotIn("{{ url_for('add_book') }}#kosync-documents", index_html)
+        self.assertIn('id="kosync-documents"', add_book_html)
+        self.assertIn('Reader Documents', add_book_html)
+        self.assertIn('/api/me/kosync-documents', add_book_html)
+
     def test_batch_match_template_has_submit_feedback_hooks(self):
         html = self._read_template_source('batch_match.html')
 

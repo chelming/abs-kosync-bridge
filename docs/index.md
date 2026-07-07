@@ -51,7 +51,7 @@
 
 - **Multiple readers** with their own sign-in, their own service logins, and their own progress — each person sees only the books they are reading.
 - **Dashboard** for live sync status, reading session details, direct service links, and source badges.
-- **Add Book** for ABS, Grimmory, or BookOrbit audio; CWA, Grimmory, BookOrbit, ABS, or local ebook sources; Storyteller links; and ebook-only flows.
+- **Add / Update Book** for ABS, Grimmory, or BookOrbit audio; CWA, Grimmory, BookOrbit, ABS, or local ebook sources; Storyteller links; ebook-only flows; and reader document fixes.
 - **Batch Match** for queue-based review and bulk linking.
 - **Library Suggestions** for background scanning, review, and queue building.
 - **Forge** for Storyteller read-along preparation.

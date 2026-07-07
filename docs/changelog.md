@@ -22,18 +22,24 @@ Highlight and note sync requires the **BridgeSync KOReader plugin from this rele
 
 - **Smarter progress arbitration.** BookBridge stores service-native update timestamps and locator metadata, then uses them to suppress stale states and prevent obvious rollback leaders.
 
+- **KOSync document linking from Add / Update Book.** Readers can review recent unlinked KOSync documents, link the right hash to one of their books, copy hashes, unlink, or delete stale entries from the same place they already match and repair book links.
+
 ### What Changed
 
 - **Annotation sync is account-aware.** BookOrbit ownership checks and Grimmory note handling were tightened so web-reader annotations round-trip to the right reader.
 
-- **Add Book clears after queueing.** The search box empties after you add a book to the queue.
+- **Storyteller compatibility is sturdier.** BookBridge supports the newer Storyteller v2 API shape and notices real locator changes even when the visible percentage has not moved.
 
-- **Integration settings are more consistent.** Grimmory highlight sync now points users to each reader's Integrations page, where the per-user credentials live.
+- **Alignment reuse is faster.** Large alignment maps are cached between repeat lookups during a sync cycle, then refreshed when the map is rebuilt.
+
+- **Add / Update Book clears after queueing.** The search box empties after you add a book to the queue.
+
+- **Integration settings are more consistent.** Grimmory highlight sync now points users to each reader's Integrations page, where the per-user credentials live, and the admin view has clearer KOReader and BookOrbit setup notes.
 
 ### Fixed
 
 - **Audiobookshelf listeners recover automatically** after a dropped Socket.IO connection.
-- **Same-folder suggestions are stricter** for split-root library layouts.
+- **Same-folder suggestions are stricter** for split-root library layouts and duplicate-looking source paths.
 - **Connection tests live with per-reader credentials** instead of on the general settings page.
 - **BridgeSync self-updates are more reliable** across plugin zip layouts.
 

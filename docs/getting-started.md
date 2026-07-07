@@ -151,9 +151,9 @@ If your audiobook and ebook services point at the same mounted `/books` tree,
 sibling audio and ebook files in the same title folder appear as high-confidence
 same-folder matches.
 
-### Add Book
+### Add / Update Book
 
-1. Open **Add Book**.
+1. Open **Add / Update Book**.
 2. Pick an ABS, Grimmory, or BookOrbit audiobook, or leave audio on **None / Skip** for an ebook-only link.
 3. Optionally pick a Storyteller title.
 4. Pick the standard ebook.

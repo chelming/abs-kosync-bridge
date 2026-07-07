@@ -11,18 +11,21 @@ Highlight and note sync requires the **BridgeSync KOReader plugin from this rele
 - **BookOrbit audiobook sync** - BookOrbit-hosted audiobooks can now act as the audio side of a mapping, including multi-file track position conversion and BookOrbit reading-session logging.
 - **ABS ebook participation in combined entries** - Audiobookshelf ebook progress now stays in the sync loop even when the same mapped book also has audiobook progress.
 - **Rich progress metadata** - service-native update timestamps, status, and locator metadata are persisted so the sync manager can tell stale resurfaced states apart from real reading movement.
+- **Add / Update Book KOSync document management** - recent unlinked KOSync document hashes can now be reviewed, linked to the right book, copied, unlinked, or deleted from Add / Update Book.
 
 ## Changed
 
 - **Progress arbitration is more conservative about rollbacks** - stale service states are suppressed, and candidates that would clearly move a newer peer backward are vetoed while still allowing genuine rereads and forward movement.
 - **Annotation sync is source-aware and account-aware** - BookOrbit ownership checks, Grimmory note sub-spokes, and lossy-spoke handling keep web-reader annotations attached to the right reader and the right highlight identity.
-- **Settings match the per-user model** - Grimmory highlight sync is configured from each reader's Integrations page, where that reader's credentials live.
-- **Add Book search resets after queueing** - after adding a book to the queue, the search box clears for the next lookup.
+- **Storyteller compatibility is steadier** - BookBridge supports the newer Storyteller v2 API shape, keeps a legacy fallback, and detects meaningful locator changes even when the rounded percentage has not changed.
+- **Alignment lookups are faster** - large parsed alignment maps are cached during repeat sync work and refreshed when a map is rebuilt.
+- **Settings match the per-user model** - Grimmory highlight sync is configured from each reader's Integrations page, where that reader's credentials live, with clearer KOReader and BookOrbit setup notes in the admin view.
+- **Add / Update Book search resets after queueing** - after adding a book to the queue, the search box clears for the next lookup.
 
 ## Fixed
 
 - **Audiobookshelf listener recovery** - dropped Socket.IO listeners now revive automatically instead of requiring a restart.
-- **Split-root same-folder suggestions** - same-folder matching no longer over-suggests when split-root paths only look related.
+- **Split-root same-folder suggestions** - same-folder matching no longer over-suggests when split-root paths only look related, and selected source paths stay anchored when filenames are easy to confuse.
 - **Per-user connection test placement** - general settings no longer show stale global test buttons for credentials that now live per reader.
 - **BridgeSync update packaging** - plugin self-updates locate `_meta.lua` instead of depending on one zip layout.
 - **KOReader null-note handling** - BridgeSync strips JSON-null sentinels so empty notes do not crash KOReader.

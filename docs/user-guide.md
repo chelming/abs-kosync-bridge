@@ -14,7 +14,7 @@ It shows:
 - **Source badges** so you can tell whether a mapping is using Audiobookshelf, Grimmory, BookOrbit, CWA, or another connected source
 - **Direct links** into supported services, including Grimmory and BookOrbit audio when a mapping uses them
 - Annotation sync status when the updated Bridge Sync KOReader plugin is in use
-- Quick access to **Add Book**, **Batch Match**, **Suggestions**, **Forge**, **Settings**, and **Logs**
+- Quick access to **Add / Update Book**, **Batch Match**, **Suggestions**, **Forge**, **Settings**, and **Logs**
 
 If a book is significantly out of sync, the card is highlighted so you can spot it quickly.
 
@@ -40,7 +40,7 @@ Use this when you want listening and reading progress to stay aligned.
 
 This mode tracks reading progress without attaching an audiobook source.
 
-- Create it by leaving audio on **None / Skip** in **Add Book**.
+- Create it by leaving audio on **None / Skip** in **Add / Update Book**.
 - You can still link a standard ebook, a Storyteller title, or both.
 - Ebook-only links skip audiobook preparation work, so they activate faster.
 
@@ -106,9 +106,9 @@ Plain KOReader/KOSync clients and older Bridge Sync versions continue syncing re
 
 ---
 
-## Add Book
+## Add / Update Book
 
-**Add Book** is the main manual linking tool.
+**Add / Update Book** is the main manual linking tool.
 
 ### Step 1: Choose audio
 
@@ -149,7 +149,7 @@ If you skip audio, **Create Mapping** makes an ebook-only link instead.
 
 ## Batch Match
 
-**Batch Match** is the queue-based version of Add Book.
+**Batch Match** is the queue-based version of Add / Update Book.
 
 Use it when you want to review multiple links and process them together.
 
@@ -200,7 +200,7 @@ Suggestions can create:
 
 ### Two ways to use it
 
-1. **Forge & Match from Add Book**
+1. **Forge & Match from Add / Update Book**
    - Starts the Storyteller upload and processing workflow
    - Finishes the mapping when processing completes
 
@@ -235,7 +235,7 @@ For audio, you can use Audiobookshelf, Grimmory, or BookOrbit. For standard eboo
 
 You can use **Grimmory or BookOrbit audiobooks**, and CWA-backed ebook selections, in:
 
-- **Add Book**
+- **Add / Update Book**
 - **Batch Match**
 - **Suggestions**
 - **Forge**
