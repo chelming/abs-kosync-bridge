@@ -18,6 +18,7 @@ from typing import Optional
 
 from flask import Blueprint, jsonify, request, send_file, g
 
+from src.utils.cache_paths import safe_cache_path
 from src.utils.kosync_headers import hash_kosync_key
 from src.utils.time_utils import utcnow
 from src.utils.user_context import set_current_user_id, reset_current_user_id
@@ -67,6 +68,9 @@ _kosync_device_session_registry = None
 _kosync_device_session_registry_lock = threading.Lock()
 _kosync_recent_external_puts: dict = {}
 _kosync_recent_external_puts_lock = threading.Lock()
+_KOREADER_STATS_MAX_BOOKS = 1000
+_KOREADER_STATS_MAX_PAGE_STATS = 10000
+_KOREADER_STATS_MERGE_LIMIT = 10000
 
 
 def _recent_external_put_ttl_seconds() -> int:
@@ -1560,6 +1564,10 @@ def koreader_upload_statistics():
     page_stats = data.get("page_stats")
     if not isinstance(books, list) or not isinstance(page_stats, list):
         return jsonify({"error": "Expected 'books' and 'page_stats' arrays"}), 400
+    if len(books) > _KOREADER_STATS_MAX_BOOKS:
+        return jsonify({"error": f"Too many books in statistics upload (max {_KOREADER_STATS_MAX_BOOKS})"}), 413
+    if len(page_stats) > _KOREADER_STATS_MAX_PAGE_STATS:
+        return jsonify({"error": f"Too many page_stats in statistics upload (max {_KOREADER_STATS_MAX_PAGE_STATS})"}), 413
 
     device = str(data.get("device") or "").strip()
     device_id = str(data.get("device_id") or "").strip()
@@ -1569,17 +1577,20 @@ def koreader_upload_statistics():
 
     if not _database_service:
         return jsonify({"error": "Database service unavailable"}), 503
+    user_id = getattr(g, "kosync_user_id", None)
 
     try:
         accepted_books = _database_service.upsert_koreader_book_stats(
             device=device,
             device_id=device_id,
             books=books,
+            user_id=user_id,
         )
         page_insert_result = _database_service.bulk_insert_koreader_page_stats(
             device=device,
             device_id=device_id,
             page_stats=page_stats,
+            user_id=user_id,
         )
     except Exception as e:
         logger.error("KOReader statistics upload failed for device '%s': %s", device_key, e)
@@ -1617,16 +1628,26 @@ def koreader_merged_statistics():
             since = float(since_raw)
         except (TypeError, ValueError):
             return jsonify({"error": "Invalid 'since' value"}), 400
+    limit = _KOREADER_STATS_MERGE_LIMIT
+    limit_raw = request.args.get("limit")
+    if limit_raw:
+        try:
+            limit = max(min(int(limit_raw), _KOREADER_STATS_MERGE_LIMIT), 1)
+        except (TypeError, ValueError):
+            return jsonify({"error": "Invalid 'limit' value"}), 400
 
     try:
+        user_id = getattr(g, "kosync_user_id", None)
         merged = _database_service.get_merged_koreader_page_stats(
             exclude_device_key=device_key,
             since=since,
+            user_id=user_id,
+            limit=limit,
         )
         page_stats = merged.get("page_stats") or []
         md5s = {row["md5"] for row in page_stats}
         books_meta = (
-            _database_service.get_merged_koreader_book_meta(device_key, md5s) if md5s else []
+            _database_service.get_merged_koreader_book_meta(device_key, md5s, user_id=user_id) if md5s else []
         )
     except Exception as e:
         logger.error("KOReader merged statistics fetch failed for device '%s': %s", device_key, e)
@@ -1637,6 +1658,7 @@ def koreader_merged_statistics():
         "page_stats": page_stats,
         "books": books_meta,
         "watermark": merged.get("watermark"),
+        "truncated": bool(merged.get("truncated")),
     }), 200
 
 
@@ -2275,7 +2297,10 @@ def _try_find_epub_by_hash(doc_hash: str) -> Optional[str]:
                                 safe_title = filename
                                 cache_dir = _container.data_dir() / "epub_cache"
                                 cache_dir.mkdir(parents=True, exist_ok=True)
-                                cache_path = cache_dir / safe_title
+                                cache_path = safe_cache_path(cache_dir, safe_title)
+                                if cache_path is None:
+                                    logger.warning("KOSync: refused unsafe cache filename '%s'", safe_title)
+                                    continue
                                 with open(cache_path, 'wb') as f:
                                     f.write(book_content)
                                 logger.info(f"📥 Persisted Grimmory book to cache: {safe_title}")
@@ -2639,8 +2664,8 @@ def _cleanup_cache_for_hash(doc_hash):
             # Delete file if in epub_cache
             if _container:
                 cache_dir = _container.data_dir() / "epub_cache"
-                file_path = cache_dir / filename
-                if file_path.exists():
+                file_path = safe_cache_path(cache_dir, filename)
+                if file_path and file_path.exists():
                     try:
                         os.remove(file_path)
                         logger.info(f"🗑️ Deleted cached EPUB: {filename}")

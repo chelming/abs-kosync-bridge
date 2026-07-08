@@ -928,7 +928,8 @@ class BookOrbitClient:
             return ""
         if len(value) == 32 and all(c in "0123456789abcdef" for c in value.lower()):
             return value.lower()
-        return hashlib.md5(value.encode("utf-8")).hexdigest()
+        # BookOrbit's KOReader plugin protocol requires MD5(password) auth keys.
+        return hashlib.md5(value.encode("utf-8")).hexdigest()  # nosec B324
 
     def _koreader_plugin_request(self, kosync_user: str, kosync_key: str,
                                  path: str, payload: dict) -> Optional[dict]:

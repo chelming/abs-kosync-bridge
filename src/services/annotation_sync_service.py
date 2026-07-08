@@ -33,6 +33,7 @@ from pathlib import Path
 
 from src.api.booklore_client import BookloreClient
 from src.api.bookorbit_client import BookOrbitClient
+from src.utils.cache_paths import safe_cache_path
 from src.utils.grimmory_cfi import GrimmoryCFIResolver
 from src.utils.user_config import resolve_setting, _ALLOW_GLOBAL_FALLBACK_KEY
 
@@ -402,7 +403,10 @@ class AnnotationSyncService:
             pass
 
         self.epub_cache_dir.mkdir(parents=True, exist_ok=True)
-        cache_path = self.epub_cache_dir / filename
+        cache_path = safe_cache_path(self.epub_cache_dir, filename)
+        if cache_path is None:
+            logger.warning("Grimmory annotation sync refused unsafe cache filename %s", filename)
+            return None
         if cache_path.exists() and cache_path.stat().st_size > 0:
             return cache_path
 

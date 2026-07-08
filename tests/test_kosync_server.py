@@ -763,7 +763,7 @@ class TestKosyncEndpoints(unittest.TestCase):
 
         svc = web_server.database_service
         admin_id = svc._default_user_id()
-        other = svc.create_user("manifest_other_user", "pw", role="user")
+        other = svc.create_user(f"manifest_other_user_{time.time_ns()}", "pw", role="user")
         svc.save_book(Book(abs_id="mine", abs_title="Mine", ebook_filename="m.epub",
                            status="active", user_id=admin_id))
         svc.save_book(Book(abs_id="theirs", abs_title="Theirs", ebook_filename="t.epub",
@@ -798,7 +798,7 @@ class TestKosyncEndpoints(unittest.TestCase):
         from src import web_server
 
         svc = web_server.database_service
-        other = svc.create_user("download_other_user", "pw", role="user")
+        other = svc.create_user(f"download_other_user_{time.time_ns()}", "pw", role="user")
         svc.save_book(Book(abs_id="theirs-dl", abs_title="Theirs", ebook_filename="t.epub",
                            status="active", user_id=other.id))
 
@@ -925,6 +925,70 @@ class TestKosyncEndpoints(unittest.TestCase):
         self.assertEqual(book['title'], 'Dune')
         self.assertEqual(book['authors'], 'Herbert')
         self.assertEqual(book['pages'], 412)
+
+    def test_statistics_upload_rejects_oversized_payloads(self):
+        self._clear_koreader_stats_tables()
+
+        response = self.client.post(
+            '/koreader/device-sync/statistics',
+            headers=self.auth_headers,
+            json={
+                'device': 'Kobo',
+                'device_id': 'device-a',
+                'books': [{'md5': str(i)} for i in range(1001)],
+                'page_stats': [],
+            },
+        )
+
+        self.assertEqual(response.status_code, 413)
+        self.assertIn('Too many books', response.get_json()['error'])
+
+    def test_merged_statistics_is_scoped_to_authenticated_user(self):
+        self._clear_koreader_stats_tables()
+        from src import web_server
+
+        admin_id = web_server.database_service._default_user_id()
+        reader_b, reader_b_headers = self._make_second_kosync_user("stats_reader_b")
+
+        web_server.database_service.upsert_koreader_book_stats(
+            device='Kobo', device_id='device-a',
+            books=[{'md5': 'a' * 32, 'title': 'Admin Book', 'authors': 'Admin', 'pages': 111}],
+            user_id=admin_id,
+        )
+        web_server.database_service.bulk_insert_koreader_page_stats(
+            device='Kobo', device_id='device-a',
+            page_stats=[
+                {'md5': 'a' * 32, 'page': 10, 'start_time': 1700000100, 'duration': 60, 'total_pages': 111},
+            ],
+            user_id=admin_id,
+        )
+        web_server.database_service.upsert_koreader_book_stats(
+            device='Kobo', device_id='device-a',
+            books=[{'md5': 'b' * 32, 'title': 'Reader B Book', 'authors': 'Reader B', 'pages': 222}],
+            user_id=reader_b.id,
+        )
+        web_server.database_service.bulk_insert_koreader_page_stats(
+            device='Kobo', device_id='device-a',
+            page_stats=[
+                {'md5': 'b' * 32, 'page': 20, 'start_time': 1700000200, 'duration': 90, 'total_pages': 222},
+            ],
+            user_id=reader_b.id,
+        )
+
+        admin_response = self.client.get(
+            '/koreader/device-sync/statistics/merged?device=Kindle&device_id=device-b',
+            headers=self.auth_headers,
+        )
+        reader_b_response = self.client.get(
+            '/koreader/device-sync/statistics/merged?device=Kindle&device_id=device-b',
+            headers=reader_b_headers,
+        )
+
+        self.assertEqual(admin_response.status_code, 200)
+        self.assertEqual(reader_b_response.status_code, 200)
+        self.assertEqual([row['md5'] for row in admin_response.get_json()['page_stats']], ['a' * 32])
+        self.assertEqual([row['md5'] for row in reader_b_response.get_json()['page_stats']], ['b' * 32])
+        self.assertEqual(reader_b_response.get_json()['books'][0]['title'], 'Reader B Book')
 
     def test_merged_statistics_disabled_by_setting(self):
         original = os.environ.get('KOREADER_COMBINE_DEVICE_STATS')

@@ -44,6 +44,7 @@ from src.utils.user_context import (
 )
 from src.utils.storyteller_transcript import StorytellerTranscript
 # Logging utilities (placed at top to ensure availability during sync)
+from src.utils.cache_paths import safe_cache_path
 from src.utils.logging_utils import sanitize_log_data
 from src.utils.progress_metadata import state_metadata_kwargs
 
@@ -921,7 +922,10 @@ class SyncManager:
         
         # Check persistent EPUB cache
         self.epub_cache_dir.mkdir(parents=True, exist_ok=True)
-        cached_path = self.epub_cache_dir / ebook_filename
+        cached_path = safe_cache_path(self.epub_cache_dir, ebook_filename)
+        if cached_path is None:
+            logger.warning("Refusing unsafe EPUB cache filename '%s'", sanitize_log_data(ebook_filename))
+            return None
         if cached_path.exists():
             logger.info(f"🔍 Found EPUB in cache: '{cached_path}'")
             return cached_path

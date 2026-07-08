@@ -15,7 +15,7 @@ import sys
 import threading
 import time
 import uuid
-from collections import defaultdict
+from collections import defaultdict, deque
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
@@ -34,6 +34,7 @@ from src.utils.user_context import (
 from src.utils.user_config import user_setting
 
 from src.utils.config_loader import ConfigLoader, env_truthy
+from src.utils.cache_paths import safe_cache_path
 from src.utils.logging_utils import memory_log_handler, LOG_PATH
 from src.utils.logging_utils import sanitize_log_data
 from src.api.api_clients import ABS_DISABLED_SENTINEL, is_abs_disabled_value
@@ -1436,8 +1437,8 @@ def get_kosync_id_for_ebook(ebook_filename, booklore_id=None, original_filename=
 
     # [NEW] Check Epub Cache explicitly (if acquired by LibraryService but not meant for /books)
     epub_cache = container.epub_cache_dir()
-    cached_path = epub_cache / ebook_filename
-    if cached_path.exists():
+    cached_path = safe_cache_path(epub_cache, ebook_filename)
+    if cached_path and cached_path.exists():
          return container.ebook_parser().get_kosync_id(cached_path)
 
     # [NEW] On-Demand Fetching
@@ -1475,7 +1476,7 @@ def get_kosync_id_for_ebook(ebook_filename, booklore_id=None, original_filename=
                      target = ebook_files[0]
                      if not epub_cache.exists(): epub_cache.mkdir(parents=True, exist_ok=True)
                      
-                     if abs_client.download_file(target['stream_url'], cached_path):
+                     if cached_path and abs_client.download_file(target['stream_url'], cached_path):
                          logger.info(f"   ✅ Downloaded ABS ebook to '{cached_path}'")
                          return container.ebook_parser().get_kosync_id(cached_path)
                  else:
@@ -1532,7 +1533,7 @@ def get_kosync_id_for_ebook(ebook_filename, booklore_id=None, original_filename=
 
                      if target and target.get('download_url'):
                          if not epub_cache.exists(): epub_cache.mkdir(parents=True, exist_ok=True)
-                         if cwa_client.download_ebook(target['download_url'], cached_path):
+                         if cached_path and cwa_client.download_ebook(target['download_url'], cached_path):
                              logger.info(f"   ✅ Downloaded CWA ebook to '{cached_path}'")
                              return container.ebook_parser().get_kosync_id(cached_path)
                      else:
@@ -6414,8 +6415,8 @@ def cleanup_mapping_resources(book):
                 continue
             seen_dirs.add(cache_dir_key)
 
-            cached_path = cache_dir_path / book.ebook_filename
-            if cached_path.exists():
+            cached_path = safe_cache_path(cache_dir_path, book.ebook_filename)
+            if cached_path and cached_path.exists():
                 try:
                     cached_path.unlink()
                     logger.info(f"🗑️ Deleted cached ebook file: {book.ebook_filename}")
@@ -7716,6 +7717,16 @@ def logs_view():
     return render_template('logs.html', embed=embed)
 
 
+def _tail_text_lines(path: Path, max_lines: int) -> list[str]:
+    if max_lines <= 0:
+        return []
+    try:
+        with open(path, 'r', encoding='utf-8', errors='replace') as f:
+            return list(deque(f, maxlen=max_lines))
+    except OSError:
+        return []
+
+
 def api_logs():
     """API endpoint for fetching logs with filtering and pagination."""
     try:
@@ -7733,19 +7744,18 @@ def api_logs():
 
         # Read current log file
         if LOG_PATH and LOG_PATH.exists():
-            with open(LOG_PATH, 'r', encoding='utf-8') as f:
-                all_lines.extend(f.readlines())
+            all_lines.extend(_tail_text_lines(LOG_PATH, lines_count))
 
         # Read backup files if needed (for more history)
         if LOG_PATH and lines_count > len(all_lines):
             for i in range(1, 6):  # Check up to 5 backup files
                 backup_path = Path(str(LOG_PATH) + f'.{i}')
                 if backup_path.exists():
-                    with open(backup_path, 'r', encoding='utf-8') as f:
-                        backup_lines = f.readlines()
-                        all_lines = backup_lines + all_lines
-                        if len(all_lines) >= lines_count:
-                            break
+                    remaining = lines_count - len(all_lines)
+                    backup_lines = _tail_text_lines(backup_path, remaining)
+                    all_lines = backup_lines + all_lines
+                    if len(all_lines) >= lines_count:
+                        break
 
         # Parse and filter logs
         log_levels = {
@@ -8040,8 +8050,8 @@ def _run_storyteller_backfill():
                 if ebook_parser and book.ebook_filename:
                     try:
                         epub_filename = book.original_ebook_filename or book.ebook_filename
-                        epub_path = container.epub_cache_dir() / epub_filename
-                        if epub_path.exists():
+                        epub_path = safe_cache_path(container.epub_cache_dir(), epub_filename)
+                        if epub_path and epub_path.exists():
                             book_text, _ = ebook_parser.extract_text_and_map(epub_path)
                     except Exception as e:
                         logger.warning(f"Could not extract text for storyteller backfill: {e}")

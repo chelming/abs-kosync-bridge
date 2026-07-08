@@ -1598,13 +1598,26 @@ class DatabaseService:
     def _normalize_koreader_device_key(device: str = None, device_id: str = None) -> str:
         return str(device_id or device or "").strip()
 
-    def upsert_koreader_book_stats(self, device: str, device_id: str, books: list[dict]) -> int:
+    @staticmethod
+    def _scope_koreader_user(query, model, user_id):
+        if user_id is None:
+            return query.filter(model.user_id.is_(None))
+        return query.filter(model.user_id == user_id)
+
+    def upsert_koreader_book_stats(
+        self,
+        device: str,
+        device_id: str,
+        books: list[dict],
+        user_id: int = None,
+    ) -> int:
         """Upsert KOReader book metadata rows for one device."""
         from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
         device_key = self._normalize_koreader_device_key(device=device, device_id=device_id)
         if not device_key:
             return 0
+        uid = self._resolve_uid(user_id)
 
         rows = []
         now = utcnow()
@@ -1615,6 +1628,7 @@ class DatabaseService:
 
             rows.append({
                 "md5": md5,
+                "user_id": uid,
                 "device": str(device or "").strip() or None,
                 "device_id": str(device_id or "").strip() or None,
                 "device_key": device_key,
@@ -1633,7 +1647,7 @@ class DatabaseService:
         with self.get_session() as session:
             stmt = sqlite_insert(KOReaderBookStat).values(rows)
             stmt = stmt.on_conflict_do_update(
-                index_elements=["md5", "device_key"],
+                index_elements=["md5", "user_id", "device_key"],
                 set_={
                     "device": stmt.excluded.device,
                     "device_id": stmt.excluded.device_id,
@@ -1649,13 +1663,20 @@ class DatabaseService:
             session.execute(stmt)
         return len(rows)
 
-    def bulk_insert_koreader_page_stats(self, device: str, device_id: str, page_stats: list[dict]) -> dict:
+    def bulk_insert_koreader_page_stats(
+        self,
+        device: str,
+        device_id: str,
+        page_stats: list[dict],
+        user_id: int = None,
+    ) -> dict:
         """Bulk insert KOReader page stats with replay-safe dedupe and cross-device echo suppression."""
         from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
         device_key = self._normalize_koreader_device_key(device=device, device_id=device_id)
         if not device_key:
             return {"accepted": 0, "duplicates": 0, "echoes": 0}
+        uid = self._resolve_uid(user_id)
 
         rows = []
         now = utcnow()
@@ -1683,6 +1704,7 @@ class DatabaseService:
 
             rows.append({
                 "md5": md5,
+                "user_id": uid,
                 "device": str(device or "").strip() or None,
                 "device_id": str(device_id or "").strip() or None,
                 "device_key": device_key,
@@ -1701,14 +1723,15 @@ class DatabaseService:
             # under another device_key is a merged copy injected into this device's
             # statistics.sqlite by the plugin, not new reading on this device.
             batch_md5s = {row["md5"] for row in rows}
-            foreign = (
-                session.query(KOReaderPageStat.md5, KOReaderPageStat.start_time, KOReaderPageStat.duration)
-                .filter(
-                    KOReaderPageStat.md5.in_(batch_md5s),
-                    KOReaderPageStat.device_key != device_key,
-                )
-                .all()
+            foreign_query = session.query(
+                KOReaderPageStat.md5,
+                KOReaderPageStat.start_time,
+                KOReaderPageStat.duration,
+            ).filter(
+                KOReaderPageStat.md5.in_(batch_md5s),
+                KOReaderPageStat.device_key != device_key,
             )
+            foreign = self._scope_koreader_user(foreign_query, KOReaderPageStat, uid).all()
             foreign_fingerprints = {
                 (item.md5, float(item.start_time), float(item.duration)) for item in foreign
             }
@@ -1722,7 +1745,7 @@ class DatabaseService:
             if fresh_rows:
                 stmt = sqlite_insert(KOReaderPageStat).values(fresh_rows)
                 stmt = stmt.on_conflict_do_nothing(
-                    index_elements=["md5", "device_key", "page", "start_time"]
+                    index_elements=["md5", "user_id", "device_key", "page", "start_time"]
                 )
                 result = session.execute(stmt)
                 inserted = max(int(result.rowcount or 0), 0)
@@ -1738,6 +1761,8 @@ class DatabaseService:
         exclude_device_key: str,
         md5s: Optional[set[str]] = None,
         since: Optional[float] = None,
+        user_id: int = None,
+        limit: int = 10000,
     ) -> dict:
         """Page-stat events from all devices except the requesting one, for cross-device merging.
 
@@ -1751,29 +1776,36 @@ class DatabaseService:
         exclude_device_key = str(exclude_device_key or "").strip()
         if not exclude_device_key:
             return {"page_stats": [], "watermark": since}
+        uid = self._resolve_uid(user_id)
+        limit = max(min(int(limit or 10000), 10000), 1)
 
         with self.get_session() as session:
             query = session.query(KOReaderPageStat).filter(
                 KOReaderPageStat.device_key != exclude_device_key
             )
+            query = self._scope_koreader_user(query, KOReaderPageStat, uid)
             if md5s:
                 query = query.filter(KOReaderPageStat.md5.in_(md5s))
             if since is not None:
                 query = query.filter(
                     KOReaderPageStat.uploaded_at >= datetime.utcfromtimestamp(float(since))
                 )
-            rows = query.order_by(KOReaderPageStat.start_time.asc()).all()
+            rows = query.order_by(KOReaderPageStat.uploaded_at.asc(), KOReaderPageStat.id.asc()).limit(limit + 1).all()
+            truncated = len(rows) > limit
+            if truncated:
+                rows = rows[:limit]
             if not rows:
-                return {"page_stats": [], "watermark": since}
+                return {"page_stats": [], "watermark": since, "truncated": False}
 
             fallback_keys = {(row.md5, row.device_key) for row in rows if not row.total_pages}
             fallback_pages: dict[tuple[str, str], int] = {}
             if fallback_keys:
-                meta_rows = (
-                    session.query(KOReaderBookStat.md5, KOReaderBookStat.device_key, KOReaderBookStat.pages)
-                    .filter(KOReaderBookStat.md5.in_({md5 for md5, _ in fallback_keys}))
-                    .all()
-                )
+                meta_query = session.query(
+                    KOReaderBookStat.md5,
+                    KOReaderBookStat.device_key,
+                    KOReaderBookStat.pages,
+                ).filter(KOReaderBookStat.md5.in_({md5 for md5, _ in fallback_keys}))
+                meta_rows = self._scope_koreader_user(meta_query, KOReaderBookStat, uid).all()
                 for meta in meta_rows:
                     if meta.pages and int(meta.pages) > 0:
                         fallback_pages[(meta.md5, meta.device_key)] = int(meta.pages)
@@ -1795,9 +1827,14 @@ class DatabaseService:
                     "duration": float(row.duration or 0),
                     "total_pages": total_pages,
                 })
-            return {"page_stats": results, "watermark": watermark}
+            return {"page_stats": results, "watermark": watermark, "truncated": truncated}
 
-    def get_merged_koreader_book_meta(self, exclude_device_key: str, md5s: set[str]) -> list[dict]:
+    def get_merged_koreader_book_meta(
+        self,
+        exclude_device_key: str,
+        md5s: set[str],
+        user_id: int = None,
+    ) -> list[dict]:
         """Canonical book metadata (md5, title, authors, pages) for the given md5s.
 
         Drawn from other devices' uploaded book stats so a device that never opened a
@@ -1810,9 +1847,11 @@ class DatabaseService:
         md5s = {str(m).strip() for m in (md5s or set()) if str(m).strip()}
         if not md5s:
             return []
+        uid = self._resolve_uid(user_id)
 
         with self.get_session() as session:
             query = session.query(KOReaderBookStat).filter(KOReaderBookStat.md5.in_(md5s))
+            query = self._scope_koreader_user(query, KOReaderBookStat, uid)
             if exclude_device_key:
                 query = query.filter(KOReaderBookStat.device_key != exclude_device_key)
             rows = query.all()
@@ -1876,7 +1915,7 @@ class DatabaseService:
         crengine's xpointer re-serialization."""
         import hashlib
         raw = f"{datetime_str or ''}|{DatabaseService._normalize_xpointer_for_key(pos0)}"
-        return hashlib.md5(raw.encode("utf-8")).hexdigest()
+        return hashlib.md5(raw.encode("utf-8"), usedforsecurity=False).hexdigest()
 
     @staticmethod
     def _bookorbit_annotation_key(datetime_str: str, pos0: str) -> str:
@@ -1886,7 +1925,7 @@ class DatabaseService:
         internal normalized identity would not match BookOrbit's side."""
         import hashlib
         raw = f"{datetime_str or ''}|{pos0 or ''}"
-        return hashlib.md5(raw.encode("utf-8")).hexdigest()
+        return hashlib.md5(raw.encode("utf-8"), usedforsecurity=False).hexdigest()
 
     @staticmethod
     def _annotation_entry_fields(entry: dict) -> dict:
@@ -2483,20 +2522,30 @@ class DatabaseService:
 
     def _get_koreader_book_links(self, session) -> dict:
         links = {}
+        uid = self._resolve_uid(None)
 
-        linked_docs = session.query(KosyncDocument).filter(
-            KosyncDocument.linked_abs_id.isnot(None)
-        ).all()
+        linked_docs_query = session.query(KosyncDocument).filter(KosyncDocument.linked_abs_id.isnot(None))
+        if uid is not None:
+            linked_docs_query = linked_docs_query.filter(
+                (KosyncDocument.user_id == uid) | (KosyncDocument.user_id.is_(None))
+            )
+        linked_docs = linked_docs_query.all()
         if linked_docs:
             linked_abs_ids = {doc.linked_abs_id for doc in linked_docs if doc.linked_abs_id}
-            books = session.query(Book).filter(Book.abs_id.in_(linked_abs_ids)).all()
+            books_query = session.query(Book).filter(Book.abs_id.in_(linked_abs_ids))
+            if uid is not None:
+                books_query = books_query.join(UserBook, UserBook.abs_id == Book.abs_id).filter(UserBook.user_id == uid)
+            books = books_query.all()
             books_by_id = {book.abs_id: book for book in books}
             for doc in linked_docs:
                 book = books_by_id.get(doc.linked_abs_id)
                 if book and doc.document_hash:
                     links.setdefault(str(doc.document_hash), book)
 
-        direct_books = session.query(Book).filter(Book.kosync_doc_id.isnot(None)).all()
+        direct_books_query = session.query(Book).filter(Book.kosync_doc_id.isnot(None))
+        if uid is not None:
+            direct_books_query = direct_books_query.join(UserBook, UserBook.abs_id == Book.abs_id).filter(UserBook.user_id == uid)
+        direct_books = direct_books_query.all()
         for book in direct_books:
             if book.kosync_doc_id:
                 links.setdefault(str(book.kosync_doc_id), book)
@@ -2504,7 +2553,9 @@ class DatabaseService:
         return links
 
     def _get_all_koreader_active_md5s(self, session) -> set[str]:
-        rows = session.query(KOReaderPageStat.md5).distinct().all()
+        uid = self._resolve_uid(None)
+        query = session.query(KOReaderPageStat.md5)
+        rows = self._scope_koreader_user(query, KOReaderPageStat, uid).distinct().all()
         return {
             str(row[0]).strip()
             for row in rows
@@ -2515,7 +2566,13 @@ class DatabaseService:
         if not md5s:
             return {}
 
-        rows = session.query(KOReaderBookStat).filter(KOReaderBookStat.md5.in_(md5s)).order_by(
+        uid = self._resolve_uid(None)
+        query = self._scope_koreader_user(
+            session.query(KOReaderBookStat).filter(KOReaderBookStat.md5.in_(md5s)),
+            KOReaderBookStat,
+            uid,
+        )
+        rows = query.order_by(
             KOReaderBookStat.last_updated.desc(),
             KOReaderBookStat.id.desc(),
         ).all()
@@ -2559,8 +2616,9 @@ class DatabaseService:
         if not md5s:
             return []
 
+        uid = self._resolve_uid(None)
         query = session.query(KOReaderPageStat.start_time, KOReaderPageStat.duration)
-        query = query.filter(KOReaderPageStat.md5.in_(md5s))
+        query = self._scope_koreader_user(query, KOReaderPageStat, uid).filter(KOReaderPageStat.md5.in_(md5s))
         if start_date is not None:
             start_epoch = datetime.combine(
                 start_date,
@@ -2602,7 +2660,9 @@ class DatabaseService:
         if not md5s:
             return set()
 
-        rows = session.query(KOReaderPageStat.start_time).filter(KOReaderPageStat.md5.in_(md5s)).all()
+        uid = self._resolve_uid(None)
+        query = session.query(KOReaderPageStat.start_time).filter(KOReaderPageStat.md5.in_(md5s))
+        rows = self._scope_koreader_user(query, KOReaderPageStat, uid).all()
         return {
             datetime.fromisoformat(self._local_date_from_epoch(row.start_time, tz_name)).date()
             for row in rows
@@ -2619,15 +2679,20 @@ class DatabaseService:
 
             from sqlalchemy import func
 
+            uid = self._resolve_uid(None)
             total_seconds = int(
-                session.query(func.coalesce(func.sum(KOReaderPageStat.duration), 0))
+                self._scope_koreader_user(
+                    session.query(func.coalesce(func.sum(KOReaderPageStat.duration), 0)),
+                    KOReaderPageStat,
+                    uid,
+                )
                 .filter(KOReaderPageStat.md5.in_(md5s))
                 .scalar()
                 or 0
             )
             pages_read = self._koreader_pages_read(session, md5s)
             books_tracked = int(
-                session.query(KOReaderPageStat.md5)
+                self._scope_koreader_user(session.query(KOReaderPageStat.md5), KOReaderPageStat, uid)
                 .filter(KOReaderPageStat.md5.in_(md5s))
                 .distinct()
                 .count()
@@ -2741,14 +2806,15 @@ class DatabaseService:
                 }
 
             contexts = self._build_koreader_book_contexts(session, md5s)
-            rows = (
+            uid = self._resolve_uid(None)
+            rows_query = (
                 session.query(KOReaderPageStat)
                 .filter(KOReaderPageStat.md5.in_(md5s))
                 .filter(KOReaderPageStat.start_time >= start_epoch)
                 .filter(KOReaderPageStat.start_time < end_epoch)
                 .order_by(KOReaderPageStat.start_time.asc())
-                .all()
             )
+            rows = self._scope_koreader_user(rows_query, KOReaderPageStat, uid).all()
 
             if not rows:
                 return {
@@ -2830,14 +2896,15 @@ class DatabaseService:
                 }
 
             contexts = self._build_koreader_book_contexts(session, md5s)
-            rows = (
+            uid = self._resolve_uid(None)
+            rows_query = (
                 session.query(KOReaderPageStat)
                 .filter(KOReaderPageStat.md5.in_(md5s))
                 .filter(KOReaderPageStat.start_time >= start_epoch)
                 .filter(KOReaderPageStat.start_time < end_epoch)
                 .order_by(KOReaderPageStat.start_time.asc())
-                .all()
             )
+            rows = self._scope_koreader_user(rows_query, KOReaderPageStat, uid).all()
 
             day_buckets = {}
             for row in rows:
@@ -2888,9 +2955,13 @@ class DatabaseService:
 
             contexts = self._build_koreader_book_contexts(session, md5s)
             sample_size = max(int(limit or 10) * 400, 4000)
-            rows = (
+            uid = self._resolve_uid(None)
+            rows_query = (
                 session.query(KOReaderPageStat)
                 .filter(KOReaderPageStat.md5.in_(md5s))
+            )
+            rows = (
+                self._scope_koreader_user(rows_query, KOReaderPageStat, uid)
                 .order_by(KOReaderPageStat.start_time.desc())
                 .limit(sample_size)
                 .all()
@@ -3015,14 +3086,15 @@ class DatabaseService:
             s["endTime"] = int(s["endTime"])
         return sessions
 
-    @staticmethod
-    def _distinct_pages_count(session, md5s, start_epoch=None, end_epoch=None) -> int:
+    def _distinct_pages_count(self, session, md5s, start_epoch=None, end_epoch=None) -> int:
         """Count distinct (md5, page) screen-pages in an optional time window."""
         if not md5s:
             return 0
+        uid = self._resolve_uid(None)
         query = session.query(KOReaderPageStat.md5, KOReaderPageStat.page).filter(
             KOReaderPageStat.md5.in_(md5s)
         )
+        query = self._scope_koreader_user(query, KOReaderPageStat, uid)
         if start_epoch is not None:
             query = query.filter(KOReaderPageStat.start_time >= start_epoch)
         if end_epoch is not None:
@@ -3073,11 +3145,12 @@ class DatabaseService:
             if not md5s:
                 return buckets
             tz = ZoneInfo(tz_name)
-            rows = (
+            uid = self._resolve_uid(None)
+            rows_query = (
                 session.query(KOReaderPageStat.start_time, KOReaderPageStat.duration)
                 .filter(KOReaderPageStat.md5.in_(md5s))
-                .all()
             )
+            rows = self._scope_koreader_user(rows_query, KOReaderPageStat, uid).all()
             for row in rows:
                 hour = datetime.fromtimestamp(float(row.start_time), tz).hour
                 buckets[hour]["seconds"] += int(max(row.duration or 0, 0))
@@ -3096,11 +3169,12 @@ class DatabaseService:
             for md5, ctx in contexts.items():
                 keys_md5[ctx["bookKey"]].add(md5)
 
-            rows = (
+            uid = self._resolve_uid(None)
+            rows_query = (
                 session.query(KOReaderPageStat.md5, KOReaderPageStat.start_time, KOReaderPageStat.duration)
                 .filter(KOReaderPageStat.md5.in_(md5s))
-                .all()
             )
+            rows = self._scope_koreader_user(rows_query, KOReaderPageStat, uid).all()
             agg = {}
             for row in rows:
                 ctx = contexts.get(row.md5)
@@ -3142,12 +3216,13 @@ class DatabaseService:
             ctx = contexts[next(iter(md5s))]
             metadata = self._get_latest_koreader_book_metadata(session, md5s)
 
-            rows = (
+            uid = self._resolve_uid(None)
+            rows_query = (
                 session.query(KOReaderPageStat)
                 .filter(KOReaderPageStat.md5.in_(md5s))
                 .order_by(KOReaderPageStat.start_time.asc())
-                .all()
             )
+            rows = self._scope_koreader_user(rows_query, KOReaderPageStat, uid).all()
             if not rows:
                 return None
 
@@ -3184,11 +3259,12 @@ class DatabaseService:
 
     def _koreader_available_years(self, session, md5s, tz_name: str) -> list[int]:
         from sqlalchemy import func
-        bounds = (
+        uid = self._resolve_uid(None)
+        bounds_query = (
             session.query(func.min(KOReaderPageStat.start_time), func.max(KOReaderPageStat.start_time))
             .filter(KOReaderPageStat.md5.in_(md5s))
-            .first()
         )
+        bounds = self._scope_koreader_user(bounds_query, KOReaderPageStat, uid).first()
         if not bounds or bounds[0] is None:
             return []
         tz = ZoneInfo(tz_name)
@@ -3214,7 +3290,8 @@ class DatabaseService:
             tz = ZoneInfo(tz_name)
             start_epoch = datetime(year, 1, 1, tzinfo=tz).timestamp()
             end_epoch = datetime(year + 1, 1, 1, tzinfo=tz).timestamp()
-            rows = (
+            uid = self._resolve_uid(None)
+            rows_query = (
                 session.query(
                     KOReaderPageStat.md5, KOReaderPageStat.page,
                     KOReaderPageStat.start_time, KOReaderPageStat.duration,
@@ -3222,8 +3299,8 @@ class DatabaseService:
                 .filter(KOReaderPageStat.md5.in_(md5s))
                 .filter(KOReaderPageStat.start_time >= start_epoch)
                 .filter(KOReaderPageStat.start_time < end_epoch)
-                .all()
             )
+            rows = self._scope_koreader_user(rows_query, KOReaderPageStat, uid).all()
 
             months = [{"month": m, "seconds": 0, "pages": 0, "finished": 0} for m in range(1, 13)]
             month_pages = [set() for _ in range(12)]

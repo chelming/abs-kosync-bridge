@@ -542,6 +542,10 @@ class KOReaderBookStat(Base):
     total_read_time = Column(Integer, nullable=True)
     last_updated = Column(DateTime, default=utcnow, onupdate=utcnow, index=True)
 
+    __table_args__ = (
+        UniqueConstraint('md5', 'user_id', 'device_key', name='uq_koreader_book_stats_md5_user_device_key'),
+    )
+
     def __init__(
         self,
         md5: str,
@@ -587,6 +591,10 @@ class KOReaderPageStat(Base):
     duration = Column(Float, nullable=False)
     total_pages = Column(Integer, nullable=True)
     uploaded_at = Column(DateTime, default=utcnow)
+
+    __table_args__ = (
+        UniqueConstraint('md5', 'user_id', 'device_key', 'page', 'start_time', name='uq_koreader_page_stats_user_replay'),
+    )
 
     def __init__(
         self,
