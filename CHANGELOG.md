@@ -8,11 +8,17 @@ All notable changes to BookBridge will be documented in this file.
 
 ### What's New
 
+- **BookFusion progress and highlight sync is now wired in.** Readers can link a BookFusion account, sync reading progress by percentage, and relay highlights through the annotation hub using freshly implemented UTF-16 offset/xpointer mapping. Uploading books to BookFusion is intentionally out of scope for this phase.
+
 - **Hardcover lists can now create KOReader collections.** BridgeSync-managed KOReader manifests can use either Grimmory shelves or Hardcover lists as the collection source. Hardcover collection mapping is per-user, only applies to books already matched in BookBridge, supports all lists or selected list names, and refreshes on a daily cache.
 
 - **Grimmory shelves can now create Hardcover lists.** When enabled in Settings -> Hardcover.app, newly matched Grimmory-backed books are added to Hardcover lists named from their Grimmory shelf membership, mirroring the shelf-to-KOReader-collection flow. The sync is additive only and can use all shelves, magic shelves only, or regular shelves only, with optional list prefixes and excluded shelf names.
 
 ### Fixed
+
+- **BookFusion linking is now available to regular users.** The Account page now lets the signed-in reader link their own BookFusion account and toggle BookFusion progress/highlight sync, and a successful device link enables BookFusion for that reader automatically.
+
+- **BookFusion highlight offsets now match real EPUB chapters.** The BookFusion mapper now parses XHTML chapters with XML declarations, counts inter-element whitespace in the UTF-16 offset space, keeps KOReader text-node indexing stable, and sends quote prefix/suffix context when pushing highlights.
 
 - **KOReader collection source controls are no longer hidden under Grimmory.** The Grimmory-vs-Hardcover collection source selector now lives per reader under Users -> Integrations -> KOReader Collections, matching the per-user manifest behavior and making Hardcover-list collections discoverable even when Grimmory is disabled.
 

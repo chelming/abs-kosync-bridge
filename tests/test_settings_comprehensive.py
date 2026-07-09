@@ -21,6 +21,7 @@ class MockContainer:
     def sync_manager(self): return self.mock_sync_manager
     def abs_client(self): return Mock()
     def booklore_client(self): return Mock()
+    def bookfusion_client(self): return Mock()
     def storyteller_client(self): return Mock()
     def hardcover_client(self): return Mock()
     def storygraph_client(self): return Mock()
@@ -64,6 +65,7 @@ class TestSettingsComprehensive(unittest.TestCase):
             'KOSYNC_ENABLED',
             'STORYTELLER_ENABLED',
             'BOOKLORE_ENABLED',
+            'BOOKFUSION_ENABLED',
             'GRIMMORY_READING_SESSIONS',
             'CWA_ENABLED',
             'CWA_SYNC_ENABLED',

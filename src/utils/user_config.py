@@ -41,6 +41,8 @@ PER_USER_CREDENTIAL_KEYS = frozenset({
     # access/refresh tokens are cached per-user — the user never pastes a JWT)
     "READEST_ANNOTATION_SYNC", "READEST_EMAIL", "READEST_PASSWORD",
     "READEST_ACCESS_TOKEN", "READEST_REFRESH_TOKEN", "READEST_TOKEN_EXPIRES_AT",
+    # BookFusion
+    "BOOKFUSION_ENABLED", "BOOKFUSION_ACCESS_TOKEN", "BOOKFUSION_ANNOTATION_SYNC",
     # Trackers (write targets are per-user accounts)
     "HARDCOVER_TOKEN", "HARDCOVER_ENABLED",
     "HARDCOVER_GRIMMORY_LIST_SYNC", "HARDCOVER_GRIMMORY_LIST_PREFIX",
@@ -114,6 +116,11 @@ PER_USER_FIELD_GROUPS = [
         ("READEST_ANNOTATION_SYNC", "Highlight sync", "bool"),
         ("READEST_EMAIL", "Account email", "text"),
         ("READEST_PASSWORD", "Account password", "secret"),
+    ]),
+    ("BookFusion", [
+        ("BOOKFUSION_ENABLED", "Enabled", "bool"),
+        ("BOOKFUSION_ACCESS_TOKEN", "Access token", "secret"),
+        ("BOOKFUSION_ANNOTATION_SYNC", "Highlight sync", "bool"),
     ]),
     ("Hardcover", [
         ("HARDCOVER_ENABLED", "Enabled", "bool"),

@@ -482,6 +482,8 @@ class _GlobalClients:
     @property
     def booklore_client(self): return container.booklore_client()
     @property
+    def bookfusion_client(self): return container.bookfusion_client()
+    @property
     def bookorbit_client(self): return container.bookorbit_client()
     @property
     def cwa_client(self): return container.cwa_client()
@@ -980,7 +982,48 @@ def account():
                 message = "Updated " + " and ".join(changed) + "." if changed else "No changes made."
                 user = database_service.get_user(user.id)  # refresh for display
 
-    return render_template('account.html', error=error, message=message, account_user=user)
+    return render_template(
+        'account.html',
+        error=error,
+        message=message,
+        account_user=user,
+        bookfusion_account=_bookfusion_account_state(user.id),
+    )
+
+
+def _setting_truthy_value(value) -> bool:
+    return str(value or "").strip().lower() in {"true", "1", "yes", "on"}
+
+
+def _bookfusion_account_state(user_id: int) -> dict:
+    """Return current-user BookFusion account state for self-service UI."""
+    try:
+        creds = database_service.get_user_credentials(user_id) or {}
+    except Exception:
+        creds = {}
+    return {
+        "enabled": _setting_truthy_value(creds.get("BOOKFUSION_ENABLED")),
+        "annotation_sync": _setting_truthy_value(creds.get("BOOKFUSION_ANNOTATION_SYNC")),
+        "linked": bool(str(creds.get("BOOKFUSION_ACCESS_TOKEN") or "").strip()),
+    }
+
+
+def api_bookfusion_account() -> object:
+    """Update self-service BookFusion settings for the current signed-in user."""
+    user = current_user()
+    if user is None:
+        return jsonify({"error": "authentication required"}), 401
+    payload = request.get_json(silent=True) or {}
+    enabled = _coerce_test_bool(payload.get("enabled"))
+    annotation_sync = _coerce_test_bool(payload.get("annotation_sync"))
+    database_service.set_user_credential(user.id, "BOOKFUSION_ENABLED", "true" if enabled else "false")
+    database_service.set_user_credential(user.id, "BOOKFUSION_ANNOTATION_SYNC", "true" if annotation_sync else "false")
+    try:
+        container.user_client_registry().invalidate(user.id)
+    except Exception as e:
+        logger.debug("Could not invalidate BookFusion client bundle for user %s: %s", user.id, e)
+    state = _bookfusion_account_state(user.id)
+    return jsonify({"ok": True, **state})
 
 
 # Library-lookup credentials the primary admin's account also lends to the
@@ -1086,6 +1129,7 @@ def admin_user_integrations(user_id):
             "BookOrbit": "bookorbit",
             "Grimmory / BookLore": "booklore",
             "Readest": "readest",
+            "BookFusion": "bookfusion",
             "Hardcover": "hardcover",
             "StoryGraph": "storygraph",
         },
@@ -1098,6 +1142,7 @@ _TEST_CONNECTION_FIELDS = {
     'storyteller': ['STORYTELLER_ENABLED', 'STORYTELLER_API_URL', 'STORYTELLER_USER', 'STORYTELLER_PASSWORD'],
     'booklore': ['BOOKLORE_ENABLED', 'BOOKLORE_SERVER', 'BOOKLORE_USER', 'BOOKLORE_PASSWORD'],
     'bookorbit': ['BOOKORBIT_ENABLED', 'BOOKORBIT_SERVER', 'BOOKORBIT_USER', 'BOOKORBIT_PASSWORD'],
+    'bookfusion': ['BOOKFUSION_ENABLED', 'BOOKFUSION_API_URL', 'BOOKFUSION_ACCESS_TOKEN'],
     'cwa': ['CWA_ENABLED', 'CWA_SERVER', 'CWA_USERNAME', 'CWA_PASSWORD', 'CWA_SYNC_TOKEN'],
     'readest': ['READEST_ANNOTATION_SYNC', 'READEST_EMAIL', 'READEST_PASSWORD', 'READEST_SUPABASE_URL'],
     'hardcover': ['HARDCOVER_ENABLED', 'HARDCOVER_TOKEN'],
@@ -2759,6 +2804,7 @@ def settings():
             'KOSYNC_ENABLED',
             'STORYTELLER_ENABLED',
             'BOOKLORE_ENABLED',
+            'BOOKFUSION_ENABLED',
             'GRIMMORY_READING_SESSIONS',
             'CWA_ENABLED',
             'CWA_SYNC_ENABLED',
@@ -2804,7 +2850,7 @@ def settings():
             for key in booklore_setting_keys
         }
         url_keys = [
-            'SHELFMARK_URL', 'ABS_SERVER', 'BOOKLORE_SERVER',
+            'SHELFMARK_URL', 'ABS_SERVER', 'BOOKLORE_SERVER', 'BOOKFUSION_API_URL',
             'STORYTELLER_API_URL', 'CWA_SERVER', 'KOSYNC_SERVER',
             'OLLAMA_URL', 'LLM_BASE_URL',
         ]
@@ -8480,6 +8526,11 @@ def _run_test_connection(service: str, payload: dict):
             _coerce_test_str(data.get('BOOKORBIT_USER')),
             _coerce_test_str(data.get('BOOKORBIT_PASSWORD')),
         ),
+        'bookfusion': lambda data: _test_bookfusion(
+            _coerce_test_bool(data.get('BOOKFUSION_ENABLED')),
+            _normalize_test_url(data.get('BOOKFUSION_API_URL')),
+            _coerce_test_str(data.get('BOOKFUSION_ACCESS_TOKEN')),
+        ),
         'cwa': lambda data: _test_cwa(
             _coerce_test_bool(data.get('CWA_ENABLED')),
             _normalize_test_url(data.get('CWA_SERVER')),
@@ -8529,6 +8580,40 @@ def _run_test_connection(service: str, payload: dict):
 def test_connection(service: str):
     """Test connectivity with diagnostic error messages."""
     return _run_test_connection(service, request.get_json(silent=True) or {})
+
+
+def api_bookfusion_device_start() -> object:
+    """Start the BookFusion device-link flow for the current user."""
+    client = uc().bookfusion_client
+    data = client.start_device_link()
+    if not data:
+        return jsonify({"ok": False, "message": "Could not start BookFusion device link"}), 502
+    return jsonify({
+        "ok": True,
+        "device_code": data.get("device_code"),
+        "user_code": data.get("user_code"),
+        "verification_uri": data.get("verification_uri"),
+        "interval": data.get("interval", 5),
+        "expires_in": data.get("expires_in", 600),
+    })
+
+
+def api_bookfusion_device_poll() -> object:
+    """Poll BookFusion's device-link token endpoint for the current user."""
+    payload = request.get_json(silent=True) or {}
+    device_code = str(payload.get("device_code") or "").strip()
+    if not device_code:
+        return jsonify({"ok": False, "error": "missing_device_code"}), 400
+    result = uc().bookfusion_client.poll_token(device_code)
+    if result.get("ok"):
+        user = current_user()
+        if user is not None:
+            try:
+                container.user_client_registry().invalidate(user.id)
+            except Exception as e:
+                logger.debug("Could not invalidate BookFusion client bundle after link for user %s: %s", user.id, e)
+    status = 200 if result.get("ok") or result.get("error") in ("authorization_pending", "slow_down") else 400
+    return jsonify(result), status
 
 
 def _test_llm_provider(
@@ -8916,6 +9001,25 @@ def _test_readest(email: str, password: str, supabase_url: str) -> dict:
     return {"ok": False, "message": "Login rejected — check email/password (Google sign-in accounts have no password)"}
 
 
+def _test_bookfusion(enabled: bool, api_url: str, access_token: str) -> dict:
+    """Validate a BookFusion access token without persisting anything."""
+    if not enabled:
+        return {"ok": False, "message": "BookFusion is disabled"}
+    if not access_token:
+        return {"ok": False, "message": "Link BookFusion first"}
+    from src.api.bookfusion_client import BookFusionClient
+    creds = {
+        "BOOKFUSION_ENABLED": "true",
+        "BOOKFUSION_ACCESS_TOKEN": access_token,
+    }
+    if api_url:
+        creds["BOOKFUSION_API_URL"] = api_url
+    client = BookFusionClient(credentials=creds)
+    if client.check_connection():
+        return {"ok": True, "message": "Connected to BookFusion"}
+    return {"ok": False, "message": "BookFusion API rejected the token"}
+
+
 def _test_storygraph(enabled: bool, session_cookie: str, remember_user_token: str) -> dict:
     if not enabled:
         return {"ok": False, "message": "StoryGraph is disabled"}
@@ -9068,6 +9172,7 @@ def create_app(test_container=None):
     app.add_url_rule('/login', 'login', login, methods=['GET', 'POST'])
     app.add_url_rule('/logout', 'logout', logout, methods=['GET', 'POST'])
     app.add_url_rule('/account', 'account', account, methods=['GET', 'POST'])
+    app.add_url_rule('/api/bookfusion/account', 'api_bookfusion_account', api_bookfusion_account, methods=['POST'])
     app.add_url_rule('/admin/users', 'admin_users', admin_users, methods=['GET', 'POST'])
     app.add_url_rule('/admin/users/<int:user_id>/integrations', 'admin_user_integrations', admin_user_integrations, methods=['GET', 'POST'])
     app.add_url_rule('/api/admin/users/<int:user_id>/test-connection/<service>', 'admin_user_test_connection', admin_user_test_connection, methods=['POST'])
@@ -9122,6 +9227,8 @@ def create_app(test_container=None):
     app.add_url_rule('/api/booklore/shelves', 'get_booklore_shelves', get_booklore_shelves, methods=['GET'])
     app.add_url_rule('/api/abs/libraries', 'get_abs_libraries', get_abs_libraries, methods=['GET'])
     app.add_url_rule('/api/booklore/refresh', 'api_booklore_refresh', api_booklore_refresh, methods=['POST'])
+    app.add_url_rule('/api/bookfusion/device/start', 'api_bookfusion_device_start', api_bookfusion_device_start, methods=['POST'])
+    app.add_url_rule('/api/bookfusion/device/poll', 'api_bookfusion_device_poll', api_bookfusion_device_poll, methods=['POST'])
     app.add_url_rule('/api/test-connection/<service>', 'test_connection', test_connection, methods=['POST'])
 
     # Storyteller API routes

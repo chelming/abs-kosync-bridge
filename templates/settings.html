@@ -1042,6 +1042,42 @@
             </div>
 
 
+            <!-- BookFusion (Optional) -->
+            <div class="settings-section">
+                {% set bookfusion_configured = get_val('BOOKFUSION_ACCESS_TOKEN') != '' %}
+                {% set bookfusion_enabled = get_bool('BOOKFUSION_ENABLED') %}
+                <div class="section-header">
+                    <h3>BookFusion</h3>
+                    <div class="toggle-switch-wrapper">
+                        <span class="toggle-label">Enable</span>
+                        <label class="toggle-switch">
+                            <input type="checkbox" id="toggle_bookfusion" name="BOOKFUSION_ENABLED"
+                                onchange="toggleSection('bookfusion_body', this.checked)" {% if bookfusion_enabled
+                                %}checked{% endif %}>
+                            <span class="slider"></span>
+                        </label>
+                    </div>
+                </div>
+                <div id="bookfusion_body" class="section-body {% if not bookfusion_enabled %}collapsed{% endif %}">
+                    <div class="form-group full-width">
+                        <label>API URL</label>
+                        <input type="text" name="BOOKFUSION_API_URL" value="{{ get_val('BOOKFUSION_API_URL', 'https://www.bookfusion.com') }}">
+                    </div>
+                    <div class="form-group full-width">
+                        <div class="help-text" style="background:rgba(102,126,234,.08);border:1px solid rgba(102,126,234,.25);border-radius:8px;padding:10px 12px;">
+                            Per-user BookFusion access is linked under
+                            <a href="{{ url_for('settings') }}#users" style="color:#aab4f5;">Settings -> Users -> (user) -> Integrations</a>.
+                            The API URL above stays global.
+                        </div>
+                    </div>
+                    <div class="form-group full-width">
+                        <button class="btn" type="button" onclick="startBookFusionLink()">Link BookFusion</button>
+                        <div id="bookfusion_link_status" class="help-text" style="margin-top:8px;"></div>
+                    </div>
+                </div>
+            </div>
+
+
             <!-- BookOrbit (Optional) -->
             <div class="settings-section">
                 {% set bookorbit_configured = get_val('BOOKORBIT_SERVER') != '' %}
@@ -1798,6 +1834,24 @@
                         </div>
                         {% endif %}
 
+                        {% if get_bool('BOOKFUSION_ENABLED') %}
+                        <div class="form-group" style="align-items: center;">
+                            <label>BookFusion Poll Mode</label>
+                            <select name="BOOKFUSION_POLL_MODE" id="bookfusion_poll_mode"
+                                    onchange="togglePollSeconds('bookfusion_poll_seconds_row', this.value)">
+                                <option value="global" {% if get_val('BOOKFUSION_POLL_MODE', 'global') == 'global' %}selected{% endif %}>Global</option>
+                                <option value="custom" {% if get_val('BOOKFUSION_POLL_MODE') == 'custom' %}selected{% endif %}>Custom</option>
+                            </select>
+                        </div>
+                        <div class="form-group" id="bookfusion_poll_seconds_row"
+                             {% if get_val('BOOKFUSION_POLL_MODE') != 'custom' %}style="opacity: 0.45; pointer-events: none;"{% endif %}>
+                            <label>BookFusion Poll Interval (seconds)</label>
+                            <input type="number" name="BOOKFUSION_POLL_SECONDS" min="10"
+                                   value="{{ get_val('BOOKFUSION_POLL_SECONDS', '300') }}">
+                            <div class="help-text">Recommended: 300s for BookFusion.</div>
+                        </div>
+                        {% endif %}
+
                     </div>
                 </div>
             </div>
@@ -2299,6 +2353,7 @@
             storyteller: ['STORYTELLER_ENABLED', 'STORYTELLER_API_URL', 'STORYTELLER_USER', 'STORYTELLER_PASSWORD'],
             booklore: ['BOOKLORE_ENABLED', 'BOOKLORE_SERVER', 'BOOKLORE_USER', 'BOOKLORE_PASSWORD'],
             bookorbit: ['BOOKORBIT_ENABLED', 'BOOKORBIT_SERVER', 'BOOKORBIT_USER', 'BOOKORBIT_PASSWORD'],
+            bookfusion: ['BOOKFUSION_ENABLED', 'BOOKFUSION_API_URL', 'BOOKFUSION_ACCESS_TOKEN'],
             cwa: ['CWA_ENABLED', 'CWA_SERVER', 'CWA_USERNAME', 'CWA_PASSWORD', 'CWA_SYNC_TOKEN'],
             hardcover: ['HARDCOVER_ENABLED', 'HARDCOVER_TOKEN'],
             storygraph: ['STORYGRAPH_ENABLED', 'STORYGRAPH_SESSION_COOKIE', 'STORYGRAPH_REMEMBER_USER_TOKEN'],
@@ -2381,6 +2436,57 @@
                 row.style.opacity = '0.45';
                 row.style.pointerEvents = 'none';
             }
+        }
+
+        function startBookFusionLink() {
+            const status = document.getElementById('bookfusion_link_status');
+            if (!status) return;
+            status.textContent = 'Starting BookFusion link...';
+            fetch('/api/bookfusion/device/start', { method: 'POST' })
+                .then(r => r.json())
+                .then(data => {
+                    if (!data.ok) {
+                        status.textContent = data.message || 'Could not start BookFusion link.';
+                        return;
+                    }
+                    const interval = Math.max(5, Number(data.interval || 5));
+                    const expiresIn = Math.max(interval, Number(data.expires_in || 600));
+                    status.innerHTML = `Go to <a href="${data.verification_uri}" target="_blank" style="color:#aab4f5;">${data.verification_uri}</a> and enter code <strong>${data.user_code}</strong>.`;
+                    pollBookFusionToken(data.device_code, interval, Date.now() + expiresIn * 1000, status);
+                })
+                .catch(err => {
+                    status.textContent = 'BookFusion link failed: ' + err;
+                });
+        }
+
+        function pollBookFusionToken(deviceCode, intervalSeconds, deadlineMs, status) {
+            if (Date.now() > deadlineMs) {
+                status.textContent = 'BookFusion link expired. Start a new link and try again.';
+                return;
+            }
+            window.setTimeout(() => {
+                fetch('/api/bookfusion/device/poll', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ device_code: deviceCode })
+                })
+                    .then(r => r.json())
+                    .then(data => {
+                        if (data.ok) {
+                            status.textContent = 'BookFusion linked. Save settings or refresh this page to see the stored token.';
+                            return;
+                        }
+                        if (data.error === 'authorization_pending' || data.error === 'slow_down') {
+                            const nextInterval = data.error === 'slow_down' ? intervalSeconds + 5 : intervalSeconds;
+                            pollBookFusionToken(deviceCode, nextInterval, deadlineMs, status);
+                            return;
+                        }
+                        status.textContent = data.message || ('BookFusion link failed: ' + (data.error || 'unknown error'));
+                    })
+                    .catch(err => {
+                        status.textContent = 'BookFusion token poll failed: ' + err;
+                    });
+            }, intervalSeconds * 1000);
         }
 
         function toggleKosyncServerMode() {

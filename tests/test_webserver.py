@@ -42,6 +42,7 @@ class MockContainer:
         self.mock_sync_clients = Mock()
         self.mock_forge_service = Mock()
         self.mock_forge_service.active_tasks = set()
+        self.mock_user_client_registry = Mock()
 
         # Configure the sync manager to return our mock clients
         self.mock_sync_manager.abs_client = self.mock_abs_client
@@ -77,6 +78,9 @@ class MockContainer:
 
     def forge_service(self):
         return self.mock_forge_service
+
+    def user_client_registry(self):
+        return self.mock_user_client_registry
 
     def sync_clients(self):
         """Return mock sync clients for integrations."""

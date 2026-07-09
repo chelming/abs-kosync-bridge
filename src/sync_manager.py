@@ -85,6 +85,7 @@ class SyncManager:
     def __init__(self,
                  abs_client=None,
                  booklore_client=None,
+                 bookfusion_client=None,
                  bookorbit_client=None,
                  hardcover_client=None,
                  transcriber=None,
@@ -109,6 +110,7 @@ class SyncManager:
         # Use dependency injection
         self.abs_client = abs_client
         self.booklore_client = booklore_client
+        self.bookfusion_client = bookfusion_client
         self.bookorbit_client = bookorbit_client
         self.hardcover_client = hardcover_client
         self.transcriber = transcriber

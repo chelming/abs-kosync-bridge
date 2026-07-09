@@ -138,6 +138,7 @@ class Book(Base):
     sync_mode = Column(String(20), default='audiobook')  # 'audiobook' or 'ebook_only'
     transcript_source = Column(String(32), nullable=True)  # 'storyteller', 'smil', 'whisper'
     storyteller_uuid = Column(String(36), index=True, nullable=True)
+    bookfusion_id = Column(String(255), nullable=True, index=True)
     abs_ebook_item_id = Column(String(255), nullable=True)  # New ID to track ebook item separately
     series_name = Column(String(500), nullable=True, index=True)
     series_sequence = Column(Float, nullable=True)
@@ -164,7 +165,7 @@ class Book(Base):
                  kosync_doc_id: str = None, transcript_file: str = None,
                  status: str = 'active', duration: float = None, sync_mode: str = 'audiobook',
                  transcript_source: str = None,
-                 storyteller_uuid: str = None, abs_ebook_item_id: str = None,
+                 storyteller_uuid: str = None, bookfusion_id: str = None, abs_ebook_item_id: str = None,
                  series_name: str = None, series_sequence: float = None,
                  user_id: int = None):
         self.abs_id = abs_id
@@ -187,6 +188,7 @@ class Book(Base):
         self.sync_mode = sync_mode
         self.transcript_source = transcript_source
         self.storyteller_uuid = storyteller_uuid
+        self.bookfusion_id = bookfusion_id
         self.abs_ebook_item_id = abs_ebook_item_id
         self.series_name = series_name
         self.series_sequence = series_sequence
@@ -673,6 +675,11 @@ class KoreaderAnnotation(Base):
     # Hardcover spoke bookkeeping (highlight id on hardcover.app)
     hardcover_highlight_id = Column(Integer, nullable=True, index=True)
     hardcover_synced_at = Column(DateTime, nullable=True)
+    # BookFusion spoke bookkeeping
+    bookfusion_highlight_id = Column(Integer, nullable=True, index=True)
+    bookfusion_version = Column(Integer, nullable=True)
+    bookfusion_synced_at = Column(DateTime, nullable=True)
+    bookfusion_deleted_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=utcnow)
     updated_at = Column(DateTime, default=utcnow, onupdate=utcnow, index=True)
 

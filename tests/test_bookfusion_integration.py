@@ -1,0 +1,203 @@
+import unittest
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+from src.api.bookfusion_client import BookFusionClient
+from src.sync_clients.bookfusion_sync_client import BookFusionSyncClient
+from src.sync_clients.sync_client_interface import LocatorResult, UpdateProgressRequest
+from src.services.bookfusion_annotation_sync import BookFusionAnnotationSync
+from src.utils.bookfusion_offsets import BookFusionOffsetMapper, utf16_len
+
+
+class _Resp:
+    def __init__(self, status_code=200, data=None, text=""):
+        self.status_code = status_code
+        self._data = data
+        self.text = text
+
+    def json(self):
+        return self._data
+
+
+class _Session:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def post(self, url, **kwargs):
+        self.calls.append(("POST", url, kwargs))
+        return self.responses.pop(0)
+
+    def get(self, url, **kwargs):
+        self.calls.append(("GET", url, kwargs))
+        return self.responses.pop(0)
+
+
+class BookFusionClientTest(unittest.TestCase):
+    def test_poll_token_persists_per_user_access_token(self):
+        db = MagicMock()
+        client = BookFusionClient(
+            credentials={"BOOKFUSION_API_URL": "https://bf.example"},
+            database_service=db,
+            user_id=7,
+        )
+        client.session = _Session([_Resp(200, {"access_token": "tok-123"})])
+
+        result = client.poll_token("device-code")
+
+        self.assertEqual(result, {"ok": True})
+        db.set_user_credential.assert_any_call(7, "BOOKFUSION_ACCESS_TOKEN", "tok-123")
+        db.set_user_credential.assert_any_call(7, "BOOKFUSION_ENABLED", "true")
+        self.assertEqual(client._creds["BOOKFUSION_ACCESS_TOKEN"], "tok-123")
+        self.assertEqual(client._creds["BOOKFUSION_ENABLED"], "true")
+
+    def test_search_books_uses_confirmed_sort_default(self):
+        client = BookFusionClient(
+            credentials={
+                "BOOKFUSION_ENABLED": "true",
+                "BOOKFUSION_ACCESS_TOKEN": "tok",
+                "BOOKFUSION_API_URL": "https://bf.example",
+            },
+        )
+        client.session = _Session([_Resp(200, {"books": []})])
+
+        client.search_books(page=2, per_page=3)
+
+        self.assertEqual(client.session.calls[0][2]["json"]["sort"], "added_at-desc")
+
+
+class BookFusionSyncClientTest(unittest.TestCase):
+    def test_supports_ebook_sync_only(self):
+        sync = BookFusionSyncClient(MagicMock(), ebook_parser=MagicMock())
+
+        self.assertEqual(sync.get_supported_sync_types(), {"ebook"})
+
+    def test_reads_percentage_as_fraction_and_service_timestamp(self):
+        api = MagicMock()
+        api.is_configured.return_value = True
+        api.get_reading_position.return_value = {
+            "percentage": 32.5,
+            "updated_at": "2026-07-09T14:51:09.000Z",
+        }
+        sync = BookFusionSyncClient(api, ebook_parser=MagicMock())
+        book = SimpleNamespace(abs_id="abs-1", bookfusion_id="8951594")
+        prev = SimpleNamespace(percentage=0.25)
+
+        state = sync.get_service_state(book, prev)
+
+        self.assertAlmostEqual(state.current["pct"], 0.325)
+        self.assertAlmostEqual(state.previous_pct, 0.25)
+        self.assertIn("service_updated_at", state.current)
+
+    def test_update_progress_posts_0_to_100_and_records_write(self):
+        api = MagicMock()
+        api.set_reading_position.return_value = {"updated_at": "now"}
+        sync = BookFusionSyncClient(api, ebook_parser=MagicMock())
+        book = SimpleNamespace(abs_id="abs-1", bookfusion_id="8951594")
+        request = UpdateProgressRequest(LocatorResult(percentage=0.425))
+
+        with patch("src.services.write_tracker.record_write") as record_write:
+            result = sync.update_progress(book, request)
+
+        self.assertTrue(result.success)
+        api.set_reading_position.assert_called_once_with(
+            "8951594",
+            {"percentage": 42.5, "page_position_in_book": 0.425},
+        )
+        record_write.assert_called_once_with("BookFusion", "abs-1", 0.425)
+
+    def test_fetch_bulk_state_uses_books_search_inline_positions(self):
+        api = MagicMock()
+        api.is_configured.return_value = True
+        api.search_books.side_effect = [
+            [{"id": 1, "reading_position": {"percentage": 10}}, {"id": 2}],
+        ]
+        sync = BookFusionSyncClient(api, ebook_parser=MagicMock())
+
+        result = sync.fetch_bulk_state()
+
+        self.assertEqual(result, {"1": {"percentage": 10}})
+        api.search_books.assert_called_once_with(page=1, per_page=100)
+
+
+class BookFusionOffsetMapperTest(unittest.TestCase):
+    XHTML = "<html><body><p>Hello <em>wide \U0001f600</em> tail</p><p>Second</p></body></html>"
+
+    def test_xpointer_to_utf16_offset_counts_surrogate_pairs(self):
+        mapper = BookFusionOffsetMapper(0, self.XHTML)
+
+        offset = mapper.xpointer_to_offset("/body/DocFragment[1]/body/p[1]/em/text().5")
+
+        self.assertEqual(offset, utf16_len("Hello wide "))
+
+    def test_offset_to_xpointer_round_trips_within_text_node(self):
+        mapper = BookFusionOffsetMapper(0, self.XHTML)
+        original = "/body/DocFragment[1]/body/p[1]/em/text().5"
+
+        offset = mapper.xpointer_to_offset(original)
+        xpointer = mapper.offset_to_xpointer(offset)
+
+        self.assertEqual(xpointer, original)
+        self.assertEqual(mapper.xpointer_to_offset(xpointer), offset)
+
+    def test_text_between_uses_utf16_offsets_without_inter_element_separator(self):
+        mapper = BookFusionOffsetMapper(0, self.XHTML)
+        start = mapper.xpointer_to_offset("/body/DocFragment[1]/body/p[1]/em/text().0")
+        end = mapper.xpointer_to_offset("/body/DocFragment[1]/body/p[1]/text()[2].5")
+
+        self.assertEqual(mapper.text_between(start, end), "wide \U0001f600 tail")
+
+    def test_xml_declaration_bytes_parse_and_whitespace_counts_in_offsets(self):
+        mapper = BookFusionOffsetMapper(
+            0,
+            b"<?xml version='1.0' encoding='utf-8'?><html><body><p>One</p>\n<p>Two</p></body></html>",
+        )
+
+        second_start = mapper.xpointer_to_offset("/body/DocFragment[1]/body/p[2]/text().0")
+
+        self.assertEqual(second_start, utf16_len("One\n"))
+        self.assertEqual(mapper.text_between(0, second_start), "One\n")
+        self.assertEqual(
+            mapper.offset_to_xpointer(second_start),
+            "/body/DocFragment[1]/body/p[2]/text().0",
+        )
+
+
+class BookFusionAnnotationSyncTest(unittest.TestCase):
+    def test_build_push_payload_uses_offsets_and_expands_text_end(self):
+        sync = BookFusionAnnotationSync(database_service=MagicMock(), ebook_parser=MagicMock())
+        sync._offsets = MagicMock()
+        sync._offsets.xpointer_to_offsets.return_value = {
+            "chapter_index": 0,
+            "start_offset": 5,
+            "end_offset": 5,
+            "quote_prefix": "before ",
+            "quote_suffix": " after",
+        }
+
+        payload = sync._build_push_payload(
+            "8951594",
+            "Book.epub",
+            {
+                "pos0": "/body/DocFragment[1]/body/p[1]/text().0",
+                "pos1": None,
+                "text": "wide \U0001f600",
+                "note": "note",
+                "color": "red",
+            },
+        )
+
+        self.assertEqual(payload["book_id"], "8951594")
+        self.assertEqual(payload["chapter_index"], 0)
+        self.assertEqual(payload["start_offset"], 5)
+        self.assertEqual(payload["end_offset"], 5 + utf16_len("wide \U0001f600"))
+        self.assertEqual(payload["quote_prefix"], "before ")
+        self.assertEqual(payload["quote_suffix"], " after")
+        self.assertEqual(payload["color"], "#FF3300")
+
+    def test_bookfusion_hex_maps_to_nearest_koreader_color(self):
+        self.assertEqual(BookFusionAnnotationSync._bookfusion_color_to_ko("#ff4954"), "red")
+
+
+if __name__ == "__main__":
+    unittest.main()

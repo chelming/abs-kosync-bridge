@@ -245,6 +245,32 @@ class TestMultiUserAuth(unittest.TestCase):
         self.assertEqual(self.client.get('/api/kosync-plugin/version').status_code, 200)
         self.assertEqual(self.client.get('/api/kosync-plugin/download').status_code, 200)
 
+    def test_regular_user_account_shows_bookfusion_self_service(self):
+        self.svc.create_user("alice", "pw", role="user")
+        self.client.post('/login', data={'username': 'alice', 'password': 'pw'})
+
+        resp = self.client.get('/account')
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn(b'BookFusion', resp.data)
+        self.assertIn(b'/api/bookfusion/account', resp.data)
+        self.assertIn(b'/api/bookfusion/device/start', resp.data)
+
+    def test_regular_user_can_save_own_bookfusion_toggles(self):
+        alice = self.svc.create_user("alice", "pw", role="user")
+        self.client.post('/login', data={'username': 'alice', 'password': 'pw'})
+
+        resp = self.client.post('/api/bookfusion/account', json={
+            'enabled': True,
+            'annotation_sync': True,
+        })
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json()["ok"], True)
+        self.assertEqual(self.svc.get_user_credential(alice.id, 'BOOKFUSION_ENABLED'), 'true')
+        self.assertEqual(self.svc.get_user_credential(alice.id, 'BOOKFUSION_ANNOTATION_SYNC'), 'true')
+        self.mock_container.mock_user_client_registry.invalidate.assert_called_with(alice.id)
+
     # --- admin-managed per-user integrations ---
     def _ipath(self, uid):
         return f'/admin/users/{uid}/integrations'

@@ -13,6 +13,7 @@ from dependency_injector import containers, providers
 # Import all the classes we'll be using
 from src.api.api_clients import ABSClient, KoSyncClient
 from src.api.booklore_client import BookloreClient
+from src.api.bookfusion_client import BookFusionClient
 from src.api.bookorbit_client import BookOrbitClient
 from src.api.cwa_client import CWAClient
 from src.api.cwa_sync_api import CWASyncApi
@@ -39,6 +40,7 @@ from src.sync_clients.abs_sync_client import ABSSyncClient
 from src.sync_clients.kosync_sync_client import KoSyncSyncClient
 from src.sync_clients.storyteller_sync_client import StorytellerSyncClient
 from src.sync_clients.booklore_sync_client import BookloreSyncClient
+from src.sync_clients.bookfusion_sync_client import BookFusionSyncClient
 from src.sync_clients.booklore_audio_sync_client import BookLoreAudioSyncClient
 from src.sync_clients.bookorbit_sync_client import BookOrbitSyncClient
 from src.sync_clients.bookorbit_audio_sync_client import BookOrbitAudioSyncClient
@@ -105,6 +107,10 @@ class Container(containers.DeclarativeContainer):
         BookloreClient,
         database_service=database_service,
         ollama_client=ollama_client
+    )
+    bookfusion_client = providers.Singleton(
+        BookFusionClient,
+        database_service=database_service,
     )
     bookorbit_client = providers.Singleton(BookOrbitClient, ollama_client=ollama_client)
     kavita_client = providers.Object(None)
@@ -219,6 +225,12 @@ class Container(containers.DeclarativeContainer):
         ebook_parser
     )
 
+    bookfusion_sync_client = providers.Singleton(
+        BookFusionSyncClient,
+        bookfusion_client,
+        ebook_parser
+    )
+
     booklore_audio_sync_client = providers.Singleton(
         BookLoreAudioSyncClient,
         booklore_client,
@@ -304,6 +316,7 @@ class Container(containers.DeclarativeContainer):
         KoSync=kosync_sync_client,
         Storyteller=storyteller_sync_client,
         BookLore=booklore_sync_client,
+        BookFusion=bookfusion_sync_client,
         BookLoreAudio=booklore_audio_sync_client,
         BookOrbit=bookorbit_sync_client,
         BookOrbitAudio=bookorbit_audio_sync_client,
@@ -396,6 +409,7 @@ class Container(containers.DeclarativeContainer):
         SyncManager,
         abs_client=abs_client,
         booklore_client=booklore_client,
+        bookfusion_client=bookfusion_client,
         bookorbit_client=bookorbit_client,
         hardcover_client=hardcover_client,
         storyteller_client=storyteller_client,

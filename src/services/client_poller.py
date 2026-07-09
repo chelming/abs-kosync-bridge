@@ -23,6 +23,7 @@ class ClientPoller:
     _POLLABLE = [
         ('Storyteller', 'STORYTELLER'),
         ('BookLore', 'BOOKLORE'),
+        ('BookFusion', 'BOOKFUSION'),
         ('BookLoreAudio', 'BOOKLORE_AUDIO'),
         ('BookOrbit', 'BOOKORBIT'),
         ('BookOrbitAudio', 'BOOKORBIT_AUDIO'),

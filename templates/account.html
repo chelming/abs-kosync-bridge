@@ -27,6 +27,15 @@
             background: #0e0e0e; border: 1px solid #2c2c2c; border-radius: 8px; color: #fff; font-size: 14px;
         }
         input:focus { outline: none; border-color: #667eea; }
+        .check-row {
+            display: flex; align-items: center; gap: 10px; margin: 10px 0;
+        }
+        .check-row input {
+            width: auto; margin: 0;
+        }
+        .check-row label {
+            margin: 0; color: #ddd;
+        }
         button {
             width: 100%; padding: 11px; margin-top: 6px;
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
@@ -43,6 +52,13 @@
         .plugin-version { color: #888; font-size: 12px; font-weight: 500; }
         .plugin-card p { color: #aaa; font-size: 13px; line-height: 1.5; margin: 0 0 16px; }
         .plugin-actions { display: flex; gap: 10px; flex-wrap: wrap; }
+        .status-pill {
+            display: inline-flex; align-items: center; padding: 4px 8px; border-radius: 999px;
+            font-size: 12px; font-weight: 700; margin-left: 8px;
+        }
+        .status-pill.linked { background: rgba(76,175,80,.14); color: #a5d6a7; border: 1px solid rgba(76,175,80,.35); }
+        .status-pill.unlinked { background: rgba(255,193,7,.12); color: #ffe082; border: 1px solid rgba(255,193,7,.32); }
+        .inline-status { color: #aaa; font-size: 12px; line-height: 1.5; margin: 10px 0 0; min-height: 18px; }
         .btn-link {
             display: inline-flex; align-items: center; justify-content: center; gap: 8px;
             padding: 10px 14px; border-radius: 8px; text-decoration: none; font-weight: 600; font-size: 13px;
@@ -84,6 +100,31 @@
     </div>
     <div class="card plugin-card">
         <h2>
+            BookFusion
+            <span id="bookfusion_link_pill" class="status-pill {% if bookfusion_account.linked %}linked{% else %}unlinked{% endif %}">
+                {% if bookfusion_account.linked %}Linked{% else %}Not linked{% endif %}
+            </span>
+        </h2>
+        <p>
+            Link the BookFusion account for <strong>{{ account_user.username }}</strong>. Progress and
+            highlight sync use this user's token, so each reader can connect their own BookFusion account.
+        </p>
+        <div class="check-row">
+            <input type="checkbox" id="bookfusion_enabled" {% if bookfusion_account.enabled %}checked{% endif %}>
+            <label for="bookfusion_enabled">Sync BookFusion reading progress</label>
+        </div>
+        <div class="check-row">
+            <input type="checkbox" id="bookfusion_annotation_sync" {% if bookfusion_account.annotation_sync %}checked{% endif %}>
+            <label for="bookfusion_annotation_sync">Sync BookFusion highlights</label>
+        </div>
+        <div class="plugin-actions">
+            <button type="button" onclick="saveBookFusionAccount()">Save BookFusion settings</button>
+            <button type="button" onclick="startBookFusionLink()">Link BookFusion</button>
+        </div>
+        <div id="bookfusion_link_status" class="inline-status"></div>
+    </div>
+    <div class="card plugin-card">
+        <h2>
             BridgeSync KOReader Plugin
             <span id="bridgesync_plugin_version" class="plugin-version"></span>
         </h2>
@@ -97,6 +138,97 @@
         </div>
     </div>
     <script>
+        function setBookFusionStatus(text) {
+            const status = document.getElementById('bookfusion_link_status');
+            if (status) status.textContent = text || '';
+        }
+
+        function setBookFusionLinked(linked) {
+            const pill = document.getElementById('bookfusion_link_pill');
+            if (!pill) return;
+            pill.classList.toggle('linked', linked);
+            pill.classList.toggle('unlinked', !linked);
+            pill.textContent = linked ? 'Linked' : 'Not linked';
+        }
+
+        function saveBookFusionAccount() {
+            setBookFusionStatus('Saving BookFusion settings...');
+            fetch('/api/bookfusion/account', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    enabled: document.getElementById('bookfusion_enabled').checked,
+                    annotation_sync: document.getElementById('bookfusion_annotation_sync').checked
+                })
+            })
+                .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, data: d }; }); })
+                .then(function (result) {
+                    if (!result.ok || !result.data.ok) {
+                        setBookFusionStatus(result.data.message || result.data.error || 'Could not save BookFusion settings.');
+                        return;
+                    }
+                    setBookFusionLinked(!!result.data.linked);
+                    setBookFusionStatus('BookFusion settings saved.');
+                })
+                .catch(function (err) {
+                    setBookFusionStatus('BookFusion settings save failed: ' + err);
+                });
+        }
+
+        function startBookFusionLink() {
+            setBookFusionStatus('Starting BookFusion link...');
+            fetch('/api/bookfusion/device/start', { method: 'POST' })
+                .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, data: d }; }); })
+                .then(function (result) {
+                    const data = result.data || {};
+                    if (!result.ok || !data.ok) {
+                        setBookFusionStatus(data.message || 'Could not start BookFusion link.');
+                        return;
+                    }
+                    const interval = Number(data.interval || 5);
+                    const expiresIn = Number(data.expires_in || 600);
+                    setBookFusionStatus('Open ' + data.verification_uri + ' and enter code ' + data.user_code + '. Waiting for authorization...');
+                    window.open(data.verification_uri, '_blank', 'noopener');
+                    pollBookFusionToken(data.device_code, interval, Date.now() + expiresIn * 1000);
+                })
+                .catch(function (err) {
+                    setBookFusionStatus('BookFusion link failed: ' + err);
+                });
+        }
+
+        function pollBookFusionToken(deviceCode, intervalSeconds, deadlineMs) {
+            if (Date.now() > deadlineMs) {
+                setBookFusionStatus('BookFusion link expired. Start a new link and try again.');
+                return;
+            }
+            window.setTimeout(function () {
+                fetch('/api/bookfusion/device/poll', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ device_code: deviceCode })
+                })
+                    .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, data: d }; }); })
+                    .then(function (result) {
+                        const data = result.data || {};
+                        if (result.ok && data.ok) {
+                            document.getElementById('bookfusion_enabled').checked = true;
+                            setBookFusionLinked(true);
+                            setBookFusionStatus('BookFusion linked for this account.');
+                            return;
+                        }
+                        if (data.error === 'authorization_pending' || data.error === 'slow_down') {
+                            const nextInterval = data.error === 'slow_down' ? intervalSeconds + 5 : intervalSeconds;
+                            pollBookFusionToken(deviceCode, nextInterval, deadlineMs);
+                            return;
+                        }
+                        setBookFusionStatus(data.message || ('BookFusion link failed: ' + (data.error || 'unknown error')));
+                    })
+                    .catch(function (err) {
+                        setBookFusionStatus('BookFusion token poll failed: ' + err);
+                    });
+            }, Math.max(1, intervalSeconds) * 1000);
+        }
+
         fetch('/api/kosync-plugin/version').then(function (r) { return r.ok ? r.json() : null; })
             .then(function (d) {
                 if (d && d.version) {
