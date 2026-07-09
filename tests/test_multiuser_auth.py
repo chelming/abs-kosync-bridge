@@ -266,6 +266,9 @@ class TestMultiUserAuth(unittest.TestCase):
         self.assertIn(b'BookFusion', resp.data)
         self.assertIn(b'/api/bookfusion/device/start', resp.data)
         self.assertIn(b'/api/account/test-connection/', resp.data)
+        self.assertIn(b'class="toggle-switch"', resp.data)
+        self.assertIn(b'name="BOOKFUSION_ENABLED"', resp.data)
+        self.assertIn(b'class="group-body collapsed"', resp.data)
 
     def test_regular_user_can_save_own_integrations(self):
         alice = self.svc.create_user("alice", "pw", role="user")
@@ -343,6 +346,8 @@ class TestMultiUserAuth(unittest.TestCase):
         self.assertIn(b'name="DEVICE_SYNC_COLLECTION_SOURCE"', resp.data)
         self.assertIn(b'value="hardcover"', resp.data)
         self.assertIn(b'name="DEVICE_SYNC_HARDCOVER_LIST_NAMES"', resp.data)
+        self.assertIn(b'class="toggle-switch"', resp.data)
+        self.assertIn(b'data-source-select="DEVICE_SYNC_COLLECTION_SOURCE"', resp.data)
 
     def test_admin_saves_user_integrations_and_invalidates(self):
         fake_registry = MagicMock()

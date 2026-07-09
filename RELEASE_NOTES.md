@@ -16,7 +16,7 @@ Highlight and note sync still requires the **BridgeSync KOReader plugin from 7.1
 
 - **Integration settings follow the reader** - user-owned credentials live with the reader, either in Account -> My Integrations or in the admin-managed user integrations page. Global Settings keep shared engine behavior such as server URLs, poll intervals, and daemon-level options.
 - **KOReader collection controls are per-reader** - the collection source selector now lives under each reader's KOReader Collections integration group, making Hardcover-list collections discoverable even when Grimmory is disabled.
-- **Readest uses per-user email/password authentication** - Readest highlight sync logs in with each reader's own account and caches tokens for that reader.
+- **Integration pages are easier to scan** - service groups now use Settings-style enable toggles in the header, and disabled groups collapse their account fields until that reader turns the integration on.
 - **Settings and account pages explain the split** - admin integration pages point readers to Account -> My Integrations, and BookFusion forms link to BookFusion's Calibre integration page for manual API-key setup.
 
 ## Operational Notes

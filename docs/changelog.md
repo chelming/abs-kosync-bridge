@@ -28,6 +28,8 @@ Highlight and note sync still requires the **BridgeSync KOReader plugin from 7.1
 
 - **KOReader collection settings now live with each reader.** The collection source selector now lives per reader under KOReader Collections, making Hardcover-list collections discoverable even when Grimmory is disabled.
 
+- **The Integrations pages are easier to scan.** Service groups now use Settings-style enable toggles in the header, and disabled groups collapse their account fields until that reader turns the integration on.
+
 ---
 
 ## [7.1.0]
