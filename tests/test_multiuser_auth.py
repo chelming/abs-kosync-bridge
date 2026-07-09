@@ -245,30 +245,47 @@ class TestMultiUserAuth(unittest.TestCase):
         self.assertEqual(self.client.get('/api/kosync-plugin/version').status_code, 200)
         self.assertEqual(self.client.get('/api/kosync-plugin/download').status_code, 200)
 
-    def test_regular_user_account_shows_bookfusion_self_service(self):
+    def test_regular_user_account_links_to_self_service_integrations(self):
         self.svc.create_user("alice", "pw", role="user")
         self.client.post('/login', data={'username': 'alice', 'password': 'pw'})
 
         resp = self.client.get('/account')
 
         self.assertEqual(resp.status_code, 200)
-        self.assertIn(b'BookFusion', resp.data)
-        self.assertIn(b'/api/bookfusion/account', resp.data)
-        self.assertIn(b'/api/bookfusion/device/start', resp.data)
+        self.assertIn(b'My Integrations', resp.data)
+        self.assertIn(b'/account/integrations', resp.data)
 
-    def test_regular_user_can_save_own_bookfusion_toggles(self):
-        alice = self.svc.create_user("alice", "pw", role="user")
+    def test_regular_user_integrations_page_shows_bookfusion_link(self):
+        self.svc.create_user("alice", "pw", role="user")
         self.client.post('/login', data={'username': 'alice', 'password': 'pw'})
 
-        resp = self.client.post('/api/bookfusion/account', json={
-            'enabled': True,
-            'annotation_sync': True,
+        resp = self.client.get('/account/integrations')
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn(b'My Integrations', resp.data)
+        self.assertIn(b'BookFusion', resp.data)
+        self.assertIn(b'/api/bookfusion/device/start', resp.data)
+        self.assertIn(b'/api/account/test-connection/', resp.data)
+
+    def test_regular_user_can_save_own_integrations(self):
+        alice = self.svc.create_user("alice", "pw", role="user")
+        self.client.post('/login', data={'username': 'alice', 'password': 'pw'})
+        self.svc.set_user_credential(alice.id, 'BOOKFUSION_ACCESS_TOKEN', 'existing-token')
+
+        resp = self.client.post('/account/integrations', data={
+            'BOOKFUSION_ENABLED': 'on',
+            'BOOKFUSION_ANNOTATION_SYNC': 'on',
+            'KOSYNC_ENABLED': 'on',
+            'KOSYNC_USER': 'alice-ko',
+            'KOSYNC_KEY': '',
         })
 
         self.assertEqual(resp.status_code, 200)
-        self.assertEqual(resp.get_json()["ok"], True)
         self.assertEqual(self.svc.get_user_credential(alice.id, 'BOOKFUSION_ENABLED'), 'true')
         self.assertEqual(self.svc.get_user_credential(alice.id, 'BOOKFUSION_ANNOTATION_SYNC'), 'true')
+        self.assertEqual(self.svc.get_user_credential(alice.id, 'BOOKFUSION_ACCESS_TOKEN'), 'existing-token')
+        self.assertEqual(self.svc.get_user_credential(alice.id, 'KOSYNC_ENABLED'), 'true')
+        self.assertEqual(self.svc.get_user_credential(alice.id, 'KOSYNC_USER'), 'alice-ko')
         self.mock_container.mock_user_client_registry.invalidate.assert_called_with(alice.id)
 
     # --- admin-managed per-user integrations ---

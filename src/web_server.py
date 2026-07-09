@@ -987,43 +987,38 @@ def account():
         error=error,
         message=message,
         account_user=user,
-        bookfusion_account=_bookfusion_account_state(user.id),
     )
 
 
-def _setting_truthy_value(value) -> bool:
-    return str(value or "").strip().lower() in {"true", "1", "yes", "on"}
-
-
-def _bookfusion_account_state(user_id: int) -> dict:
-    """Return current-user BookFusion account state for self-service UI."""
-    try:
-        creds = database_service.get_user_credentials(user_id) or {}
-    except Exception:
-        creds = {}
-    return {
-        "enabled": _setting_truthy_value(creds.get("BOOKFUSION_ENABLED")),
-        "annotation_sync": _setting_truthy_value(creds.get("BOOKFUSION_ANNOTATION_SYNC")),
-        "linked": bool(str(creds.get("BOOKFUSION_ACCESS_TOKEN") or "").strip()),
-    }
-
-
-def api_bookfusion_account() -> object:
-    """Update self-service BookFusion settings for the current signed-in user."""
+def account_integrations():
+    """Self-service integration settings for the signed-in user."""
     user = current_user()
     if user is None:
-        return jsonify({"error": "authentication required"}), 401
-    payload = request.get_json(silent=True) or {}
-    enabled = _coerce_test_bool(payload.get("enabled"))
-    annotation_sync = _coerce_test_bool(payload.get("annotation_sync"))
-    database_service.set_user_credential(user.id, "BOOKFUSION_ENABLED", "true" if enabled else "false")
-    database_service.set_user_credential(user.id, "BOOKFUSION_ANNOTATION_SYNC", "true" if annotation_sync else "false")
-    try:
-        container.user_client_registry().invalidate(user.id)
-    except Exception as e:
-        logger.debug("Could not invalidate BookFusion client bundle for user %s: %s", user.id, e)
-    state = _bookfusion_account_state(user.id)
-    return jsonify({"ok": True, **state})
+        return redirect(url_for('login'))
+
+    from src.utils.user_config import PER_USER_FIELD_GROUPS
+
+    message = None
+    if request.method == 'POST':
+        _apply_user_integrations(user.id)
+        message = "Saved your integrations."
+        user = database_service.get_user(user.id)
+
+    creds = database_service.get_user_credentials(user.id)
+    master = {
+        key: os.environ.get(key, '')
+        for _g, fields in PER_USER_FIELD_GROUPS for key, _l, _t in fields
+    }
+    return render_template(
+        'account_integrations.html',
+        groups=PER_USER_FIELD_GROUPS,
+        creds=creds,
+        master=master,
+        allow_master_fallback=bool(getattr(user, "is_admin", False)),
+        message=message,
+        account_user=user,
+        user_test_services=_USER_TEST_SERVICES,
+    )
 
 
 # Library-lookup credentials the primary admin's account also lends to the
@@ -1121,19 +1116,22 @@ def admin_user_integrations(user_id):
         allow_master_fallback=bool(getattr(target, "is_admin", False)),
         message=message,
         target_user=target,
-        user_test_services={
-            "Audiobookshelf": "abs",
-            "KOReader / KoSync": "kosync",
-            "Storyteller": "storyteller",
-            "Calibre-Web (Automated)": "cwa",
-            "BookOrbit": "bookorbit",
-            "Grimmory / BookLore": "booklore",
-            "Readest": "readest",
-            "BookFusion": "bookfusion",
-            "Hardcover": "hardcover",
-            "StoryGraph": "storygraph",
-        },
+        user_test_services=_USER_TEST_SERVICES,
     )
+
+
+_USER_TEST_SERVICES = {
+    "Audiobookshelf": "abs",
+    "KOReader / KoSync": "kosync",
+    "Storyteller": "storyteller",
+    "Calibre-Web (Automated)": "cwa",
+    "BookOrbit": "bookorbit",
+    "Grimmory / BookLore": "booklore",
+    "Readest": "readest",
+    "BookFusion": "bookfusion",
+    "Hardcover": "hardcover",
+    "StoryGraph": "storygraph",
+}
 
 
 _TEST_CONNECTION_FIELDS = {
@@ -1198,6 +1196,14 @@ def admin_user_test_connection(user_id, service):
     return _run_test_connection(service, payload)
 
 
+def account_test_connection(service):
+    user = current_user()
+    if user is None:
+        return jsonify({"ok": False, "message": "Authentication required"}), 401
+    payload = _posted_user_test_credentials(user, request.get_json(silent=True) or {})
+    return _run_test_connection(service, payload)
+
+
 @admin_required
 def admin_user_abs_libraries(user_id):
     """List this user's Audiobookshelf libraries, using the credentials posted
@@ -1217,6 +1223,23 @@ def admin_user_abs_libraries(user_id):
         return jsonify({"error": str(e)}), 502
 
 
+def account_abs_libraries():
+    """List current user's Audiobookshelf libraries from unsaved form credentials."""
+    user = current_user()
+    if user is None:
+        return jsonify({"error": "Authentication required"}), 401
+    payload = _posted_user_test_credentials(user, request.get_json(silent=True) or {})
+    from src.api.api_clients import ABSClient
+    client = ABSClient(credentials=payload)
+    if not client.is_configured():
+        return jsonify({"error": "Audiobookshelf not configured for this user (set the API token above)"}), 400
+    try:
+        return jsonify(client.get_libraries() or [])
+    except Exception as e:
+        logger.warning("Self-service ABS library lookup failed for user %s: %s", user.id, e)
+        return jsonify({"error": str(e)}), 502
+
+
 @admin_required
 def admin_user_booklore_libraries(user_id):
     """List this user's Grimmory libraries, using the credentials posted from
@@ -1233,6 +1256,23 @@ def admin_user_booklore_libraries(user_id):
         return jsonify(client.get_libraries() or [])
     except Exception as e:
         logger.warning("Per-user Grimmory library lookup failed for user %s: %s", user_id, e)
+        return jsonify({"error": str(e)}), 502
+
+
+def account_booklore_libraries():
+    """List current user's Grimmory libraries from unsaved form credentials."""
+    user = current_user()
+    if user is None:
+        return jsonify({"error": "Authentication required"}), 401
+    payload = _posted_user_test_credentials(user, request.get_json(silent=True) or {})
+    from src.api.booklore_client import BookloreClient
+    client = BookloreClient(database_service=database_service, credentials=payload)
+    if not client.is_configured():
+        return jsonify({"error": "Grimmory not configured for this user (set the login above)"}), 400
+    try:
+        return jsonify(client.get_libraries() or [])
+    except Exception as e:
+        logger.warning("Self-service Grimmory library lookup failed for user %s: %s", user.id, e)
         return jsonify({"error": str(e)}), 502
 
 
@@ -9172,7 +9212,10 @@ def create_app(test_container=None):
     app.add_url_rule('/login', 'login', login, methods=['GET', 'POST'])
     app.add_url_rule('/logout', 'logout', logout, methods=['GET', 'POST'])
     app.add_url_rule('/account', 'account', account, methods=['GET', 'POST'])
-    app.add_url_rule('/api/bookfusion/account', 'api_bookfusion_account', api_bookfusion_account, methods=['POST'])
+    app.add_url_rule('/account/integrations', 'account_integrations', account_integrations, methods=['GET', 'POST'])
+    app.add_url_rule('/api/account/test-connection/<service>', 'account_test_connection', account_test_connection, methods=['POST'])
+    app.add_url_rule('/api/account/abs-libraries', 'account_abs_libraries', account_abs_libraries, methods=['POST'])
+    app.add_url_rule('/api/account/booklore-libraries', 'account_booklore_libraries', account_booklore_libraries, methods=['POST'])
     app.add_url_rule('/admin/users', 'admin_users', admin_users, methods=['GET', 'POST'])
     app.add_url_rule('/admin/users/<int:user_id>/integrations', 'admin_user_integrations', admin_user_integrations, methods=['GET', 'POST'])
     app.add_url_rule('/api/admin/users/<int:user_id>/test-connection/<service>', 'admin_user_test_connection', admin_user_test_connection, methods=['POST'])

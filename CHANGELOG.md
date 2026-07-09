@@ -8,6 +8,8 @@ All notable changes to BookBridge will be documented in this file.
 
 ### What's New
 
+- **Readers can now manage their own integrations.** The Account page now links to a self-service Integrations page where each signed-in reader can save their own service usernames, passwords, tokens, keys, and per-user sync toggles without needing admin Settings access.
+
 - **BookFusion progress and highlight sync is now wired in.** Readers can link a BookFusion account, sync reading progress by percentage, and relay highlights through the annotation hub using freshly implemented UTF-16 offset/xpointer mapping. Uploading books to BookFusion is intentionally out of scope for this phase.
 
 - **Hardcover lists can now create KOReader collections.** BridgeSync-managed KOReader manifests can use either Grimmory shelves or Hardcover lists as the collection source. Hardcover collection mapping is per-user, only applies to books already matched in BookBridge, supports all lists or selected list names, and refreshes on a daily cache.
