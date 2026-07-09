@@ -917,5 +917,124 @@ class HardcoverClient:
                 return True
             return False
 
+    # ------------------------------------------------------------------
+    # Highlights / annotations
+    # ------------------------------------------------------------------
+
+    def get_user_book_id(self, hardcover_book_id: int) -> Optional[int]:
+        """Return the user_book.id for the current user + book, or None."""
+        uid = self.get_user_id()
+        if not uid or not hardcover_book_id:
+            return None
+        result = self.query(
+            """
+            query GetUserBook($bookId: Int!, $userId: Int!) {
+                user_books(where: {book_id: {_eq: $bookId}, user_id: {_eq: $userId}}) {
+                    id
+                }
+            }
+            """,
+            {"bookId": hardcover_book_id, "userId": uid},
+        )
+        rows = (result or {}).get("user_books") or []
+        return int(rows[0]["id"]) if rows else None
+
+    def get_highlights(self, user_book_id: int) -> Optional[list]:
+        """Fetch all highlights for a user_book. Returns list or None on error."""
+        if not user_book_id:
+            return None
+        result = self.query(
+            """
+            query GetHighlights($userBookId: Int!) {
+                user_book_highlights(where: {user_book_id: {_eq: $userBookId}}) {
+                    id
+                    text
+                    note
+                    location
+                    location_type
+                    color
+                }
+            }
+            """,
+            {"userBookId": user_book_id},
+        )
+        if result is None:
+            return None
+        return result.get("user_book_highlights") or []
+
+    def insert_highlight(
+        self,
+        user_book_id: int,
+        text: str,
+        note: Optional[str] = None,
+        location: Optional[int] = None,
+        color: Optional[str] = None,
+    ) -> Optional[int]:
+        """Create a highlight. Returns the new highlight id, or None on failure."""
+        result = self.query(
+            """
+            mutation InsertHighlight(
+                $userBookId: Int!, $text: String!, $note: String,
+                $location: Int, $color: String
+            ) {
+                insert_user_book_highlights_one(object: {
+                    user_book_id: $userBookId,
+                    text: $text,
+                    note: $note,
+                    location: $location,
+                    location_type: "page",
+                    color: $color
+                }) {
+                    id
+                }
+            }
+            """,
+            {
+                "userBookId": user_book_id,
+                "text": text or "",
+                "note": note,
+                "location": location,
+                "color": color,
+            },
+        )
+        row = (result or {}).get("insert_user_book_highlights_one")
+        if row and row.get("id") is not None:
+            return int(row["id"])
+        return None
+
+    def update_highlight(
+        self,
+        highlight_id: int,
+        note: Optional[str] = None,
+        color: Optional[str] = None,
+    ) -> bool:
+        """Update note/color on an existing highlight."""
+        result = self.query(
+            """
+            mutation UpdateHighlight($id: Int!, $note: String, $color: String) {
+                update_user_book_highlights_by_pk(
+                    pk_columns: {id: $id},
+                    _set: {note: $note, color: $color}
+                ) {
+                    id
+                }
+            }
+            """,
+            {"id": highlight_id, "note": note, "color": color},
+        )
+        return bool((result or {}).get("update_user_book_highlights_by_pk"))
+
+    def delete_highlight(self, highlight_id: int) -> bool:
+        """Delete a highlight by id."""
+        result = self.query(
+            """
+            mutation DeleteHighlight($id: Int!) {
+                delete_user_book_highlights_by_pk(id: $id) { id }
+            }
+            """,
+            {"id": highlight_id},
+        )
+        return bool((result or {}).get("delete_user_book_highlights_by_pk"))
+
 
 # [END FILE]
