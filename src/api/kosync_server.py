@@ -18,12 +18,13 @@ from typing import Optional
 
 from flask import Blueprint, jsonify, request, send_file, g
 
+from src.api.booklore_client import BookloreClient
 from src.api.hardcover_client import HardcoverClient
 from src.utils.cache_paths import safe_cache_path
 from src.utils.kosync_headers import hash_kosync_key
 from src.utils.time_utils import utcnow
 from src.utils.user_context import set_current_user_id, reset_current_user_id
-from src.utils.user_config import _ALLOW_GLOBAL_FALLBACK_KEY
+from src.utils.user_config import _ALLOW_GLOBAL_FALLBACK_KEY, resolve_setting
 from src.utils.string_utils import calculate_similarity, clean_book_title
 from src.services.llm_matching import judge_best_candidate
 from src.db.models import State
@@ -54,6 +55,9 @@ _manifest_cache: Optional[dict] = None
 _manifest_cache_lock = threading.Lock()
 _manifest_rebuild_event = threading.Event()
 _manifest_prebuilder_started = False
+_booklore_shelf_mapping_cache: dict = {}
+_booklore_shelf_mapping_cache_lock = threading.Lock()
+_BOOKLORE_SHELF_MAPPING_TTL_SECONDS = 86400
 _hardcover_list_mapping_cache: dict = {}
 _hardcover_list_mapping_cache_lock = threading.Lock()
 _HARDCOVER_LIST_MAPPING_TTL_SECONDS = 86400
@@ -140,41 +144,6 @@ def signal_manifest_rebuild() -> None:
     _manifest_rebuild_event.set()
 
 
-def _build_shelf_mapping_for_cache() -> Optional[dict]:
-    """Fetch the Booklore shelf mapping — same logic as the manifest endpoint."""
-    collection_source = os.environ.get("DEVICE_SYNC_COLLECTION_SOURCE", "grimmory").lower()
-    if collection_source != "grimmory":
-        return None
-    collections_mode = os.environ.get("DEVICE_SYNC_COLLECTIONS", "off").lower()
-    if collections_mode == "off" or not _container:
-        return None
-    try:
-        bl = _container.booklore_client()
-        if not bl.is_configured():
-            return None
-        excluded_raw = os.environ.get("DEVICE_SYNC_EXCLUDED_SHELVES", "")
-        excludes = [s.strip() for s in excluded_raw.split(",") if s.strip()]
-        sync_shelf = os.environ.get("BOOKLORE_SHELF_NAME", "").strip()
-        if sync_shelf and sync_shelf not in excludes:
-            excludes.append(sync_shelf)
-        service = _get_koreader_device_sync_service()
-        if not service:
-            return None
-        target_book_ids = [
-            str(book.ebook_source_id)
-            for book in service.database_service.get_books_by_status("active")
-            if getattr(book, "ebook_source_id", None)
-        ]
-        return bl.get_book_shelf_mapping(
-            mode=collections_mode,
-            excludes=excludes,
-            target_book_ids=target_book_ids,
-        )
-    except Exception as e:
-        logger.warning("Manifest prebuilder: shelf mapping failed: %s", e)
-        return None
-
-
 def _compute_manifest_revision(items) -> str:
     """Deterministic revision over a manifest's book items.
 
@@ -206,6 +175,83 @@ def _device_collection_source() -> str:
 
 def _split_csv(value: str) -> list[str]:
     return [part.strip() for part in str(value or "").split(",") if part.strip()]
+
+
+def _booklore_credentials_for_manifest(user_id):
+    if user_id is None or _database_service is None:
+        return None
+    try:
+        credentials = _database_service.get_user_credentials(user_id)
+    except Exception as e:
+        logger.warning("Manifest Grimmory shelf credentials lookup failed (user_id=%s): %s", user_id, e)
+        return {_ALLOW_GLOBAL_FALLBACK_KEY: False}
+    credentials[_ALLOW_GLOBAL_FALLBACK_KEY] = False
+    return credentials
+
+
+def _booklore_shelf_cache_key(user_id, credentials: Optional[dict]) -> tuple:
+    server = resolve_setting(credentials, "BOOKLORE_SERVER", "") or ""
+    username = resolve_setting(credentials, "BOOKLORE_USER", "") or ""
+    password = resolve_setting(credentials, "BOOKLORE_PASSWORD", "") or ""
+    library_id = resolve_setting(credentials, "BOOKLORE_LIBRARY_ID", "") or ""
+    secret_hash = hashlib.sha256(f"{username}\0{password}".encode("utf-8")).hexdigest()[:16]
+    mode = os.environ.get("DEVICE_SYNC_COLLECTIONS", "off").strip().lower()
+    excludes = tuple(sorted(_split_csv(os.environ.get("DEVICE_SYNC_EXCLUDED_SHELVES", ""))))
+    sync_shelf = resolve_setting(credentials, "BOOKLORE_SHELF_NAME", "") or ""
+    global_sync_shelf = os.environ.get("BOOKLORE_SHELF_NAME", "") or ""
+    return (user_id, server, library_id, secret_hash, mode, excludes, sync_shelf, global_sync_shelf)
+
+
+def _is_booklore_manifest_book(book) -> bool:
+    source = str(getattr(book, "ebook_source", "") or "").strip().lower()
+    return source in {"booklore", "grimmory"} and bool(getattr(book, "ebook_source_id", None))
+
+
+def _build_booklore_shelf_mapping(user_id) -> Optional[dict[str, list[str]]]:
+    """Return Grimmory book id -> shelf names for the manifest user, cached daily."""
+    mode = os.environ.get("DEVICE_SYNC_COLLECTIONS", "off").strip().lower()
+    if mode == "off" or _database_service is None:
+        return None
+
+    credentials = _booklore_credentials_for_manifest(user_id)
+    cache_key = _booklore_shelf_cache_key(user_id, credentials)
+    now = time.time()
+    with _booklore_shelf_mapping_cache_lock:
+        cached = _booklore_shelf_mapping_cache.get(cache_key)
+        if cached and (now - cached["time"]) < _BOOKLORE_SHELF_MAPPING_TTL_SECONDS:
+            return cached["mapping"]
+
+    try:
+        client = BookloreClient(database_service=_database_service, credentials=credentials)
+        if not client.is_configured():
+            return None
+        excludes = _split_csv(os.environ.get("DEVICE_SYNC_EXCLUDED_SHELVES", ""))
+        sync_shelves = [
+            str(resolve_setting(credentials, "BOOKLORE_SHELF_NAME", "") or "").strip(),
+            str(os.environ.get("BOOKLORE_SHELF_NAME", "") or "").strip(),
+        ]
+        for sync_shelf in sync_shelves:
+            if sync_shelf and sync_shelf not in excludes:
+                excludes.append(sync_shelf)
+        books = _database_service.get_books_by_status("active", user_id=user_id) if user_id else _database_service.get_books_by_status("active")
+        target_book_ids = [
+            str(book.ebook_source_id)
+            for book in books
+            if _is_booklore_manifest_book(book)
+        ]
+        mapping = client.get_book_shelf_mapping(
+            mode=mode,
+            excludes=excludes,
+            target_book_ids=target_book_ids,
+        )
+        with _booklore_shelf_mapping_cache_lock:
+            _booklore_shelf_mapping_cache[cache_key] = {"time": now, "mapping": mapping}
+        return mapping
+    except Exception as e:
+        logger.warning("Manifest Grimmory shelf mapping failed (user_id=%s): %s", user_id, e)
+        with _booklore_shelf_mapping_cache_lock:
+            cached = _booklore_shelf_mapping_cache.get(cache_key)
+        return cached["mapping"] if cached else None
 
 
 def _hardcover_list_cache_key(user_id, credentials: Optional[dict]) -> tuple:
@@ -302,8 +348,30 @@ def _apply_hardcover_list_collections(manifest: dict, user_id) -> None:
         item["shelves"] = mapping.get(hardcover_book_id) or ["Unsorted"]
 
 
+def _apply_booklore_shelf_collections(manifest: dict, user_id) -> None:
+    mapping = _build_booklore_shelf_mapping(user_id)
+    if mapping is None or _database_service is None:
+        return
+    try:
+        books = _database_service.get_books_by_status("active", user_id=user_id) if user_id else _database_service.get_books_by_status("active")
+    except Exception as e:
+        logger.warning("Manifest Grimmory shelf book lookup failed (user_id=%s): %s", user_id, e)
+        return
+    books_by_abs = {str(book.abs_id): book for book in books}
+    for item in manifest.get("books") or []:
+        book = books_by_abs.get(str(item.get("abs_id") or ""))
+        if not book or not _is_booklore_manifest_book(book):
+            item.pop("shelves", None)
+            continue
+        source_id = str(getattr(book, "ebook_source_id", "") or "").strip()
+        item["shelves"] = mapping.get(source_id) or ["Unsorted"]
+
+
 def _apply_user_collection_source(manifest: dict, user_id) -> None:
-    if _device_collection_source() == "hardcover":
+    source = _device_collection_source()
+    if source == "grimmory":
+        _apply_booklore_shelf_collections(manifest, user_id)
+    elif source == "hardcover":
         _apply_hardcover_list_collections(manifest, user_id)
 
 
@@ -333,7 +401,7 @@ def _scope_manifest_to_user(manifest, user_id):
         return manifest
     all_books = manifest.get("books") or []
     books = [dict(item) for item in all_books if str(item.get("abs_id")) in owned_ids]
-    if len(books) == len(all_books) and _device_collection_source() != "hardcover":
+    if len(books) == len(all_books) and _device_collection_source() == "off":
         return manifest
     scoped = dict(manifest)
     scoped["books"] = books
@@ -354,8 +422,7 @@ def _manifest_prebuilder_loop() -> None:
         if not service:
             continue
         try:
-            shelf_mapping = _build_shelf_mapping_for_cache()
-            manifest = service.build_manifest(shelf_mapping=shelf_mapping)
+            manifest = service.build_manifest()
             with _manifest_cache_lock:
                 _manifest_cache = manifest
             logger.debug(
@@ -1627,8 +1694,7 @@ def koreader_device_sync_manifest():
     if not service:
         return jsonify({"error": "Device sync service unavailable"}), 503
 
-    shelf_mapping = _build_shelf_mapping_for_cache()
-    manifest = service.build_manifest(shelf_mapping=shelf_mapping)
+    manifest = service.build_manifest()
     with _manifest_cache_lock:
         _manifest_cache = manifest
 

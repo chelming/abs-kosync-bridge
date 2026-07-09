@@ -248,6 +248,8 @@ class TestKosyncEndpoints(unittest.TestCase):
         if web_server.database_service.count_users() == 0:
             web_server.database_service.create_user("admin", "secret", role="admin")
         kosync_server._kosync_device_session_registry = None
+        with kosync_server._booklore_shelf_mapping_cache_lock:
+            kosync_server._booklore_shelf_mapping_cache.clear()
         with kosync_server._hardcover_list_mapping_cache_lock:
             kosync_server._hardcover_list_mapping_cache.clear()
         with kosync_server._kosync_open_sessions_lock:
@@ -795,6 +797,98 @@ class TestKosyncEndpoints(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         ids = [b["abs_id"] for b in response.get_json()["books"]]
         self.assertEqual(ids, ["mine"])
+
+    def test_device_sync_manifest_uses_grimmory_shelves_for_user_collections(self):
+        from src.api import kosync_server
+        from src import web_server
+
+        svc = web_server.database_service
+        admin_id = svc._default_user_id()
+        svc.save_book(Book(abs_id="bl-mine", abs_title="Mine", ebook_filename="m.epub",
+                           ebook_source="BookLore", ebook_source_id="42",
+                           status="active", user_id=admin_id))
+        svc.save_book(Book(abs_id="bo-collision", abs_title="Collision", ebook_filename="c.epub",
+                           ebook_source="BookOrbit", ebook_source_id="42",
+                           status="active", user_id=admin_id))
+        svc.set_user_credential(admin_id, "BOOKLORE_ENABLED", "true")
+        svc.set_user_credential(admin_id, "BOOKLORE_USER", "reader")
+        svc.set_user_credential(admin_id, "BOOKLORE_PASSWORD", "secret")
+        svc.set_user_credential(admin_id, "BOOKLORE_SHELF_NAME", "Kobo")
+
+        fake_client = MagicMock()
+        fake_client.is_configured.return_value = True
+        fake_client.get_book_shelf_mapping.return_value = {"42": ["Fantasy"]}
+
+        manifest = {
+            "generated_at": 1,
+            "revision": "abc",
+            "delete_mode": "mirror",
+            "books": [
+                {"abs_id": "bl-mine", "title": "Mine", "filename": "m.epub",
+                 "content_hash": "h1", "download_path": "/x", "size": 1},
+                {"abs_id": "bo-collision", "title": "Collision", "filename": "c.epub",
+                 "content_hash": "h2", "download_path": "/y", "size": 1,
+                 "shelves": ["Old Source"]},
+            ],
+        }
+
+        with patch.dict(os.environ, {
+            "DEVICE_SYNC_COLLECTION_SOURCE": "grimmory",
+            "DEVICE_SYNC_COLLECTIONS": "all",
+            "DEVICE_SYNC_EXCLUDED_SHELVES": "Read",
+            "BOOKLORE_SERVER": "http://grimmory.test",
+        }, clear=False), \
+             patch.object(kosync_server, "BookloreClient", return_value=fake_client):
+            scoped = kosync_server._scope_manifest_to_user(manifest, admin_id)
+            scoped_again = kosync_server._scope_manifest_to_user(manifest, admin_id)
+
+        by_id = {item["abs_id"]: item for item in scoped["books"]}
+        self.assertEqual(by_id["bl-mine"]["shelves"], ["Fantasy"])
+        self.assertNotIn("shelves", by_id["bo-collision"])
+        self.assertNotEqual(scoped["revision"], "abc")
+        fake_client.get_book_shelf_mapping.assert_called_once_with(
+            mode="all",
+            excludes=["Read", "Kobo"],
+            target_book_ids=["42"],
+        )
+        self.assertEqual(scoped_again["books"][0]["shelves"], ["Fantasy"])
+
+    def test_device_sync_manifest_uses_unsorted_for_grimmory_match_outside_selected_shelves(self):
+        from src.api import kosync_server
+        from src import web_server
+
+        svc = web_server.database_service
+        admin_id = svc._default_user_id()
+        svc.save_book(Book(abs_id="bl-unsorted", abs_title="Unsorted", ebook_filename="u.epub",
+                           ebook_source="BookLore", ebook_source_id="99",
+                           status="active", user_id=admin_id))
+        svc.set_user_credential(admin_id, "BOOKLORE_ENABLED", "true")
+        svc.set_user_credential(admin_id, "BOOKLORE_USER", "reader")
+        svc.set_user_credential(admin_id, "BOOKLORE_PASSWORD", "secret")
+
+        fake_client = MagicMock()
+        fake_client.is_configured.return_value = True
+        fake_client.get_book_shelf_mapping.return_value = {}
+        manifest = {
+            "generated_at": 1,
+            "revision": "abc",
+            "delete_mode": "mirror",
+            "books": [
+                {"abs_id": "bl-unsorted", "title": "Unsorted", "filename": "u.epub",
+                 "content_hash": "h1", "download_path": "/x", "size": 1},
+            ],
+        }
+
+        with patch.dict(os.environ, {
+            "DEVICE_SYNC_COLLECTION_SOURCE": "grimmory",
+            "DEVICE_SYNC_COLLECTIONS": "all",
+            "DEVICE_SYNC_EXCLUDED_SHELVES": "",
+            "BOOKLORE_SERVER": "http://grimmory.test",
+        }, clear=False), \
+             patch.object(kosync_server, "BookloreClient", return_value=fake_client):
+            scoped = kosync_server._scope_manifest_to_user(manifest, admin_id)
+
+        self.assertEqual(scoped["books"][0]["shelves"], ["Unsorted"])
 
     def test_device_sync_manifest_uses_hardcover_lists_for_user_collections(self):
         from src.api import kosync_server
