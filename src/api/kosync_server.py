@@ -178,6 +178,20 @@ def _split_csv(value: str) -> list[str]:
     return [part.strip() for part in str(value or "").split(",") if part.strip()]
 
 
+def _manifest_fallback_allowed(user_id) -> bool:
+    """Whether manifest collection resolution may fall back to the global config.
+
+    Mirrors the app-wide policy (see _bind_request_user_context): admins inherit
+    the shared os.environ settings/credentials, regular users are isolated to
+    their own so one reader's shelves/lists never bleed into another's manifest."""
+    try:
+        user = _database_service.get_user(user_id) if _database_service else None
+    except Exception as e:
+        logger.warning("Manifest fallback-policy lookup failed (user_id=%s): %s", user_id, e)
+        return False
+    return bool(user and getattr(user, "is_admin", False))
+
+
 def _booklore_credentials_for_manifest(user_id):
     if user_id is None or _database_service is None:
         return None
@@ -186,7 +200,7 @@ def _booklore_credentials_for_manifest(user_id):
     except Exception as e:
         logger.warning("Manifest Grimmory shelf credentials lookup failed (user_id=%s): %s", user_id, e)
         return {_ALLOW_GLOBAL_FALLBACK_KEY: False}
-    credentials[_ALLOW_GLOBAL_FALLBACK_KEY] = False
+    credentials[_ALLOW_GLOBAL_FALLBACK_KEY] = _manifest_fallback_allowed(user_id)
     return credentials
 
 
@@ -275,7 +289,7 @@ def _hardcover_credentials_for_manifest(user_id):
     except Exception as e:
         logger.warning("Manifest Hardcover list credentials lookup failed (user_id=%s): %s", user_id, e)
         return {_ALLOW_GLOBAL_FALLBACK_KEY: False}
-    credentials[_ALLOW_GLOBAL_FALLBACK_KEY] = False
+    credentials[_ALLOW_GLOBAL_FALLBACK_KEY] = _manifest_fallback_allowed(user_id)
     return credentials
 
 
@@ -337,14 +351,19 @@ def _apply_hardcover_list_collections(manifest: dict, user_id) -> None:
     mapping = _build_hardcover_list_mapping(user_id)
     if mapping is None or _database_service is None:
         return
+    try:
+        details_by_abs = {
+            str(getattr(details, "abs_id", "") or ""): details
+            for details in _database_service.get_all_hardcover_details()
+        }
+    except Exception as e:
+        logger.warning("Manifest Hardcover details lookup failed (user_id=%s): %s", user_id, e)
+        return
     for item in manifest.get("books") or []:
         abs_id = str(item.get("abs_id") or "")
         if not abs_id:
             continue
-        try:
-            details = _database_service.get_hardcover_details(abs_id)
-        except Exception:
-            details = None
+        details = details_by_abs.get(abs_id)
         hardcover_book_id = str(getattr(details, "hardcover_book_id", "") or "").strip()
         if not hardcover_book_id:
             item.pop("shelves", None)

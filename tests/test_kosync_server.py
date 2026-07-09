@@ -891,6 +891,130 @@ class TestKosyncEndpoints(unittest.TestCase):
 
         self.assertEqual(scoped["books"][0]["shelves"], ["Unsorted"])
 
+    def test_device_sync_manifest_grimmory_falls_back_to_global_for_admin(self):
+        """An admin whose Grimmory collection config lives only in the global
+        settings (os.environ) — the pre-per-user layout — still gets collections.
+        Regular users are isolated, but admins inherit the shared config."""
+        from src.api import kosync_server
+        from src import web_server
+
+        svc = web_server.database_service
+        admin_id = svc._default_user_id()
+        self.assertTrue(getattr(svc.get_user(admin_id), "is_admin", False))
+        svc.save_book(Book(abs_id="bl-admin", abs_title="Admin Book", ebook_filename="a.epub",
+                           ebook_source="BookLore", ebook_source_id="42",
+                           status="active", user_id=admin_id))
+
+        fake_client = MagicMock()
+        fake_client.is_configured.return_value = True
+        fake_client.get_book_shelf_mapping.return_value = {"42": ["Fantasy"]}
+
+        manifest = {
+            "generated_at": 1,
+            "revision": "abc",
+            "delete_mode": "mirror",
+            "books": [
+                {"abs_id": "bl-admin", "title": "Admin Book", "filename": "a.epub",
+                 "content_hash": "h1", "download_path": "/x", "size": 1},
+            ],
+        }
+
+        with patch.dict(os.environ, {
+            "DEVICE_SYNC_COLLECTION_SOURCE": "grimmory",
+            "DEVICE_SYNC_COLLECTIONS": "all",
+            "DEVICE_SYNC_EXCLUDED_SHELVES": "",
+            "BOOKLORE_SHELF_NAME": "",
+            "BOOKLORE_SERVER": "http://grimmory.test",
+        }, clear=False), \
+             patch.object(kosync_server, "BookloreClient", return_value=fake_client):
+            scoped = kosync_server._scope_manifest_to_user(manifest, admin_id)
+
+        self.assertEqual(scoped["books"][0]["shelves"], ["Fantasy"])
+        fake_client.get_book_shelf_mapping.assert_called_once_with(
+            mode="all", excludes=[], target_book_ids=["42"],
+        )
+
+    def test_device_sync_manifest_hardcover_falls_back_to_global_for_admin(self):
+        """The Hardcover-list collection source also honors admin global fallback."""
+        from src.api import kosync_server
+        from src import web_server
+
+        svc = web_server.database_service
+        admin_id = svc._default_user_id()
+        svc.save_book(Book(abs_id="hc-admin", abs_title="Admin HC", ebook_filename="a.epub",
+                           status="active", user_id=admin_id))
+        svc.save_hardcover_details(HardcoverDetails(
+            abs_id="hc-admin",
+            hardcover_book_id="101",
+            hardcover_edition_id="201",
+            matched_by="test",
+        ))
+
+        fake_client = MagicMock()
+        fake_client.is_configured.return_value = True
+        fake_client.get_user_lists.return_value = [{"id": 1, "name": "Owned"}]
+        fake_client.get_list_book_memberships.return_value = [
+            {"list_id": 1, "book_id": 101},
+        ]
+
+        manifest = {
+            "generated_at": 1,
+            "revision": "abc",
+            "delete_mode": "mirror",
+            "books": [
+                {"abs_id": "hc-admin", "title": "Admin HC", "filename": "a.epub",
+                 "content_hash": "h1", "download_path": "/x", "size": 1},
+            ],
+        }
+
+        with patch.dict(os.environ, {
+            "DEVICE_SYNC_COLLECTION_SOURCE": "hardcover",
+            "DEVICE_SYNC_HARDCOVER_LISTS": "all",
+            "DEVICE_SYNC_HARDCOVER_LIST_NAMES": "",
+            "HARDCOVER_TOKEN": "global-token",
+        }, clear=False), \
+             patch.object(kosync_server, "HardcoverClient", return_value=fake_client):
+            scoped = kosync_server._scope_manifest_to_user(manifest, admin_id)
+
+        self.assertEqual(scoped["books"][0]["shelves"], ["Owned"])
+
+    def test_device_sync_manifest_grimmory_isolated_for_regular_user(self):
+        """A regular user with no per-user Grimmory config must NOT inherit the
+        admin's global collection settings (per-user isolation)."""
+        from src.api import kosync_server
+        from src import web_server
+
+        svc = web_server.database_service
+        member = svc.create_user(f"iso_reader_{time.time_ns()}", "pw", role="user")
+        svc.save_book(Book(abs_id="bl-reader", abs_title="Reader Book", ebook_filename="r.epub",
+                           ebook_source="BookLore", ebook_source_id="55",
+                           status="active", user_id=member.id))
+
+        fake_client = MagicMock()
+        fake_client.is_configured.return_value = True
+        fake_client.get_book_shelf_mapping.return_value = {"55": ["Fantasy"]}
+
+        manifest = {
+            "generated_at": 1,
+            "revision": "abc",
+            "delete_mode": "mirror",
+            "books": [
+                {"abs_id": "bl-reader", "title": "Reader Book", "filename": "r.epub",
+                 "content_hash": "h1", "download_path": "/x", "size": 1},
+            ],
+        }
+
+        with patch.dict(os.environ, {
+            "DEVICE_SYNC_COLLECTION_SOURCE": "grimmory",
+            "DEVICE_SYNC_COLLECTIONS": "all",
+            "BOOKLORE_SERVER": "http://grimmory.test",
+        }, clear=False), \
+             patch.object(kosync_server, "BookloreClient", return_value=fake_client):
+            scoped = kosync_server._scope_manifest_to_user(manifest, member.id)
+
+        self.assertNotIn("shelves", scoped["books"][0])
+        fake_client.get_book_shelf_mapping.assert_not_called()
+
     def test_device_sync_manifest_uses_hardcover_lists_for_user_collections(self):
         from src.api import kosync_server
         from src import web_server
