@@ -7460,15 +7460,22 @@ def update_hash(abs_id):
             flash("❌ Could not recalculate hash (file not found?)", "error")
             return redirect(url_for('index'))
 
-    # Make the linked hash durable: register it as a linked KosyncDocument so the
-    # device-sync reconciler / re-match can never strand a hash the user just pinned,
-    # and so PUT/GET resolve it via the per-book sibling path independent of the
-    # single book.kosync_doc_id column.
-    if updated and book.kosync_doc_id:
+    # Keep both sides of a hash change resolvable. The selected hash remains the
+    # book's primary pointer, while the previous hash stays linked as a sibling so
+    # existing devices and progress rows are never stranded.
+    hashes_to_link = [book.kosync_doc_id]
+    if old_hash and old_hash != book.kosync_doc_id:
+        hashes_to_link.append(old_hash)
+    for doc_hash in hashes_to_link:
+        if not updated or not doc_hash:
+            continue
         try:
-            database_service.ensure_linked_kosync_document(book.kosync_doc_id, abs_id)
+            database_service.ensure_linked_kosync_document(doc_hash, abs_id)
         except Exception as e:
-            logger.warning(f"⚠️ Could not register linked KoSync document for '{sanitize_log_data(book.abs_title)}': {e}")
+            logger.warning(
+                f"⚠️ Could not register linked KoSync document '{sanitize_log_data(doc_hash)}' "
+                f"for '{sanitize_log_data(book.abs_title)}': {e}"
+            )
 
     # Trigger an instant sync cycle so the engine can reconcile progress
     # using 'furthest wins' logic. This avoids overwriting newer progress

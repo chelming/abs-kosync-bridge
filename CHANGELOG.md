@@ -6,25 +6,11 @@ All notable changes to BookBridge will be documented in this file.
 
 ## [Unreleased]
 
-### Fixed
+## [7.1.1] - 2026-07-11
 
-- **BridgeSync 0.5.1 loads correctly after updating from 0.5.0.** Version 0.5.0 attempted to write its SQLite startup message before the plugin log path existed, so KOReader disabled the plugin with `bad argument #1 to 'open' (string expected, got nil)`. Startup now establishes the log path before any SQLite initialization messages. Devices that installed 0.5.0 must manually re-download the plugin because the disabled build cannot run its self-updater.
-- **EbookParser path resolution is now cached to eliminate redundant 6–7s recursive scans.** `resolve_book_path` stores successful filename-to-Path resolutions in `_path_cache`, validates cached paths before reuse (dropping stale entries), and checks the cache directory for `bookfusion_`/`storyteller_`-prefixed managed files *before* scanning the 40 MB library tree. A new `invalidate_path_cache()` method clears entries when files are added/removed/renamed. (#318)
-- **EbookParser no longer resolves the same generated XPath twice.** `get_locator_from_char_offset` now calls `_compute_xpath_at_position` with pre-resolved `book_path/full_text/spine_map`, skipping the redundant `resolve_book_path + extract_text_and_map` that `get_perfect_ko_xpath` would otherwise repeat. The old `get_perfect_ko_xpath` body is the shared `_compute_xpath_at_position`; the public method delegates to it with its own resolution, so callers that don't have pre-resolved data still work. (#318)
-- **SyncManager EPUB hydration now shares the parser's path cache.** `_resolve_local_epub_uncached` tries `self.ebook_parser.resolve_book_path()` first, falling back to its own filesystem scan, cache directory, and Grimmory/BookOrbit download only when the parser cannot find the file. (#318)
-- **`/api/mark-complete` no longer calls inappropriate clients or persists state on write failure.** The endpoint now filters clients by `sync_type` (audiobook/ebook from `book.sync_mode`) and `client.supports_book(book)`, matching the `clear_progress` applicability pattern. State rows are only saved after a successful write, preventing orphan 100% snapshots for clients that never owned the book. (#318)
-- **Audiobookshelf instant sync now honors live debounce changes without feedback loops or worker leaks.** Running Socket.IO listeners re-read the debounce setting, keep self-write suppression active through long debounce intervals, and terminate their debounce worker when the supervisor replaces a dead connection.
-- **BridgeSync now drains large sync backlogs without skipping data.** Highlight changes are uploaded in complete acknowledgment-gated chunks before per-book watermarks advance, server-side annotation pages are drained immediately, and reading-stat uploads are bounded below the server limit. BridgeSync also serializes and coalesces competing sync work, exposes on-device job status, repairs incoming xpointer ranges, limits oversized payloads, checks semantic plugin versions daily without offering downgrades, and uses KOReader gettext strings. Plugin version 0.4.0 requires re-download.
-- **Background transcription now stops cleanly when its mapping is deleted.** Cancellation is scoped to the active worker, delete/re-add no longer inherits stale cancellation state, cache cleanup waits for the worker to exit, and a late worker update cannot recreate the deleted mapping. (#313)
-- **Suggestion scans tolerate Audiobookshelf progress records with null durations.** Finished records are dismissed and incomplete records without usable duration data are skipped without aborting the scan. (#312)
-- **Restart recovery serializes pending full Forge uploads.** Large Storyteller uploads no longer all restart concurrently after BookBridge restarts. (#314)
-- **KOReader statistics writes tolerate ordinary SQLite lock contention.** Connections use a bounded busy timeout and statistics uploads retry transient lock failures. (#315)
+The headline is **reader-owned integrations, BookFusion support, and a more reliable BridgeSync**: BookBridge now gives each reader a self-service place for their own service accounts, adds BookFusion progress and highlight sync, expands list and collection bridges, and makes large-library synchronization faster and more resilient.
 
-## [7.1.1] - 2026-07-09
-
-The headline is **reader-owned integrations and BookFusion support**: BookBridge now gives each reader a self-service place for their own service accounts, adds BookFusion progress and highlight sync, and expands list/collection bridges without changing the already-released 7.1.0 annotation foundation.
-
-Highlight and note sync still requires the **BridgeSync KOReader plugin from 7.1.0 or newer**. Older BridgeSync builds and plain KOSync clients continue syncing reading position, but they do not have the annotation exchange, sweep, close-capture, or managed collection support.
+Highlight and note sync still requires the **BridgeSync KOReader plugin from 7.1.0 or newer**. Older BridgeSync builds and plain KOSync clients continue syncing reading position, but they do not have annotation exchange, sweep, close-capture, or managed collection support. Install the latest bundled plugin for the reliability improvements below. Devices that briefly installed BridgeSync 0.5.0 must reinstall manually because that disabled build cannot run its own updater.
 
 ### What's New
 
@@ -45,6 +31,22 @@ Highlight and note sync still requires the **BridgeSync KOReader plugin from 7.1
 - **KOReader collection settings now live with each reader.** The Grimmory-vs-Hardcover collection source selector now lives per reader under Integrations -> KOReader Collections, matching the per-user manifest behavior and making Hardcover-list collections discoverable even when Grimmory is disabled.
 
 - **The Integrations pages are easier to scan.** Service groups now use Settings-style enable toggles in the header, and disabled groups collapse their account fields until that reader turns the integration on.
+
+- **BridgeSync handles large libraries and competing sync requests more reliably.** Annotation and statistics uploads are bounded and acknowledgment-gated, paged server results are drained completely, and overlapping work is serialized and coalesced. On-device job status, safer payload handling, xpointer repair, semantic update checks, and translated interface strings make sync behavior easier to understand and recover.
+
+- **EPUB position resolution is substantially faster.** Book paths are cached and shared by the parser and sync manager, managed cache files bypass unnecessary library scans, and generated XPath lookups reuse already-resolved EPUB text instead of parsing the same book twice. (#318)
+
+### Fixed
+
+- **Manually selected KoSync hashes now stay selected.** The previous and served-file hashes remain linked as siblings, so devices and progress resolve through either EPUB build without a manifest refresh replacing the chosen primary hash. (#316)
+
+- **Mark Complete only writes to compatible services.** BookBridge now filters clients by book type and support, and records completion only after a successful remote update. (#318)
+
+- **Background work shuts down and resumes safely.** Deleting a mapping cancels its transcription worker without allowing a late save to recreate it, while restart recovery serializes pending full Forge uploads instead of launching them all together. (#313, #314)
+
+- **Routine incomplete or temporarily locked data no longer aborts maintenance work.** Suggestion scans skip unusable Audiobookshelf duration records, and KOReader statistics writes retry ordinary SQLite lock contention. (#312, #315)
+
+- **Audiobookshelf instant sync applies live debounce changes safely.** Listener replacements no longer leak debounce workers, and self-write suppression remains active across longer debounce intervals.
 
 ## [7.1.0] - 2026-07-08
 

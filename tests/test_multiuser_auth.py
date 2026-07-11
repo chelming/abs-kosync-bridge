@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 from tests.test_webserver import MockContainer
 from src.db.database_service import DatabaseService
 from src.db.models import Book, KosyncDocument, PendingSuggestion, State
+from src.services.koreader_device_sync_service import KOReaderDeviceSyncService
 
 _TEMPLATES = str(Path(__file__).parent.parent / "templates")
 
@@ -754,10 +755,64 @@ class TestMultiUserAuth(unittest.TestCase):
         linked_doc = self.svc.get_kosync_document("new-hash")
         self.assertIsNotNone(linked_doc)
         self.assertEqual(linked_doc.linked_abs_id, "reg-book")
+        previous_doc = self.svc.get_kosync_document("old-hash")
+        self.assertIsNotNone(previous_doc)
+        self.assertEqual(previous_doc.linked_abs_id, "reg-book")
 
         resp = self.client.post('/api/storyteller/link/reg-book', json={'uuid': 'none'})
         self.assertEqual(resp.status_code, 200)
         self.assertIsNone(self.svc.get_book("reg-book").storyteller_uuid)
+
+    def test_manual_hash_survives_device_manifest_rebuild(self):
+        """A manifest refresh must not replace a hash explicitly pinned by a user."""
+        reg = self.svc.create_user("reg-hash", "pw", role="user")
+        ebook_path = Path(self.tmp) / "manual-hash.epub"
+        ebook_path.write_bytes(b"issue-316-epub")
+        self.svc.save_book(Book(
+            abs_id="manual-hash-book",
+            abs_title="Manual Hash Book",
+            ebook_filename=ebook_path.name,
+            original_ebook_filename=ebook_path.name,
+            kosync_doc_id="original-content-hash",
+            status="active",
+            user_id=reg.id,
+        ))
+        self.client.post('/login', data={'username': 'reg-hash', 'password': 'pw'})
+
+        with patch("src.web_server.threading.Thread"):
+            response = self.client.post(
+                '/update-hash/manual-hash-book',
+                data={'new_hash': 'manually-pinned-hash'},
+            )
+        self.assertEqual(response.status_code, 302)
+
+        ebook_parser = MagicMock()
+        ebook_parser.resolve_book_path.return_value = ebook_path
+        ebook_parser.get_kosync_id.return_value = "original-content-hash"
+        service = KOReaderDeviceSyncService(
+            database_service=self.svc,
+            ebook_parser=ebook_parser,
+            abs_client=MagicMock(),
+            booklore_client=MagicMock(),
+            cwa_client=MagicMock(),
+            epub_cache_dir=Path(self.tmp) / "epub_cache",
+        )
+
+        manifest = service.build_manifest()
+
+        self.assertEqual(
+            self.svc.get_book("manual-hash-book").kosync_doc_id,
+            "manually-pinned-hash",
+        )
+        linked_hashes = {
+            doc.document_hash
+            for doc in self.svc.get_kosync_documents_for_book("manual-hash-book")
+        }
+        self.assertEqual(
+            linked_hashes,
+            {"original-content-hash", "manually-pinned-hash"},
+        )
+        self.assertEqual(manifest["books"][0]["content_hash"], "original-content-hash")
 
     def test_regular_user_kosync_documents_are_scoped_to_own_and_claimed(self):
         admin = self.svc.get_user_by_username("admin")
