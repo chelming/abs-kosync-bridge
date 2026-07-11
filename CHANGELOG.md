@@ -8,6 +8,7 @@ All notable changes to BookBridge will be documented in this file.
 
 ### Fixed
 
+- **Audiobookshelf instant sync now honors live debounce changes without feedback loops or worker leaks.** Running Socket.IO listeners re-read the debounce setting, keep self-write suppression active through long debounce intervals, and terminate their debounce worker when the supervisor replaces a dead connection.
 - **BridgeSync now drains large sync backlogs without skipping data.** Highlight changes are uploaded in complete acknowledgment-gated chunks before per-book watermarks advance, server-side annotation pages are drained immediately, and reading-stat uploads are bounded below the server limit. BridgeSync also serializes and coalesces competing sync work, exposes on-device job status, repairs incoming xpointer ranges, limits oversized payloads, checks semantic plugin versions daily without offering downgrades, and uses KOReader gettext strings. Plugin version 0.4.0 requires re-download.
 - **Background transcription now stops cleanly when its mapping is deleted.** Cancellation is scoped to the active worker, delete/re-add no longer inherits stale cancellation state, cache cleanup waits for the worker to exit, and a late worker update cannot recreate the deleted mapping. (#313)
 - **Suggestion scans tolerate Audiobookshelf progress records with null durations.** Finished records are dismissed and incomplete records without usable duration data are skipped without aborting the scan. (#312)
