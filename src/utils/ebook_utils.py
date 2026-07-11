@@ -934,6 +934,34 @@ class EbookParser:
             curr_tag = curr_tag.parent
         return fragment_id
 
+    def _resolve_spine_item_for_position(self, spine_map, target_index):
+        """Resolve the spine item containing a character position.
+        Handles synthetic separator gaps between spine items and trailing
+        positions past the last real character. For gaps between items, snaps
+        to the following non-empty spine item. For positions past the last
+        item, clamps to the last real character position and returns its item.
+        Returns (spine_item, clamped_index) or (None, None) when the spine
+        map is empty or the position is unrecoverable.
+        """
+        if not spine_map:
+            return None, None
+        # 1. Exact match — position falls inside a spine item's range.
+        for item in spine_map:
+            if item['start'] <= target_index < item['end']:
+                return item, target_index
+        # 2. Gap between spine items: snap to the start of the following item.
+        for item in spine_map:
+            if target_index < item['start']:
+                clamped = max(item['start'], target_index)
+                return item, clamped
+        # 3. Trailing position past the last spine item: clamp to the last
+        #    real character, never the last item blindly.
+        last = spine_map[-1]
+        clamped = min(target_index, last['end'] - 1)
+        if clamped >= last['start']:
+            return last, clamped
+        return spine_map[-1], spine_map[-1]['start']
+
     def get_locator_from_char_offset(self, filename, char_offset: int) -> Optional[LocatorResult]:
         """
         Resolve a rich locator directly from a global character offset.
@@ -952,16 +980,16 @@ class EbookParser:
             target_index = max(0, min(int(char_offset), total_len - 1))
             percentage = target_index / total_len
 
-            target_item = next((item for item in spine_map if item['start'] <= target_index < item['end']), None)
+            target_item, clamped_index = self._resolve_spine_item_for_position(spine_map, target_index)
             if not target_item:
-                target_item = spine_map[-1]
+                return None
 
-            local_index = max(0, target_index - target_item['start'])
+            local_index = max(0, clamped_index - target_item['start'])
             # Use pre-resolved data to avoid a second resolve_book_path + extract_text_and_map
             # inside get_perfect_ko_xpath. xpath and perfect_ko_xpath are identical here
             # (both are the KOReader XPath), so compute once via the shared implementation.
             perfect_ko = self._compute_xpath_at_position(
-                filename, target_index,
+                filename, clamped_index,
                 book_path=book_path, full_text=full_text, spine_map=spine_map,
             )
             cfi = self._generate_cfi(target_item['spine_index'] - 1, target_item['content'], local_index)
@@ -1258,11 +1286,12 @@ class EbookParser:
             # Clamp position to valid range
             position = max(0, min(position, len(full_text) - 1))
 
-            # Find which spine item contains this position
-            target_item = next((item for item in spine_map
-                              if item['start'] <= position < item['end']), spine_map[-1])
+            # Find which spine item contains this position (or snap to nearest valid)
+            target_item, clamped_pos = self._resolve_spine_item_for_position(spine_map, position)
+            if not target_item:
+                return None
 
-            local_pos = position - target_item['start']
+            local_pos = clamped_pos - target_item['start']
 
             # Parse HTML content with BeautifulSoup
             soup = BeautifulSoup(target_item['content'], 'html.parser')

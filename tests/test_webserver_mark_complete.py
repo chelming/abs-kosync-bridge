@@ -261,3 +261,158 @@ class MarkCompleteRouteTest(unittest.TestCase):
         abs_client.abs_client.mark_finished.assert_called_once_with("test-book")
         # State should not be persisted when the write failed
         self._db.save_state.assert_not_called()
+
+
+class MarkCompleteKoSyncLocatorTest(unittest.TestCase):
+    """Test that mark_complete persists KoSync locator fields (xpath, cfi)."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        os.environ['DATA_DIR'] = self.temp_dir
+        os.environ['BOOKS_DIR'] = self.temp_dir
+
+    def _build_test(self, mock_clients, sync_mode='audiobook'):
+        """Build Flask app and test client with given mock clients."""
+        from src.db.models import Book
+
+        container = MockContainer(mock_clients=mock_clients)
+        container.mock_database_service.get_book.return_value = Book(
+            abs_id="test-book",
+            abs_title="Test Book",
+            sync_mode=sync_mode,
+            status="active",
+        )
+
+        import src.db.migration_utils
+        self._orig_init_db = src.db.migration_utils.initialize_database
+        src.db.migration_utils.initialize_database = lambda data_dir: container.mock_database_service
+
+        from src.web_server import create_app
+        app, _ = create_app(test_container=container)
+        app.config['TESTING'] = True
+        app.config['WTF_CSRF_ENABLED'] = False
+        app.config['LOGIN_DISABLED'] = True
+        client = app.test_client()
+
+        self._app = app
+        self._container = container
+        self._db = container.mock_database_service
+        self._mock_clients = mock_clients
+
+        return client
+
+    def tearDown(self):
+        import src.db.migration_utils
+        if hasattr(self, '_orig_init_db'):
+            src.db.migration_utils.initialize_database = self._orig_init_db
+        import shutil
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_persists_kosync_xpath_and_cfi_from_updated_state(self):
+        """KoSync xpath and cfi from result.updated_state are persisted in State."""
+        kosync_client = _make_client(
+            "KoSync", sync_types={'ebook'},
+            update_progress_result=MagicMock(
+                success=True,
+                updated_state={
+                    'xpath': '/body/DocFragment[17]/body/p[3]/text().0',
+                    'cfi': '/6/4[chap1]!',
+                },
+            ),
+        )
+
+        clients = {'KoSync': kosync_client}
+        client_app = self._build_test(clients, sync_mode='ebook_only')
+
+        response = _post_json(client_app, '/api/mark-complete/test-book')
+        assert response.status_code == 200, response.get_data(as_text=True)
+
+        # save_state should have been called once
+        assert self._db.save_state.call_count == 1
+        saved = self._db.save_state.call_args[0][0]
+        self.assertEqual(saved.client_name, "kosync")
+        self.assertEqual(saved.percentage, 1.0)
+        self.assertEqual(saved.xpath, '/body/DocFragment[17]/body/p[3]/text().0')
+        self.assertEqual(saved.cfi, '/6/4[chap1]!')
+
+    def test_persists_partial_updated_state(self):
+        """Only xpath in updated_state is persisted when cfi is absent."""
+        kosync_client = _make_client(
+            "KoSync", sync_types={'ebook'},
+            update_progress_result=MagicMock(
+                success=True,
+                updated_state={'xpath': '/body/p[1]/text().0'},
+            ),
+        )
+
+        clients = {'KoSync': kosync_client}
+        client_app = self._build_test(clients, sync_mode='ebook_only')
+
+        response = _post_json(client_app, '/api/mark-complete/test-book')
+        assert response.status_code == 200, response.get_data(as_text=True)
+
+        saved = self._db.save_state.call_args[0][0]
+        self.assertEqual(saved.xpath, '/body/p[1]/text().0')
+        self.assertIsNone(saved.cfi)
+
+    def test_skips_locator_for_abs_client(self):
+        """ABS client does not pass through update_progress result for locator fields."""
+        abs_client = _make_client("ABS", sync_types={'audiobook'})
+        abs_client.update_progress = MagicMock()
+
+        clients = {'ABS': abs_client}
+        client_app = self._build_test(clients)
+
+        response = _post_json(client_app, '/api/mark-complete/test-book')
+        assert response.status_code == 200, response.get_data(as_text=True)
+
+        # State should have been saved (ABS mark_finished succeeded)
+        assert self._db.save_state.call_count == 1
+        saved = self._db.save_state.call_args[0][0]
+        self.assertEqual(saved.client_name, "abs")
+        self.assertEqual(saved.percentage, 1.0)
+        # ABS doesn't set xpath/cfi via updated_state
+        self.assertIsNone(saved.xpath)
+        self.assertIsNone(saved.cfi)
+
+    def test_no_updated_state_graceful(self):
+        """When result has no updated_state attribute, persistence still works."""
+        kosync_client = _make_client(
+            "KoSync", sync_types={'ebook'},
+            update_progress_result=MagicMock(success=True),
+        )
+        # Remove updated_state
+        del kosync_client.update_progress.return_value.updated_state
+
+        clients = {'KoSync': kosync_client}
+        client_app = self._build_test(clients, sync_mode='ebook_only')
+
+        response = _post_json(client_app, '/api/mark-complete/test-book')
+        assert response.status_code == 200, response.get_data(as_text=True)
+
+        saved = self._db.save_state.call_args[0][0]
+        self.assertEqual(saved.client_name, "kosync")
+        self.assertEqual(saved.percentage, 1.0)
+        self.assertIsNone(saved.xpath)
+        self.assertIsNone(saved.cfi)
+
+    def test_empty_updated_state_graceful(self):
+        """When updated_state is empty dict, persistence still works without locators."""
+        kosync_client = _make_client(
+            "KoSync", sync_types={'ebook'},
+            update_progress_result=MagicMock(
+                success=True,
+                updated_state={},
+            ),
+        )
+
+        clients = {'KoSync': kosync_client}
+        client_app = self._build_test(clients, sync_mode='ebook_only')
+
+        response = _post_json(client_app, '/api/mark-complete/test-book')
+        assert response.status_code == 200, response.get_data(as_text=True)
+
+        saved = self._db.save_state.call_args[0][0]
+        self.assertEqual(saved.client_name, "kosync")
+        self.assertIsNone(saved.xpath)
+        self.assertIsNone(saved.cfi)

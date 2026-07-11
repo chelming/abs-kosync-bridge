@@ -7399,6 +7399,11 @@ def mark_complete(abs_id):
 
         # Only persist state when the write succeeded.
         if success:
+            # Preserve any locator metadata returned by the client (e.g. KoSync's
+            # completion XPath) so the synced state has a viable locator.
+            updated_state = {}
+            if client_name.lower() != 'abs':
+                updated_state = getattr(result, 'updated_state', {}) or {}
             state = State(
                 abs_id=abs_id,
                 client_name=client_name.lower(),
@@ -7406,6 +7411,8 @@ def mark_complete(abs_id):
                 timestamp=int(time.time()),
                 last_updated=int(time.time()),
                 user_id=(user.id if user else None),
+                xpath=updated_state.get('xpath'),
+                cfi=updated_state.get('cfi'),
             )
             database_service.save_state(state)
 

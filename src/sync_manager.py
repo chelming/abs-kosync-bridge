@@ -383,9 +383,11 @@ class SyncManager:
         if ko_offset is None and safe_locator.xpath:
             ko_offset = self.ebook_parser.resolve_xpath_to_index(target_epub, safe_locator.xpath)
         if ko_offset is None:
-            ko_offset = target_offset
-
-        ko_error = abs(int(ko_offset) - int(target_offset))
+            # XPath unresolvable — set error above tolerance to trigger fallback
+            # instead of pretending it resolved with zero error.
+            ko_error = tolerance + 1
+        else:
+            ko_error = abs(int(ko_offset) - int(target_offset))
         if ko_error > tolerance:
             sentence_xpath = self.ebook_parser.get_sentence_level_ko_xpath(target_epub, safe_locator.percentage)
             sentence_offset = self.ebook_parser.resolve_xpath_to_index(target_epub, sentence_xpath) if sentence_xpath else None
@@ -419,14 +421,16 @@ class SyncManager:
             except Exception as regen_err:
                 logger.debug(f"'{book.abs_id}' Failed to regenerate CFI for Grimmory fallback: {regen_err}")
 
-            if regenerated_cfi:
+            if regenerated_cfi and regenerated_error is not None and regenerated_error <= tolerance:
                 safe_locator.cfi = regenerated_cfi
                 cfi_offset = regenerated_offset
                 cfi_error = regenerated_error
-                if regenerated_error is not None and regenerated_error <= tolerance:
-                    fallback.append("booklore=regenerated_cfi")
-                else:
-                    fallback.append("booklore=regenerated_cfi_unverified")
+                fallback.append("booklore=regenerated_cfi")
+            elif regenerated_cfi:
+                # Regenerated CFI failed round-trip — sending it risks collapsed
+                # positions on Grimmory/BookOrbit. Discard entirely.
+                safe_locator.cfi = None
+                fallback.append("booklore=regenerated_cfi_rejected")
             elif safe_locator.cfi:
                 fallback.append("booklore=keep_unstable_cfi")
             else:

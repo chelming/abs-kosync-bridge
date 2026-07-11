@@ -2617,7 +2617,14 @@ def _respond_from_book_states(doc_id, book):
         # book was just advanced from ABS/Storyteller/etc.) must be pulled forward —
         # returning its stale spot here drags the reader back and starts a GET/PUT
         # tug-of-war (e.g. a 40% audiobook position repeatedly snapping back to 9%).
-        if float(best_doc.percentage) > synced_pct + 0.0001:
+        # Use the sibling's locator when its percentage meets or exceeds the
+        # synced state's. Equal percentages (e.g. both at 100%) where the synced
+        # state has no locator fields (mark-complete with percent-only) mean the
+        # sibling's valid locator should be used rather than suppressed.
+        # The epsilon forms a forgiveness zone so that floating-point near-equal
+        # values are treated as equal while still rejecting genuinely behind
+        # siblings.
+        if float(best_doc.percentage) + 0.0001 > synced_pct:
             logger.info(f"KOSync: Resolved {doc_id} to '{book.abs_title}' via sibling hash {best_doc.document_hash} ({float(best_doc.percentage):.2%})")
             poison_pill = _suppress_empty_progress_response(doc_id, float(best_doc.percentage), best_doc.progress)
             if poison_pill is not None:

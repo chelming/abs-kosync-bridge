@@ -6,6 +6,10 @@ All notable changes to BookBridge will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Locator spine-position resolver and stabilization fixes from automated review.** The synthetic inter-spine separator character between EPUB spine items no longer maps to the last spine item; instead it snaps to the start of the following item. Resolved CFI values that were off by 136K+ characters. XPath resolution failures in locator stabilization no longer silently succeed with zero error. Regenerated CFI that fails round-trip verification is rejected before reaching Grimmory or BookOrbit. Marking a book complete now preserves the client's locator metadata (xpath, cfi) in the persisted state. KoSync GET resolution uses a per-user sibling's valid locator when its percentage equals the synced state (e.g. both at 100%). See `docs/automated-review/BUG_REPORT.md` for the full defect analysis.
+
 ## [7.1.1] - 2026-07-11
 
 The headline is **reader-owned integrations, BookFusion support, and a more reliable BridgeSync**: BookBridge now gives each reader a self-service place for their own service accounts, adds BookFusion progress and highlight sync, expands list and collection bridges, and makes large-library synchronization faster and more resilient.
