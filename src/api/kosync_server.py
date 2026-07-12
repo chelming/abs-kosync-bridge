@@ -2008,8 +2008,26 @@ def kosync_upload_sessions():
 
     accepted = 0
     rejected = 0
+    results = []
 
-    for session in data:
+    def record_result(index: int, session: dict, was_accepted: bool,
+                      reason: str = None) -> None:
+        """Record one ordered acknowledgement for the plugin's local queue."""
+        result = {"index": index, "accepted": was_accepted}
+        session_id = session.get('session_id') if isinstance(session, dict) else None
+        if session_id:
+            result["session_id"] = session_id
+        if reason:
+            result["reason"] = reason
+        results.append(result)
+
+    for index, session in enumerate(data, start=1):
+        if not isinstance(session, dict):
+            logger.warning("Session upload: invalid session at index %d", index)
+            rejected += 1
+            record_result(index, {}, False, "invalid_session")
+            continue
+
         abs_id = session.get('abs_id')
         doc_hash = session.get('document_hash')
         book = None
@@ -2031,6 +2049,7 @@ def kosync_upload_sessions():
         if not book:
             logger.warning(f"Session upload: book not found for abs_id='{abs_id}' hash='{doc_hash}'")
             rejected += 1
+            record_result(index, session, False, "book_not_found")
             continue
 
         session_type = session.get('session_type', 'EBOOK')
@@ -2072,6 +2091,7 @@ def kosync_upload_sessions():
         if already_recorded:
             logger.info("Session upload: accepted duplicate retry for '%s'", abs_id)
             accepted += 1
+            record_result(index, session, True)
             continue
 
         try:
@@ -2089,7 +2109,10 @@ def kosync_upload_sessions():
         except Exception as e:
             logger.warning(f"Session upload: failed to record session for '{abs_id}': {e}")
             rejected += 1
+            record_result(index, session, False, "record_failed")
             continue
+
+        record_result(index, session, True)
 
         if _database_service:
             try:
@@ -2208,7 +2231,7 @@ def kosync_upload_sessions():
         )
 
     logger.info(f"Session upload: accepted={accepted}, rejected={rejected}")
-    return jsonify({"accepted": accepted, "rejected": rejected}), 200
+    return jsonify({"accepted": accepted, "rejected": rejected, "results": results}), 200
 
 
 @kosync_sync_bp.route('/device-sync/logs', methods=['POST'])

@@ -91,7 +91,20 @@ end)
 preload("json", function()
     return {
         encode = function() return "{}" end,
-        decode = function() return {} end,
+        decode = function(value)
+            if value == "__partial_session_response__" then
+                return {
+                    accepted = 1,
+                    rejected = 1,
+                    results = {
+                        { index = 1, session_id = "session-accepted", accepted = true },
+                        { index = 2, session_id = "session-rejected", accepted = false,
+                            reason = "book_not_found" },
+                    },
+                }
+            end
+            return {}
+        end,
     }
 end)
 
@@ -242,7 +255,7 @@ assert(#uploaded_log_payloads == 3,
 assert(uploaded_log_payloads[2].operation == "session_upload")
 assert(uploaded_log_payloads[2].status == "failure")
 assert(uploaded_log_payloads[3].status == "success")
-assert(uploaded_log_payloads[3].plugin_version == "0.5.3")
+assert(uploaded_log_payloads[3].plugin_version == "0.5.4")
 assert(type(sqlite_values.device_log_upload_offset) == "number",
     "successful telemetry must persist the acknowledged log byte offset")
 
@@ -255,5 +268,61 @@ for _, line in ipairs(uploaded_log_payloads[2].lines or {}) do
 end
 assert(saw_ack_failure,
     "failure telemetry must include the local SQLite acknowledgement diagnostic")
+
+bridge._loadStateItems = function()
+    return {
+        ["kobo-book"] = {
+            local_path = "/mnt/onboard/Koreaderbooks/Title.epub",
+            filename = "Title.epub",
+            content_hash = "hash-1",
+        },
+    }
+end
+assert(bridge:_resolveAbsId("/mnt/onboard/KoreaderBooks/Title.epub") == "kobo-book",
+    "managed Kobo paths must resolve across case-only directory differences")
+bridge.ui.document = { file = "/mnt/onboard/KoreaderBooks/Title.epub" }
+assert(bridge:_isCurrentDocument("/mnt/onboard/Koreaderbooks/Title.epub"),
+    "the open-book guard must compare managed Kobo paths case-insensitively")
+
+local saved_items = nil
+bridge.delete_removed_books = true
+bridge._ensureDirectory = function() return true end
+bridge._getStateScalar = function() return "old-revision" end
+bridge.api.getManifest = function()
+    return true, { revision = "new-revision", books = {} }
+end
+bridge._saveState = function(_, items)
+    saved_items = items
+    return true
+end
+bridge._updateCollections = function() end
+bridge._isCurrentDocument = function() return false end
+bridge._deleteManagedFile = function() return false, "permission denied" end
+local delete_result = bridge:_runSync()
+assert(delete_result.deleted == 0 and delete_result.errors == 1,
+    "failed managed-file removal must be reported as an error, not a deletion")
+assert(saved_items["kobo-book"] ~= nil,
+    "failed managed-file removal must retain state for a later retry")
+
+local marked_session_ids = nil
+bridge.pending_sessions = {
+    { session_id = "session-accepted", abs_id = "book-1" },
+    { session_id = "session-rejected", abs_id = "missing-book" },
+}
+bridge.api.uploadSessions = function()
+    return true, 200, "__partial_session_response__"
+end
+bridge.sqlite_state.mark_sessions_uploaded = function(_, session_ids)
+    marked_session_ids = session_ids
+    return true
+end
+upload_ok = bridge:_uploadSessions()
+assert(upload_ok == false,
+    "a partial server acknowledgement must keep the upload job retryable")
+assert(#marked_session_ids == 1 and marked_session_ids[1] == "session-accepted",
+    "only server-accepted sessions may be acknowledged in local SQLite")
+assert(#bridge.pending_sessions == 1
+        and bridge.pending_sessions[1].session_id == "session-rejected",
+    "server-rejected sessions must remain queued for recovery")
 
 print("BridgeSync Lua init regression test passed")

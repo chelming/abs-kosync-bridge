@@ -1384,9 +1384,30 @@ function BridgeSync:_buildHashIndex()
     return index
 end
 
+function BridgeSync:_normalizeManagedPath(path)
+    if not path then
+        return nil
+    end
+    local normalized = tostring(path):gsub("\\", "/"):gsub("/+", "/")
+    if #normalized > 1 then
+        normalized = normalized:gsub("/$", "")
+    end
+    local lower = normalized:lower()
+    if lower:match("^/mnt/onboard/") or lower:match("^/mnt/us/") then
+        return lower
+    end
+    return normalized
+end
+
+function BridgeSync:_managedPathsEqual(left, right)
+    local normalized_left = self:_normalizeManagedPath(left)
+    local normalized_right = self:_normalizeManagedPath(right)
+    return normalized_left ~= nil and normalized_left == normalized_right
+end
+
 function BridgeSync:_findTrackedAbsIdByPath(items, path)
     for abs_id, entry in pairs(items) do
-        if entry.local_path == path then
+        if self:_managedPathsEqual(entry.local_path, path) then
             return abs_id
         end
     end
@@ -1394,41 +1415,50 @@ function BridgeSync:_findTrackedAbsIdByPath(items, path)
 end
 
 function BridgeSync:_safeRemove(path)
-    if path and self:_fileExists(path) then
-        os.remove(path)
+    if not path or not self:_fileExists(path) then
+        return true
     end
+    local ok, err = os.remove(path)
+    return ok == true, err
 end
 
 function BridgeSync:_removeTree(path)
     local mode = lfs.attributes(path, "mode")
     if mode == "file" then
-        os.remove(path)
-        return true
+        local ok, err = os.remove(path)
+        return ok == true, err
     end
     if mode ~= "directory" then
-        return false
+        return true
     end
 
     for entry in lfs.dir(path) do
         if entry ~= "." and entry ~= ".." then
             local child = path .. "/" .. entry
-            self:_removeTree(child)
+            local child_ok, child_err = self:_removeTree(child)
+            if not child_ok then
+                return false, child_err
+            end
         end
     end
-    lfs.rmdir(path)
-    return true
+    local ok, err = lfs.rmdir(path)
+    return ok == true, err
 end
 
 function BridgeSync:_deleteManagedFile(path)
     if not path or path == "" then
-        return
+        return true
     end
-    self:_safeRemove(path)
-    self:_removeTree(path .. ".sdr")
+    local file_ok, file_err = self:_safeRemove(path)
+    local sidecar_ok, sidecar_err = self:_removeTree(path .. ".sdr")
+    if not file_ok or not sidecar_ok then
+        return false, file_err or sidecar_err or "managed file deletion failed"
+    end
+    return true
 end
 
 function BridgeSync:_moveFile(source_path, target_path)
-    if source_path == target_path then
+    if self:_managedPathsEqual(source_path, target_path) then
         return true
     end
 
@@ -1457,7 +1487,7 @@ end
 
 function BridgeSync:_isCurrentDocument(path)
     local current = self:_currentDocumentPath()
-    return current and path and current == path
+    return self:_managedPathsEqual(current, path)
 end
 
 function BridgeSync:_runSync()
@@ -1531,7 +1561,7 @@ function BridgeSync:_runSync()
         end
 
         if reused_path then
-            if reused_path ~= target_path then
+            if not self:_managedPathsEqual(reused_path, target_path) then
                 local move_ok = self:_moveFile(reused_path, target_path)
                 if move_ok then
                     renamed = renamed + 1
@@ -1575,7 +1605,7 @@ function BridgeSync:_runSync()
                     else
                         downloaded = downloaded + 1
                         if previous_entry
-                            and previous_entry.local_path == target_path
+                            and self:_managedPathsEqual(previous_entry.local_path, target_path)
                             and previous_entry.content_hash
                             and previous_entry.content_hash ~= book.content_hash
                         then
@@ -1602,9 +1632,15 @@ function BridgeSync:_runSync()
                     items[abs_id] = entry
                     deferred = deferred + 1
                 else
-                    self:_deleteManagedFile(entry.local_path)
-                    items[abs_id] = nil
-                    deleted = deleted + 1
+                    local delete_ok, delete_err = self:_deleteManagedFile(entry.local_path)
+                    if delete_ok then
+                        items[abs_id] = nil
+                        deleted = deleted + 1
+                    else
+                        errors = errors + 1
+                        self:logWarn("Managed file deletion failed for", abs_id,
+                            entry.local_path or "", delete_err or "")
+                    end
                 end
             elseif entry.pending_delete then
                 entry.pending_delete = nil
@@ -1903,7 +1939,7 @@ end
 function BridgeSync:_resolveAbsId(file_path)
     local items = self:_loadStateItems()
     for abs_id, entry in pairs(items) do
-        if entry.local_path and entry.local_path == file_path then
+        if entry.local_path and self:_managedPathsEqual(entry.local_path, file_path) then
             return abs_id
         end
     end
@@ -2046,13 +2082,43 @@ function BridgeSync:_uploadSessions()
 
     self:logInfo("Uploading", #self.pending_sessions, "pending sessions")
 
-    local ok, code, body = self.api:uploadSessions(self.pending_sessions)
+    local submitted_sessions = self.pending_sessions
+    local ok, code, body = self.api:uploadSessions(submitted_sessions)
     if ok then
-        self:logInfo("Sessions uploaded successfully")
+        local response = nil
+        local parsed, decoded = pcall(json.decode, body or "{}")
+        if parsed and type(decoded) == "table" then
+            response = decoded
+        end
+
+        local accepted_sessions = submitted_sessions
+        local retained_sessions = {}
+        local has_per_session_results = response and type(response.results) == "table"
+        if has_per_session_results then
+            accepted_sessions = {}
+            local results_by_index = {}
+            for _, result in ipairs(response.results) do
+                if type(result) == "table" and tonumber(result.index) then
+                    results_by_index[tonumber(result.index)] = result
+                end
+            end
+            for index, session in ipairs(submitted_sessions) do
+                local result = results_by_index[index]
+                if result and result.accepted == true then
+                    table.insert(accepted_sessions, session)
+                else
+                    table.insert(retained_sessions, session)
+                end
+            end
+        elseif response and tonumber(response.rejected or 0) > 0 then
+            accepted_sessions = {}
+            retained_sessions = submitted_sessions
+        end
+
         -- Mark SQLite rows as uploaded so they aren't reloaded on restart
         if self.sqlite_available then
             local uploaded_ids = {}
-            for _, s in ipairs(self.pending_sessions) do
+            for _, s in ipairs(accepted_sessions) do
                 if s.session_id then
                     table.insert(uploaded_ids, s.session_id)
                 end
@@ -2068,8 +2134,17 @@ function BridgeSync:_uploadSessions()
                 end
             end
         end
-        self.pending_sessions = {}
+
+        self.pending_sessions = retained_sessions
         self:_savePendingSessions(self.pending_sessions)
+        if #retained_sessions > 0 then
+            self:logWarn("Session upload partially accepted:", #accepted_sessions,
+                "accepted,", #retained_sessions, "retained for retry")
+            self:_uploadDeviceLogTail("session_upload", "partial")
+            return false
+        end
+
+        self:logInfo("Sessions uploaded successfully")
         self:_uploadDeviceLogTail("session_upload", "success")
         return true
     else

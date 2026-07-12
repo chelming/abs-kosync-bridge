@@ -650,12 +650,44 @@ class DatabaseService:
             session.query(KosyncDocument).filter(
                 KosyncDocument.linked_abs_id == abs_id
             ).update({KosyncDocument.linked_abs_id: None})
+
+            # SQLite foreign-key enforcement is not guaranteed on established
+            # installs, so remove membership rows explicitly instead of relying
+            # on their ON DELETE CASCADE declarations.
+            session.query(UserBookFusionLink).filter(
+                UserBookFusionLink.abs_id == abs_id
+            ).delete(synchronize_session=False)
+            session.query(UserBook).filter(
+                UserBook.abs_id == abs_id
+            ).delete(synchronize_session=False)
             
             book = session.query(Book).filter(Book.abs_id == abs_id).first()
             if book:
                 session.delete(book)  # Cascade will handle states and jobs
                 return True
             return False
+
+    def cleanup_orphaned_book_references(self) -> dict[str, int]:
+        """Remove legacy membership or hash links whose book no longer exists."""
+        from sqlalchemy import select
+
+        with self.get_session() as session:
+            valid_book_ids = select(Book.abs_id)
+            user_book_links = session.query(UserBook).filter(
+                ~UserBook.abs_id.in_(valid_book_ids)
+            ).delete(synchronize_session=False)
+            bookfusion_links = session.query(UserBookFusionLink).filter(
+                ~UserBookFusionLink.abs_id.in_(valid_book_ids)
+            ).delete(synchronize_session=False)
+            kosync_links = session.query(KosyncDocument).filter(
+                KosyncDocument.linked_abs_id.isnot(None),
+                ~KosyncDocument.linked_abs_id.in_(valid_book_ids),
+            ).update({KosyncDocument.linked_abs_id: None}, synchronize_session=False)
+            return {
+                "user_books": int(user_book_links or 0),
+                "user_bookfusion_links": int(bookfusion_links or 0),
+                "kosync_documents": int(kosync_links or 0),
+            }
 
     def get_books_by_status(self, status: str, user_id: int = None) -> List[Book]:
         """Get books by status. When user_id is given, scope to the books that

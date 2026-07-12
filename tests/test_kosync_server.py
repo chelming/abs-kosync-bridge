@@ -1770,9 +1770,25 @@ class TestKosyncEndpoints(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.get_json(), {'accepted': 1, 'rejected': 0})
+        self.assertEqual(response.get_json(), {
+            'accepted': 1,
+            'rejected': 0,
+            'results': [{
+                'accepted': True,
+                'index': 1,
+                'session_id': 'plugin-session-1',
+            }],
+        })
         self.assertEqual(retry_response.status_code, 200)
-        self.assertEqual(retry_response.get_json(), {'accepted': 1, 'rejected': 0})
+        self.assertEqual(retry_response.get_json(), {
+            'accepted': 1,
+            'rejected': 0,
+            'results': [{
+                'accepted': True,
+                'index': 1,
+                'session_id': 'plugin-session-1',
+            }],
+        })
 
         registry = web_server.database_service.get_json_setting('KOSYNC_DEVICE_SESSION_REGISTRY', default={})
         self.assertEqual(registry[device_id]['mode'], 'plugin')
@@ -1786,6 +1802,74 @@ class TestKosyncEndpoints(unittest.TestCase):
 
         with kosync_server._kosync_open_sessions_lock:
             self.assertFalse(kosync_server._kosync_open_sessions)
+
+    def test_plugin_session_upload_returns_per_session_rejections(self):
+        """A missing book must be retryable instead of hidden by an HTTP 200 batch."""
+        from src import web_server
+        from src.api import kosync_server
+
+        book = Book(
+            abs_id='session-ack-book',
+            abs_title='Session Ack Book',
+            ebook_filename='session-ack.epub',
+            kosync_doc_id='s' * 32,
+            status='active',
+            sync_mode='ebook_only',
+        )
+        web_server.database_service.save_book(book)
+        payload = [
+            {
+                'session_id': 'accepted-session',
+                'abs_id': book.abs_id,
+                'session_type': 'EPUB',
+                'start_time': 1_742_910_000,
+                'end_time': 1_742_910_120,
+                'duration_seconds': 120,
+                'start_progress': 10,
+                'end_progress': 12,
+            },
+            {
+                'session_id': 'rejected-session',
+                'abs_id': 'missing-book',
+                'session_type': 'EPUB',
+                'start_time': 1_742_920_000,
+                'end_time': 1_742_920_120,
+                'duration_seconds': 120,
+                'start_progress': 5,
+                'end_progress': 6,
+            },
+        ]
+
+        with patch.object(kosync_server, '_manager', None), \
+             self.assertLogs(kosync_server.logger, level='WARNING') as captured:
+            response = self.client.post(
+                '/koreader/device-sync/sessions',
+                headers=self.auth_headers,
+                json=payload,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json(), {
+            'accepted': 1,
+            'rejected': 1,
+            'results': [
+                {
+                    'accepted': True,
+                    'index': 1,
+                    'session_id': 'accepted-session',
+                },
+                {
+                    'accepted': False,
+                    'index': 2,
+                    'reason': 'book_not_found',
+                    'session_id': 'rejected-session',
+                },
+            ],
+        })
+        self.assertIn(
+            "Session upload: book not found for abs_id='missing-book' hash='None'",
+            "\n".join(captured.output),
+        )
 
     def test_plugin_log_upload_relays_bounded_severity_to_bridge_logs(self):
         """Device log telemetry is authenticated, sanitized, and severity-preserving."""
@@ -1907,7 +1991,11 @@ class TestKosyncEndpoints(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.get_json(), {'accepted': 1, 'rejected': 0})
+        self.assertEqual(response.get_json(), {
+            'accepted': 1,
+            'rejected': 0,
+            'results': [{'accepted': True, 'index': 1}],
+        })
 
         registry = web_server.database_service.get_json_setting('KOSYNC_DEVICE_SESSION_REGISTRY', default={})
         self.assertEqual(registry[external_device_id]['mode'], 'plugin')
