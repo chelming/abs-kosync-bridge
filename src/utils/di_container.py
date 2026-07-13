@@ -344,6 +344,18 @@ class Container(containers.DeclarativeContainer):
         ),
     )
 
+    # Per-user client registry (multi-user). Builds per-user API + sync clients
+    # from each user's stored credentials, reusing the shared catalog services.
+    user_client_registry = providers.Singleton(
+        UserClientRegistry,
+        database_service=database_service,
+        ebook_parser=ebook_parser,
+        alignment_service=alignment_service,
+        transcriber=transcriber,
+        ollama_client=ollama_client,
+        epub_cache_dir=epub_cache_dir,
+    )
+
     # Book mapping helper for shelf-watch auto-matches + ebook-only fallbacks.
     # Constructed late so it can pull sync_clients (also a Singleton) for Hardcover/StoryGraph automatch.
     book_mapping_service = providers.Singleton(
@@ -357,6 +369,7 @@ class Container(containers.DeclarativeContainer):
             Hardcover=hardcover_sync_client,
             StoryGraph=storygraph_sync_client,
         ),
+        user_client_registry=user_client_registry,
     )
 
     # "Up Next" shelf watchers (Grimmory + BookOrbit). SuggestionsService is
@@ -369,6 +382,7 @@ class Container(containers.DeclarativeContainer):
         book_mapping_service=book_mapping_service,
         source_name='BookLore',
         env_prefix='BOOKLORE',
+        user_client_registry=user_client_registry,
     )
 
     shelf_watch_service_bookorbit = providers.Singleton(
@@ -378,6 +392,7 @@ class Container(containers.DeclarativeContainer):
         book_mapping_service=book_mapping_service,
         source_name='BookOrbit',
         env_prefix='BOOKORBIT',
+        user_client_registry=user_client_registry,
     )
 
     shelf_watch_services = providers.List(
@@ -388,20 +403,6 @@ class Container(containers.DeclarativeContainer):
     shelf_watch_services_by_client = providers.Dict(
         BookLore=shelf_watch_service,
         BookOrbit=shelf_watch_service_bookorbit,
-    )
-
-    # Per-user client registry (multi-user). Builds per-user API + sync clients
-    # from each user's stored credentials, reusing the shared catalog services.
-    # The global Singletons above remain for the existing single-user paths;
-    # per-user sync (Phase 3+) goes through this registry.
-    user_client_registry = providers.Singleton(
-        UserClientRegistry,
-        database_service=database_service,
-        ebook_parser=ebook_parser,
-        alignment_service=alignment_service,
-        transcriber=transcriber,
-        ollama_client=ollama_client,
-        epub_cache_dir=epub_cache_dir,
     )
 
     # Sync Manager

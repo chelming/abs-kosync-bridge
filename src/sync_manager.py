@@ -501,7 +501,13 @@ class SyncManager:
 
         for user_id in ordered_ids:
             try:
-                return registry.get_clients(user_id)
+                bundle = registry.get_clients(user_id)
+                logger.debug(
+                    "Claimant bundle for '%s': user_id=%s (source: %s)",
+                    abs_id, user_id,
+                    "owner" if user_id == owner_id else "claimant",
+                )
+                return bundle
             except Exception as exc:
                 logger.warning(
                     "Could not build claimant client bundle for pending job '%s' user_id=%s: %s",
@@ -1542,6 +1548,12 @@ class SyncManager:
 
         # 4. Launch the heavy work in a separate thread
         client_bundle = self._client_bundle_for_book_claimant(target_book)
+        bundle_user_id = getattr(client_bundle, 'user_id', None) if client_bundle else None
+        logger.info(
+            "Background job claimant for '%s': user_id=%s",
+            sanitize_log_data(target_book.abs_title),
+            bundle_user_id,
+        )
         library_service = (
             getattr(client_bundle, "library_service", None)
             if client_bundle is not None
@@ -1949,6 +1961,14 @@ class SyncManager:
                             logger.warning(f"⚠️ Failed to clean audio cache: {cleanup_err}")
             else:
                 book.status = 'failed_retry_later'
+                # Log which claimant was used so cross-user identity mismatches
+                # are diagnosable (shared Book row, wrong claimant's credentials).
+                bundle_user = getattr(client_bundle, 'user_id', None) if client_bundle else None
+                logger.info(
+                    "Background job %s marked failed_retry_later (claimant user_id=%s, "
+                    "error=%s)",
+                    abs_id, bundle_user, str(e)[:200],
+                )
 
             if self.database_service.update_book_if_exists(book) is None:
                 logger.info(f"🛑 Skipping failure save for {sanitize_log_data(abs_title)}: mapping was deleted")
@@ -2723,17 +2743,47 @@ class SyncManager:
             legacy = getattr(self, 'shelf_watch_service', None)
             shelf_watchers = [legacy] if legacy else []
         if not target_abs_id:
-            for shelf_watch in shelf_watchers:
+            # Per-user shelf-watch: use the current cycle's user context when
+            # available, so each user's shelves/clients are used and their
+            # BookOrbit links are stored.  When no ambient user context exists
+            # and a registry is available, iterate once per active user so each
+            # user's library is processed independently.
+            shelf_user_id = None
+            try:
+                from src.utils.user_context import get_current_user_id as _get_uid
+                shelf_user_id = _get_uid()
+            except Exception:
+                pass
+
+            registry = getattr(self, 'user_client_registry', None)
+            db = getattr(self, 'database_service', None)
+            if shelf_user_id is not None:
+                # Caller already scoped — one pass with the ambient user.
+                user_ids_to_watch = [shelf_user_id]
+            elif registry is not None and hasattr(db, 'list_users'):
                 try:
-                    # Each watcher gates on its own source's poll mode.
-                    runs_global = getattr(shelf_watch, 'runs_in_global_cycle', None)
-                    if runs_global is not None and not runs_global():
-                        continue
-                    if runs_global is None and os.environ.get('BOOKLORE_POLL_MODE', 'global').lower() != 'global':
-                        continue
-                    shelf_watch.process_watch_shelf()
-                except Exception as e:
-                    logger.warning(f"Shelf-watch run failed: {e}")
+                    user_ids_to_watch = [u.id for u in db.list_users()
+                                         if getattr(u, 'active', 1)]
+                except Exception:
+                    user_ids_to_watch = [None]
+                if not user_ids_to_watch:
+                    user_ids_to_watch = [None]
+            else:
+                # Legacy single-user / no-registry mode.
+                user_ids_to_watch = [None]
+
+            for shelf_user in user_ids_to_watch:
+                for shelf_watch in shelf_watchers:
+                    try:
+                        # Each watcher gates on its own source's poll mode.
+                        runs_global = getattr(shelf_watch, 'runs_in_global_cycle', None)
+                        if runs_global is not None and not runs_global():
+                            continue
+                        if runs_global is None and os.environ.get('BOOKLORE_POLL_MODE', 'global').lower() != 'global':
+                            continue
+                        shelf_watch.process_watch_shelf(user_id=shelf_user)
+                    except Exception as e:
+                        logger.warning(f"Shelf-watch run failed: {e}")
 
         # Optimization: Pre-fetch bulk data from all clients that support it
         # Only do this if we are in a full cycle (target_abs_id is None)

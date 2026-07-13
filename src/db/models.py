@@ -916,6 +916,46 @@ class UserBookFusionLink(Base):
         return f"<UserBookFusionLink(user_id={self.user_id}, abs_id='{self.abs_id}', bookfusion_id='{self.bookfusion_id}')>"
 
 
+class UserBookOrbitLink(Base):
+    """Per-user link between a shared BookBridge book and BookOrbit remote IDs.
+
+    Carries both optional per-user BookOrbit identities (ebook_id and audio_id)
+    plus useful title/author metadata and timestamps.  One link per
+    ``(user_id, abs_id)``; provider IDs are NOT globally unique because the same
+    remote identity may legitimately be shared across users.
+    """
+    __tablename__ = 'user_bookorbit_links'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
+    abs_id = Column(String(255), ForeignKey('books.abs_id', ondelete='CASCADE'), nullable=False, index=True)
+    ebook_id = Column(String(255), nullable=True)
+    audio_id = Column(String(255), nullable=True)
+    title = Column(String(500), nullable=True)
+    author = Column(String(500), nullable=True)
+    created_at = Column(DateTime, nullable=True)
+    updated_at = Column(DateTime, nullable=True)
+
+    __table_args__ = (
+        Index('ix_user_bookorbit_links_user_abs', 'user_id', 'abs_id', unique=True),
+    )
+
+    def __init__(self, user_id: int, abs_id: str, ebook_id: str = None,
+                 audio_id: str = None, title: str = None, author: str = None):
+        self.user_id = user_id
+        self.abs_id = abs_id
+        self.ebook_id = str(ebook_id) if ebook_id else None
+        self.audio_id = str(audio_id) if audio_id else None
+        self.title = title
+        self.author = author
+        now = utcnow()
+        self.created_at = now
+        self.updated_at = now
+
+    def __repr__(self):
+        return f"<UserBookOrbitLink(user_id={self.user_id}, abs_id='{self.abs_id}', ebook_id='{self.ebook_id}', audio_id='{self.audio_id}')>"
+
+
 # Database configuration
 class DatabaseManager:
     """

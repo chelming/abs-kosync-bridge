@@ -526,6 +526,17 @@ def uc():
         user = current_user()
     except RuntimeError:
         user = None
+    if user is None:
+        # Background per-user work has no Flask request context. The sync
+        # cycle/poller binds the ambient user id before invoking helpers such
+        # as SuggestionsService, so resolve that user's bundle instead of
+        # silently falling back to the admin/global clients.
+        user_id = get_current_user_id()
+        if user_id is not None:
+            try:
+                return container.user_client_registry().get_clients(user_id)
+            except Exception as e:
+                logger.debug("uc(): ambient user bundle unavailable: %s", e)
     if user is not None:
         try:
             return container.user_client_registry().get_clients(user.id)

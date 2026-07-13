@@ -6,6 +6,12 @@ All notable changes to BookBridge will be documented in this file.
 
 ## [Unreleased]
 
+- **Fixed:** Shelf-watch is now scoped per user for GitHub issue [#318]. Global and
+  custom polling use each user's own library client and candidate pool, shared
+  mappings are claimed through `UserBook`, and per-user BookOrbit ebook/audio IDs
+  are stored in a new link table so one reader's library identity cannot be used
+  for another reader.
+
 ## [7.2.0] - 2026-07-13
 
 The headline is **reader-owned integrations, full BookFusion support, and a more reliable BridgeSync**: BookBridge now gives each reader a self-service place for their own service accounts, connects to BookFusion for progress, highlight, and book-upload sync, reorganizes Settings and Integrations around a clearer per-service layout, and makes large-library synchronization faster and more resilient.

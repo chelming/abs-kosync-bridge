@@ -38,6 +38,7 @@ from .models import (
     UserCredential,
     UserBook,
     UserBookFusionLink,
+    UserBookOrbitLink,
     Base,
 )
 from src.utils.time_utils import utcnow
@@ -834,6 +835,145 @@ class DatabaseService:
             link = self.get_user_bookfusion_link(user_id, abs_id)
             if link and link.get("bookfusion_id"):
                 return str(link["bookfusion_id"])
+        return None
+
+    # ---- per-user BookOrbit book links (ebook + audio per user) ----
+
+    def _serialize_bookorbit_link(self, link: 'UserBookOrbitLink') -> dict:
+        return {
+            "user_id": link.user_id,
+            "abs_id": link.abs_id,
+            "ebook_id": link.ebook_id,
+            "audio_id": link.audio_id,
+            "title": link.title,
+            "author": link.author,
+            "created_at": link.created_at,
+            "updated_at": link.updated_at,
+        }
+
+    def get_user_bookorbit_link(self, user_id: int, abs_id: str) -> Optional[dict]:
+        """Return the user's BookOrbit link for one BookBridge book."""
+        if user_id is None or not abs_id:
+            return None
+        with self.get_session() as session:
+            link = session.query(UserBookOrbitLink).filter(
+                UserBookOrbitLink.user_id == user_id,
+                UserBookOrbitLink.abs_id == abs_id,
+            ).first()
+            return self._serialize_bookorbit_link(link) if link else None
+
+    def get_user_bookorbit_links_for_books(self, user_id: int, abs_ids: list) -> dict:
+        """Return BookOrbit links keyed by abs_id for a user's visible books."""
+        if user_id is None or not abs_ids:
+            return {}
+        with self.get_session() as session:
+            rows = session.query(UserBookOrbitLink).filter(
+                UserBookOrbitLink.user_id == user_id,
+                UserBookOrbitLink.abs_id.in_(abs_ids),
+            ).all()
+            return {link.abs_id: self._serialize_bookorbit_link(link) for link in rows}
+
+    def set_user_bookorbit_link(
+        self,
+        user_id: int,
+        abs_id: str,
+        ebook_id: str = None,
+        audio_id: str = None,
+        title: str = None,
+        author: str = None,
+    ) -> Optional[dict]:
+        """Create or update a user's BookOrbit link for a shared book.
+
+        At least one of ``ebook_id`` or ``audio_id`` must be provided.
+        """
+        if user_id is None or not abs_id:
+            return None
+        e_id = str(ebook_id).strip() if ebook_id else None
+        a_id = str(audio_id).strip() if audio_id else None
+        if not e_id and not a_id:
+            return None
+        with self.get_session() as session:
+            existing = session.query(UserBookOrbitLink).filter(
+                UserBookOrbitLink.user_id == user_id,
+                UserBookOrbitLink.abs_id == abs_id,
+            ).first()
+            if existing is None:
+                existing = UserBookOrbitLink(
+                    user_id=user_id,
+                    abs_id=abs_id,
+                    ebook_id=e_id,
+                    audio_id=a_id,
+                    title=title,
+                    author=author,
+                )
+                session.add(existing)
+            else:
+                if e_id:
+                    existing.ebook_id = e_id
+                if a_id:
+                    existing.audio_id = a_id
+                if title:
+                    existing.title = title
+                if author:
+                    existing.author = author
+                existing.updated_at = utcnow()
+            session.flush()
+            return self._serialize_bookorbit_link(existing)
+
+    def delete_user_bookorbit_link(self, user_id: int, abs_id: str) -> bool:
+        """Delete a user's BookOrbit link for one BookBridge book."""
+        if user_id is None or not abs_id:
+            return False
+        with self.get_session() as session:
+            deleted = session.query(UserBookOrbitLink).filter(
+                UserBookOrbitLink.user_id == user_id,
+                UserBookOrbitLink.abs_id == abs_id,
+            ).delete(synchronize_session=False)
+            return bool(deleted)
+
+    def has_user_bookorbit_link(self, abs_id: str) -> bool:
+        """Return whether any user has a BookOrbit identity for a shared book."""
+        if not abs_id:
+            return False
+        with self.get_session() as session:
+            return session.query(UserBookOrbitLink.id).filter(
+                UserBookOrbitLink.abs_id == abs_id,
+            ).first() is not None
+
+    def resolve_bookorbit_ebook_id(self, user_id: int, book) -> Optional[str]:
+        """Resolve the user's BookOrbit ebook id for a shared book.
+
+        Prefers the active user's ``UserBookOrbitLink``; falls back to the
+        shared legacy ``Book.ebook_source_id`` for single-user / old rows.
+        """
+        abs_id = getattr(book, "abs_id", None)
+        if user_id is not None and abs_id:
+            link = self.get_user_bookorbit_link(user_id, abs_id)
+            if link is not None:
+                return str(link["ebook_id"]) if link.get("ebook_id") else None
+        # Fallback: legacy shared Book fields
+        if getattr(book, "ebook_source", None) == "BookOrbit":
+            val = getattr(book, "ebook_source_id", None)
+            if val:
+                return str(val)
+        return None
+
+    def resolve_bookorbit_audio_id(self, user_id: int, book) -> Optional[str]:
+        """Resolve the user's BookOrbit audio id for a shared book.
+
+        Prefers the active user's ``UserBookOrbitLink``; falls back to the
+        shared legacy ``Book.audio_source_id`` for single-user / old rows.
+        """
+        abs_id = getattr(book, "abs_id", None)
+        if user_id is not None and abs_id:
+            link = self.get_user_bookorbit_link(user_id, abs_id)
+            if link is not None:
+                return str(link["audio_id"]) if link.get("audio_id") else None
+        # Fallback: legacy shared Book fields
+        if getattr(book, "audio_source", None) == "BookOrbit":
+            val = getattr(book, "audio_provider_book_id", None) or getattr(book, "audio_source_id", None)
+            if val:
+                return str(val)
         return None
 
     def get_book_user_ids(self, abs_id: str) -> List[int]:
