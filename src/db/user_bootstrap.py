@@ -22,6 +22,26 @@ def _backfill_orphans_to_admin(database_service, admin) -> dict:
     return counts
 
 
+def _repair_bookorbit_links(database_service, admin) -> dict:
+    """Repair legacy BookOrbit ownership links after assigning orphan rows."""
+    try:
+        counts = database_service.repair_missing_bookorbit_user_links()
+    except Exception as exc:
+        logger.warning(
+            "Multi-user bootstrap: BookOrbit ownership repair failed for admin '%s': %s",
+            admin.username,
+            exc,
+        )
+        return {}
+    if counts.get("created"):
+        logger.info(
+            "Multi-user bootstrap: repaired %d BookOrbit ownership links for admin '%s'",
+            counts["created"],
+            admin.username,
+        )
+    return counts
+
+
 def _prefill_admin_integrations_from_global(database_service, admin) -> int:
     """Seed the admin's per-user integration credentials from the existing global
     settings so an install upgrading to multi-user doesn't have to re-enter
@@ -95,6 +115,7 @@ def bootstrap_admin_user(database_service) -> None:
             return
 
         _backfill_orphans_to_admin(database_service, admin)
+        _repair_bookorbit_links(database_service, admin)
         _prefill_admin_integrations_from_global(database_service, admin)
     except Exception as e:
         logger.error("Multi-user bootstrap failed: %s", e)
@@ -109,5 +130,6 @@ def create_initial_admin_user(database_service, username: str, password: str):
         raise ValueError("Initial admin already exists")
     user = database_service.create_user(username, password, role="admin")
     counts = _backfill_orphans_to_admin(database_service, user)
+    _repair_bookorbit_links(database_service, user)
     _prefill_admin_integrations_from_global(database_service, user)
     return user, counts

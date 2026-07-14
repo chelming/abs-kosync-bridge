@@ -8,6 +8,15 @@ All notable changes to BookBridge will be documented in this file.
 
 ### Fixed
 
+- **Upgraded multi-user BookOrbit matches now keep each reader's library identity.**
+  The 7.2.0 ownership migration could silently skip legacy rows whose shared book
+  had no creator ID, leaving sync clients to reuse a shared BookOrbit ebook or
+  audiobook ID. A follow-up migration and startup repair now recover those rows
+  from their user claim (or default admin), preserve existing per-user links, and
+  prevent a scoped client from using a legacy ID when multiple readers claim the
+  same book. Existing installs self-heal after migration and restart; deleting and
+  rematching the book is no longer required. (#318)
+
 - **Audiobook-only mappings no longer trigger KoSync EPUB discovery.** KoSync is
   excluded from an `audiobook_only` sync cycle, and blank or placeholder document
   IDs (`None` / `null`) are rejected by the KoSync endpoint before they can create
