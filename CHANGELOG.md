@@ -6,6 +6,15 @@ All notable changes to BookBridge will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **CUDA container images are now published alongside CPU images.** Use a
+  `-cuda` tag such as `latest-cuda` or `dev-cuda` on amd64 hosts with NVIDIA
+  GPU transcription. The image bundles the required CUDA libraries, while
+  automatic Whisper device selection now verifies both those libraries and a
+  GPU passed through to the container before choosing CUDA. Contributed by
+  [@ykpdang](https://github.com/ykpdang). (#320)
+
 ### Fixed
 
 - **Upgraded multi-user BookOrbit matches now keep each reader's library identity.**
