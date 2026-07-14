@@ -78,11 +78,13 @@ class TestSettingsComprehensive(unittest.TestCase):
             'INSTANT_SYNC_ENABLED',
             'SHELFMARK_ENABLED',
             'STORYTELLER_NO_EPUB_CACHE',
+            'STORYTELLER_POLL_WAIT_FOR_SETTLE',
             'BOOKLORE_SHELF_WATCH_ENABLED',
             'BOOKORBIT_ENABLED',
             'BOOKORBIT_READING_SESSIONS',
             'BOOKORBIT_SHELF_WATCH_ENABLED',
             'CALIBRE_USE_ABS_IDENTIFIER',
+            'BOOKFUSION_POLL_WAIT_FOR_SETTLE',
         ]
 
     def tearDown(self):
@@ -184,6 +186,35 @@ class TestSettingsComprehensive(unittest.TestCase):
             html,
             re.compile(
                 r'<input type="checkbox" id="toggle_storygraph" name="STORYGRAPH_ENABLED"[\s\S]*?checked',
+                re.IGNORECASE,
+            ),
+        )
+
+    @patch('src.web_server.restart_server')
+    def test_bookfusion_settle_wait_persists_after_save_and_reload(self, mock_restart):
+        """BOOKFUSION_POLL_WAIT_FOR_SETTLE round-trips through save, DB, and UI."""
+        response = self.client.post('/settings', data={
+            'SYNC_PERIOD_MINS': '5',
+            'BOOKFUSION_ENABLED': 'on',
+            'BOOKFUSION_POLL_MODE': 'custom',
+            'BOOKFUSION_POLL_SECONDS': '300',
+            'BOOKFUSION_POLL_WAIT_FOR_SETTLE': 'on',
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b'Restarting the application', response.data)
+        self.assertEqual(self.settings_store.get('BOOKFUSION_POLL_WAIT_FOR_SETTLE'), 'true')
+
+        os.environ.pop('BOOKFUSION_POLL_WAIT_FOR_SETTLE', None)
+
+        from src.utils.config_loader import ConfigLoader
+        ConfigLoader.load_settings(self.mock_container.mock_database_service)
+
+        html = self._render_settings_template_source()
+        self.assertIn('name="BOOKFUSION_POLL_WAIT_FOR_SETTLE"', html)
+        self.assertRegex(
+            html,
+            re.compile(
+                r'<input type="checkbox" name="BOOKFUSION_POLL_WAIT_FOR_SETTLE"[\s\S]*?checked',
                 re.IGNORECASE,
             ),
         )
