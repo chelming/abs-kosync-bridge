@@ -8,6 +8,15 @@ All notable changes to BookBridge will be documented in this file.
 
 ### Added
 
+- **Opt-in anonymous diagnostics.** Help improve BookBridge by sharing a small
+  daily diagnostic report: deduplicated warning lines from your sync logs with
+  book titles, file paths, and URLs replaced by anonymous tokens — never your
+  library contents or credentials. Admins are asked once via a dashboard
+  prompt (existing installs see it after upgrading), and the choice can be
+  reviewed anytime under Settings → Diagnostics, which also shows the
+  instance ID, the last send time, and a "Send report now" button. Nothing is
+  ever collected or sent unless you opt in.
+
 - **CUDA container images are now published alongside CPU images.** Use a
   `-cuda` tag such as `latest-cuda` or `dev-cuda` on amd64 hosts with NVIDIA
   GPU transcription. The image bundles the required CUDA libraries, while
