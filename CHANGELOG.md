@@ -26,6 +26,12 @@ All notable changes to BookBridge will be documented in this file.
 
 ### Fixed
 
+- **KOReader device setup now suggests a reachable sync-server address.** Reverse-proxied
+  HTTPS keeps the browser-visible origin without exposing the internal KoSync port, while
+  direct LAN access uses the configured KoSync port. Loopback addresses now show a warning
+  and must be replaced before copying, and the Copy button only reports success after the
+  clipboard operation succeeds (with a plain-HTTP fallback).
+
 - **BookFusion dashboard link now validates the book exists before persisting.**
   Dashboard search and the duplicate-resolution path during upload previously
   persisted a BookFusion id without checking whether the BookFusion reader API

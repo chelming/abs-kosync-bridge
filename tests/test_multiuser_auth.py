@@ -247,6 +247,40 @@ class TestMultiUserAuth(unittest.TestCase):
         self.assertEqual(self.client.get('/api/kosync-plugin/version').status_code, 200)
         self.assertEqual(self.client.get('/api/kosync-plugin/download').status_code, 200)
 
+    def test_account_suggests_browser_visible_kosync_url(self):
+        self.svc.create_user("reg", "pw", role="user")
+        self.client.post('/login', data={'username': 'reg', 'password': 'pw'})
+
+        with patch.dict(os.environ, {'KOSYNC_PORT': '5758'}):
+            page = self.client.get('/account').get_data(as_text=True)
+
+        self.assertIn("location.protocol === 'https:'", page)
+        self.assertIn("? location.origin", page)
+        self.assertIn("location.protocol + '//' + location.hostname + ':' + syncPort", page)
+        self.assertIn('var syncPort = "5758"', page)
+
+    def test_account_warns_and_blocks_copy_for_loopback_url(self):
+        self.svc.create_user("reg", "pw", role="user")
+        self.client.post('/login', data={'username': 'reg', 'password': 'pw'})
+
+        page = self.client.get('/account').get_data(as_text=True)
+
+        self.assertIn("host === 'localhost' || host === '127.0.0.1' || host === '::1'", page)
+        self.assertIn('points back to the KOReader device itself', page)
+        self.assertIn("showCopyResult(btn, 'Replace host')", page)
+
+    def test_account_copy_reports_real_result_and_has_http_fallback(self):
+        self.svc.create_user("reg", "pw", role="user")
+        self.client.post('/login', data={'username': 'reg', 'password': 'pw'})
+
+        page = self.client.get('/account').get_data(as_text=True)
+
+        self.assertIn("navigator.clipboard.writeText(input.value)", page)
+        self.assertIn("Promise.resolve(document.execCommand('copy'))", page)
+        self.assertIn("ok === false ? 'Copy failed' : 'Copied'", page)
+        self.assertIn(".catch(function ()", page)
+        self.assertIn("showCopyResult(btn, 'Copy failed')", page)
+
     def test_regular_user_account_links_to_self_service_integrations(self):
         self.svc.create_user("alice", "pw", role="user")
         self.client.post('/login', data={'username': 'alice', 'password': 'pw'})
