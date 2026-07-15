@@ -467,8 +467,24 @@ def maybe_send_diagnostics(
     warning_count = len(payload.get('warnings', []))
 
     try:
-        resp = requests.post(endpoint, json=payload, timeout=30)
+        headers: Dict[str, str] = {}
+        ingest_token = os.environ.get('DIAGNOSTICS_INGEST_TOKEN', '').strip()
+        if ingest_token:
+            headers['Authorization'] = f'Bearer {ingest_token}'
+        resp = requests.post(endpoint, json=payload, timeout=30, headers=headers)
         if 200 <= resp.status_code < 300:
+            # Persist token returned by the receiver (TOFU registration)
+            try:
+                resp_json = resp.json()
+                returned_token = (resp_json or {}).get('token', '')
+                if returned_token:
+                    os.environ['DIAGNOSTICS_INGEST_TOKEN'] = returned_token
+                    try:
+                        database_service.set_setting('DIAGNOSTICS_INGEST_TOKEN', returned_token)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
             handler.clear_snapshot(snapshot)
             now_iso = _utc_iso()
             os.environ['DIAGNOSTICS_LAST_SENT'] = now_iso

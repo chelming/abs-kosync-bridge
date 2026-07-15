@@ -22,6 +22,7 @@ sent unless the user explicitly enables it.
 | `DIAGNOSTICS_INSTANCE_ID` | `""` | Stable UUID4 hex identifier (auto-generated) |
 | `DIAGNOSTICS_ENDPOINT_URL` | `""` | Collector POST URL (TBD for Phase 4) |
 | `DIAGNOSTICS_LAST_SENT` | `""` | ISO-8601 timestamp of last successful send |
+| `DIAGNOSTICS_INGEST_TOKEN` | `""` | Per-instance auth token (auto-persisted from receiver response) |
 
 ## POST Payload Schema
 
@@ -127,8 +128,9 @@ in SQLite for automated and ad-hoc analysis.
 Three tables, managed idempotently via `CREATE TABLE IF NOT EXISTS`:
 
 - **`instances`** — one row per `instance_id`; tracks `first_seen`,
-  `last_seen`, `last_version`, `last_services_json`, and
-  `last_total_books`.  Upserted on every incoming batch.
+  `last_seen`, `last_version`, `last_services_json`,
+  `last_total_books`, `token` (TOFU auth token), and
+  `banned` (0/1).  Upserted on every incoming batch.
 - **`batches`** — one row per received payload; stores `received_at`,
   `sent_at`, `app_version`, `services_json`, `total_books`, window
   bounds, and `dropped` count.
@@ -150,6 +152,23 @@ docker compose up -d --build
 The public `DIAGNOSTICS_ENDPOINT_URL` that opted-in instances POST to
 is still TBD; when deployed behind a reverse proxy, the URL will point
 at the proxy's external address (port 20129 on the internal network).
+
+### Input Sanitization
+
+All attacker-authored text fields (templates, messages, context lines,
+version strings) are sanitized at ingest before any storage:
+
+- **Control characters** (Cc category except ``\n`` and ``\t``) are stripped.
+  Line endings are normalised to ``\n``.
+- **Markdown structure** is neutralised: fences (`` ``` ``) become ``'''``,
+  line-leading ``#`` characters are escaped, and markdown link syntax ``](``
+  is broken to ``] (``.
+- **Length caps** are enforced: template/message 400 chars, logger/level
+  100 chars, context entries 400 chars (max 60 entries), ``app_version``
+  60 chars.
+
+The triage prompt and digest renderer additionally treat stored text as
+untrusted data and apply their own output-sanitization layer.
 
 ### Hygiene
 
@@ -239,3 +258,35 @@ payload; `has_analysis` boolean indicates whether an analysis exists.
 | `analysis_md` | string | Set analysis text; stamps `analysis_at` and auto-promotes `open` → `triaged` |
 
 Invalid values return `400`.
+
+### Authentication (TOFU)
+
+The receiver uses Trust-On-First-Use (TOFU) per-instance token
+authentication for the ingest endpoint.
+
+| Step | Behaviour |
+|------|-----------|
+| **New instance** | First `POST /api/v1/diagnostics` auto-registers. The receiver generates a per-instance token (`secrets.token_hex(24)`), stores it on the `instances` row, and returns it **once** in the response as `"token"`. |
+| **Subsequent POSTs** | Must include `Authorization: Bearer <token>`. Missing or wrong token → `401 {"ok": false, "error": "invalid token"}`. |
+| **Grandfathering** | An existing instance row with no stored token (pre-upgrade) gets a token issued and returned on its next successful POST, then requires it thereafter. |
+| **Banned** | `instances.banned = 1` → `403 {"ok": false, "error": "banned"}`, checked before anything else. |
+
+The sender (`diagnostics.py`) automatically persists the received token
+in the `DIAGNOSTICS_INGEST_TOKEN` environment variable and database
+setting, so subsequent sends include the header without user
+intervention.
+
+### Quotas
+
+Two per-call env-var quotas protect the receiver:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DIAG_MIN_BATCH_INTERVAL_HOURS` | `20` | Minimum hours between batches from the same instance. Exceeded → `429 {"error": "too_frequent", "retry_after_hours": N}`. Set to `0` to disable. |
+| `DIAG_NEW_INSTANCES_PER_HOUR` | `10` | Maximum new instance registrations per hour (global). Exceeded → `429 {"error": "registration_limited"}`. Set to `0` to disable. |
+
+### Read-Token Gate
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DIAG_READ_TOKEN` | *(unset)* | When set, `GET /api/v1/export`, `/api/v1/summary`, `/api/v1/findings`, `/api/v1/findings/<id>`, and `PATCH /api/v1/findings/<id>` require `Authorization: Bearer <that token>`. `GET /api/v1/health` is always open. The ingest `POST /api/v1/diagnostics` is **not** affected (it uses per-instance tokens). |

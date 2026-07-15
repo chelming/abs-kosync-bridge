@@ -5,9 +5,12 @@ plain SQLite database.  Designed to run in its own Docker container on
 port 20129.
 """
 
+import hmac
 import json
 import logging
 import os
+import re
+import secrets
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -19,6 +22,34 @@ logger = logging.getLogger(__name__)
 _SCHEMA_VERSION = 1
 _MAX_BODY_BYTES = 1_000_000
 _DEFAULT_EXPORT_CAP = 500
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def _sanitize_text(value: Any, max_len: int) -> str:
+    """Sanitize attacker-authored text before storage.
+
+    Strips control characters (Cc category except ``\\n`` and ``\\t``),
+    neutralises markdown syntax (fences, headings, links), and truncates
+    to *max_len*.
+    """
+    s = str(value)
+
+    # Normalise line endings
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+
+    # Remove control characters except \n and \t
+    s = _CONTROL_CHAR_RE.sub("", s)
+
+    # Neutralise markdown structure
+    s = s.replace("```", "'''")
+    # Escape line-leading '#' (including indented ones)
+    s = re.sub(r"(?m)^(\s*)#", r"\1\#", s)
+    # Break markdown links
+    s = s.replace("](", "] (")
+
+    if len(s) > max_len:
+        s = s[:max_len]
+    return s
 
 # ---------------------------------------------------------------------------
 # Database helpers
@@ -31,7 +62,9 @@ CREATE TABLE IF NOT EXISTS instances (
     last_seen            TEXT NOT NULL,
     last_version         TEXT,
     last_services_json   TEXT,
-    last_total_books     INTEGER
+    last_total_books     INTEGER,
+    token                TEXT,
+    banned               INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS batches (
@@ -107,7 +140,31 @@ def init_db(db_path: str) -> None:
     os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
     with sqlite3.connect(db_path, timeout=10) as conn:
         conn.executescript(_DDL)
+    _ensure_columns(db_path)
     logger.info("Database initialised at %s", db_path)
+
+
+def _ensure_columns(db_path: str) -> None:
+    """Add any missing columns to existing tables for schema upgrades.
+
+    ``CREATE TABLE IF NOT EXISTS`` will not add columns to an existing
+    table, so we inspect with PRAGMA and ALTER TABLE as needed.
+    """
+    expected: Dict[str, Dict[str, str]] = {
+        "instances": {
+            "token": "TEXT",
+            "banned": "INTEGER NOT NULL DEFAULT 0",
+        },
+    }
+    with sqlite3.connect(db_path, timeout=10) as conn:
+        for table, columns in expected.items():
+            existing = {
+                row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            for col, typedef in columns.items():
+                if col not in existing:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typedef}")
+                    logger.info("Added column %s.%s", table, col)
 
 
 def _maybe_cleanup(db: sqlite3.Connection, now_iso: str) -> None:
@@ -177,6 +234,31 @@ def _close_db(exc: BaseException | None) -> None:
     db = g.pop("db", None)
     if db is not None:
         db.close()
+
+
+# ---------------------------------------------------------------------------
+# Authentication helpers
+# ---------------------------------------------------------------------------
+
+def _bearer_token() -> str:
+    """Extract the Bearer token from the Authorization header, or ''."""
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        return auth[7:]
+    return ""
+
+
+def _read_authorized() -> bool:
+    """Check whether the request is authorised for read/PATCH endpoints.
+
+    ``DIAG_READ_TOKEN`` env var controls access.  When unset or empty,
+    all requests are allowed.  When set, the request must carry a matching
+    ``Authorization: Bearer <token>`` header.
+    """
+    required = os.environ.get("DIAG_READ_TOKEN", "").strip()
+    if not required:
+        return True
+    return hmac.compare_digest(_bearer_token(), required)
 
 
 # ---------------------------------------------------------------------------
@@ -500,31 +582,126 @@ def create_receiver_app(db_path: Optional[str] = None) -> Flask:
             return jsonify({"ok": False, "error": "warnings must be a list"}), 400
 
         now_iso = datetime.now(timezone.utc).isoformat()
+        now_dt = datetime.now(timezone.utc)
         services_json = json.dumps(payload.get("services"), separators=(",", ":"))
 
         try:
             db = _get_db()
+
+            # -- auth / quota checks ----------------------------------------
+            row = db.execute(
+                "SELECT * FROM instances WHERE instance_id = ?",
+                (instance_id,),
+            ).fetchone()
+
+            # Ban gate
+            if row is not None and row["banned"]:
+                return jsonify({"ok": False, "error": "banned"}), 403
+
+            # Token check for known instances that already have a token
+            if row is not None and row["token"]:
+                if not hmac.compare_digest(_bearer_token(), row["token"]):
+                    return jsonify({"ok": False, "error": "invalid token"}), 401
+
+            # Per-instance batch-interval quota
+            try:
+                interval_hours = int(os.environ.get("DIAG_MIN_BATCH_INTERVAL_HOURS", "20"))
+            except ValueError:
+                interval_hours = 20
+            if interval_hours > 0 and row is not None:
+                last_batch = db.execute(
+                    "SELECT received_at FROM batches WHERE instance_id = ? ORDER BY received_at DESC LIMIT 1",
+                    (instance_id,),
+                ).fetchone()
+                if last_batch and last_batch["received_at"]:
+                    try:
+                        last_dt = datetime.fromisoformat(last_batch["received_at"])
+                        if last_dt.tzinfo is None:
+                            last_dt = last_dt.replace(tzinfo=timezone.utc)
+                        elapsed_h = (now_dt - last_dt).total_seconds() / 3600
+                        if elapsed_h < interval_hours:
+                            retry = round(interval_hours - elapsed_h, 2)
+                            return jsonify({
+                                "ok": False,
+                                "error": "too_frequent",
+                                "retry_after_hours": retry,
+                            }), 429
+                    except (ValueError, TypeError):
+                        pass
+
+            # Global new-instance registration cap
+            if row is None:
+                try:
+                    reg_cap = int(os.environ.get("DIAG_NEW_INSTANCES_PER_HOUR", "10"))
+                except ValueError:
+                    reg_cap = 10
+                if reg_cap > 0:
+                    cutoff = (now_dt - timedelta(hours=1)).isoformat()
+                    new_count = db.execute(
+                        "SELECT COUNT(*) FROM instances WHERE first_seen > ?",
+                        (cutoff,),
+                    ).fetchone()[0]
+                    if new_count >= reg_cap:
+                        return jsonify({
+                            "ok": False,
+                            "error": "registration_limited",
+                        }), 429
+
+            # Token issuance (TOFU)
+            new_token: Optional[str] = None
+            if row is None or not row["token"]:
+                new_token = secrets.token_hex(24)
+
+            # Sanitize all user-tainted fields before storage
+            sanitized_app_version = _sanitize_text(payload.get("app_version", ""), 60)
+
             # Upsert instance
-            db.execute(
-                """\
-                INSERT INTO instances (instance_id, first_seen, last_seen,
-                                       last_version, last_services_json, last_total_books)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(instance_id) DO UPDATE SET
-                    last_seen            = excluded.last_seen,
-                    last_version         = excluded.last_version,
-                    last_services_json   = excluded.last_services_json,
-                    last_total_books     = excluded.last_total_books
-                """,
-                (
-                    instance_id,
-                    now_iso,
-                    now_iso,
-                    payload.get("app_version"),
-                    services_json,
-                    payload.get("total_books"),
-                ),
-            )
+            if new_token:
+                db.execute(
+                    """\
+                    INSERT INTO instances (instance_id, first_seen, last_seen,
+                                           last_version, last_services_json,
+                                           last_total_books, token)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(instance_id) DO UPDATE SET
+                        last_seen            = excluded.last_seen,
+                        last_version         = excluded.last_version,
+                        last_services_json   = excluded.last_services_json,
+                        last_total_books     = excluded.last_total_books,
+                        token                = excluded.token
+                    """,
+                    (
+                        instance_id,
+                        now_iso,
+                        now_iso,
+                        sanitized_app_version,
+                        services_json,
+                        payload.get("total_books"),
+                        new_token,
+                    ),
+                )
+            else:
+                db.execute(
+                    """\
+                    INSERT INTO instances (instance_id, first_seen, last_seen,
+                                           last_version, last_services_json,
+                                           last_total_books)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(instance_id) DO UPDATE SET
+                        last_seen            = excluded.last_seen,
+                        last_version         = excluded.last_version,
+                        last_services_json   = excluded.last_services_json,
+                        last_total_books     = excluded.last_total_books
+                    """,
+                    (
+                        instance_id,
+                        now_iso,
+                        now_iso,
+                        sanitized_app_version,
+                        services_json,
+                        payload.get("total_books"),
+                    ),
+                )
             # Insert batch
             window = payload.get("window") or {}
             cur = db.execute(
@@ -538,7 +715,7 @@ def create_receiver_app(db_path: Optional[str] = None) -> Flask:
                     instance_id,
                     now_iso,
                     payload.get("sent_at"),
-                    payload.get("app_version"),
+                    sanitized_app_version,
                     services_json,
                     payload.get("total_books"),
                     window.get("start"),
@@ -551,18 +728,23 @@ def create_receiver_app(db_path: Optional[str] = None) -> Flask:
             # Insert warnings
             warning_rows: List[Tuple] = []
             for w in warnings_raw:
+                s_template = _sanitize_text(w.get("template", ""), 400)
+                s_message = _sanitize_text(w.get("message", ""), 400)
+                s_logger = _sanitize_text(w.get("logger", ""), 100)
+                s_level = _sanitize_text(w.get("level", ""), 100)
                 ctx = w.get("context")
                 if isinstance(ctx, list):
-                    context_text = "\n".join(str(c) for c in ctx)
+                    ctx_capped = ctx[:60]
+                    context_text = "\n".join(str(_sanitize_text(c, 400)) for c in ctx_capped)
                 else:
                     context_text = None
                 warning_rows.append((
                     batch_id,
                     instance_id,
-                    w.get("logger"),
-                    w.get("level"),
-                    w.get("template"),
-                    w.get("message"),
+                    s_logger,
+                    s_level,
+                    s_template,
+                    s_message,
                     w.get("count", 1),
                     w.get("first_seen"),
                     w.get("last_seen"),
@@ -579,25 +761,30 @@ def create_receiver_app(db_path: Optional[str] = None) -> Flask:
                     warning_rows,
                 )
 
-            # Aggregate findings
-            for w in warnings_raw:
+            # Aggregate findings (using same sanitized values)
+            for i, w in enumerate(warnings_raw):
+                s_template = _sanitize_text(w.get("template", ""), 400)
+                s_message = _sanitize_text(w.get("message", ""), 400)
+                s_logger = _sanitize_text(w.get("logger", ""), 100)
+                s_level = _sanitize_text(w.get("level", ""), 100)
                 ctx = w.get("context")
                 if isinstance(ctx, list):
-                    ctx_text = "\n".join(str(c) for c in ctx)
+                    ctx_capped = ctx[:60]
+                    ctx_text = "\n".join(str(_sanitize_text(c, 400)) for c in ctx_capped)
                 else:
                     ctx_text = None
                 _upsert_finding(
                     db,
-                    template=w.get("template") or "",
-                    logger_name=w.get("logger") or "",
-                    level=w.get("level") or "",
+                    template=s_template,
+                    logger_name=s_logger,
+                    level=s_level,
                     count=w.get("count", 1),
                     w_first_seen=w.get("first_seen") or now_iso,
                     w_last_seen=w.get("last_seen") or now_iso,
-                    sample_message=w.get("message"),
+                    sample_message=s_message,
                     sample_context=ctx_text,
                     instance_id=instance_id,
-                    app_version=payload.get("app_version"),
+                    app_version=sanitized_app_version,
                     now_iso=now_iso,
                 )
 
@@ -605,7 +792,14 @@ def create_receiver_app(db_path: Optional[str] = None) -> Flask:
             _maybe_cleanup(db, now_iso)
 
             db.commit()
-            return jsonify({"ok": True, "batch_id": batch_id, "warnings_stored": len(warning_rows)})
+            resp_data: Dict[str, Any] = {
+                "ok": True,
+                "batch_id": batch_id,
+                "warnings_stored": len(warning_rows),
+            }
+            if new_token:
+                resp_data["token"] = new_token
+            return jsonify(resp_data)
 
         except Exception:
             logger.exception("Unexpected error receiving diagnostics payload")
@@ -614,6 +808,9 @@ def create_receiver_app(db_path: Optional[str] = None) -> Flask:
     # -- export ---------------------------------------------------------------
     @app.route("/api/v1/export")
     def export_batches() -> Any:
+        if not _read_authorized():
+            return jsonify({"ok": False, "error": "unauthorized"}), 401
+
         since_str = request.args.get("since")
         if since_str:
             since = since_str
@@ -640,6 +837,9 @@ def create_receiver_app(db_path: Optional[str] = None) -> Flask:
     # -- summary --------------------------------------------------------------
     @app.route("/api/v1/summary")
     def summary() -> Any:
+        if not _read_authorized():
+            return jsonify({"ok": False, "error": "unauthorized"}), 401
+
         days_str = request.args.get("days", "7")
         try:
             days = int(days_str)
@@ -713,6 +913,9 @@ def create_receiver_app(db_path: Optional[str] = None) -> Flask:
     # -- findings list --------------------------------------------------------
     @app.route("/api/v1/findings")
     def list_findings() -> Any:
+        if not _read_authorized():
+            return jsonify({"ok": False, "error": "unauthorized"}), 401
+
         db = _get_db()
         status_filter = request.args.get("status", "open")
         category_filter = request.args.get("category")
@@ -767,6 +970,9 @@ def create_receiver_app(db_path: Optional[str] = None) -> Flask:
     # -- findings detail ------------------------------------------------------
     @app.route("/api/v1/findings/<int:finding_id>")
     def get_finding(finding_id: int) -> Any:
+        if not _read_authorized():
+            return jsonify({"ok": False, "error": "unauthorized"}), 401
+
         db = _get_db()
         row = db.execute("SELECT * FROM findings WHERE id = ?", (finding_id,)).fetchone()
         if row is None:
@@ -799,6 +1005,9 @@ def create_receiver_app(db_path: Optional[str] = None) -> Flask:
     # -- findings update ------------------------------------------------------
     @app.route("/api/v1/findings/<int:finding_id>", methods=["PATCH"])
     def update_finding(finding_id: int) -> Any:
+        if not _read_authorized():
+            return jsonify({"ok": False, "error": "unauthorized"}), 401
+
         db = _get_db()
         row = db.execute("SELECT * FROM findings WHERE id = ?", (finding_id,)).fetchone()
         if row is None:

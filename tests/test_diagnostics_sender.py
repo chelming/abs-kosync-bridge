@@ -249,6 +249,7 @@ class TestMaybeSendPaths(unittest.TestCase):
         self._orig_endpoint = os.environ.pop('DIAGNOSTICS_ENDPOINT_URL', None)
         self._orig_last_sent = os.environ.pop('DIAGNOSTICS_LAST_SENT', None)
         self._orig_instance = os.environ.pop('DIAGNOSTICS_INSTANCE_ID', None)
+        self._orig_ingest_token = os.environ.pop('DIAGNOSTICS_INGEST_TOKEN', None)
 
         os.environ['DIAGNOSTICS_OPT_IN'] = 'true'
         os.environ['DIAGNOSTICS_ENDPOINT_URL'] = 'http://collector.example.com'
@@ -265,6 +266,7 @@ class TestMaybeSendPaths(unittest.TestCase):
             ('DIAGNOSTICS_ENDPOINT_URL', self._orig_endpoint),
             ('DIAGNOSTICS_LAST_SENT', self._orig_last_sent),
             ('DIAGNOSTICS_INSTANCE_ID', self._orig_instance),
+            ('DIAGNOSTICS_INGEST_TOKEN', self._orig_ingest_token),
         ]:
             if val is not None:
                 os.environ[key] = val
@@ -337,6 +339,56 @@ class TestMaybeSendPaths(unittest.TestCase):
             call_kwargs = mock_post.call_args
             payload = call_kwargs.kwargs.get('json') or call_kwargs[1].get('json')
             self.assertEqual(payload['warnings'], [])
+
+    @patch('src.services.diagnostics.requests.post')
+    def test_ingest_token_sends_bearer_header(self, mock_post):
+        os.environ['DIAGNOSTICS_INGEST_TOKEN'] = 'my-token-abc'
+        mock_resp = Mock()
+        mock_resp.status_code = 200
+        mock_post.return_value = mock_resp
+
+        maybe_send_diagnostics(self.db, force=True)
+        call_kwargs = mock_post.call_args
+        headers = call_kwargs.kwargs.get('headers') or call_kwargs[1].get('headers', {})
+        self.assertEqual(headers.get('Authorization'), 'Bearer my-token-abc')
+
+    @patch('src.services.diagnostics.requests.post')
+    def test_no_ingest_token_omits_auth_header(self, mock_post):
+        os.environ.pop('DIAGNOSTICS_INGEST_TOKEN', None)
+        mock_resp = Mock()
+        mock_resp.status_code = 200
+        mock_post.return_value = mock_resp
+
+        maybe_send_diagnostics(self.db, force=True)
+        call_kwargs = mock_post.call_args
+        headers = call_kwargs.kwargs.get('headers') or call_kwargs[1].get('headers', {})
+        self.assertNotIn('Authorization', headers)
+
+    @patch('src.services.diagnostics.requests.post')
+    def test_token_returned_in_response_persisted(self, mock_post):
+        mock_resp = Mock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {'ok': True, 'token': 'newtok123'}
+        mock_post.return_value = mock_resp
+
+        result = maybe_send_diagnostics(self.db, force=True)
+        self.assertTrue(result['sent'])
+        self.assertEqual(os.environ.get('DIAGNOSTICS_INGEST_TOKEN'), 'newtok123')
+        self.assertTrue(any(
+            k == 'DIAGNOSTICS_INGEST_TOKEN' and v == 'newtok123'
+            for k, v in self.db.set_setting_calls
+        ))
+
+    @patch('src.services.diagnostics.requests.post')
+    def test_json_parse_error_on_success_does_not_break_send(self, mock_post):
+        mock_resp = Mock()
+        mock_resp.status_code = 200
+        mock_resp.json.side_effect = ValueError("no json")
+        mock_post.return_value = mock_resp
+
+        result = maybe_send_diagnostics(self.db, force=True)
+        self.assertTrue(result['sent'])
+        self.assertNotIn('DIAGNOSTICS_INGEST_TOKEN', os.environ)
 
 
 # ---------------------------------------------------------------------------
