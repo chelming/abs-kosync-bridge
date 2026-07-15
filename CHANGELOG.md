@@ -17,6 +17,18 @@ All notable changes to BookBridge will be documented in this file.
 
 ### Fixed
 
+- **BookFusion dashboard link now validates the book exists before persisting.**
+  Dashboard search and the duplicate-resolution path during upload previously
+  persisted a BookFusion id without checking whether the BookFusion reader API
+  could actually serve it. An inaccessible id (e.g. uploaded but not yet
+  indexed, or belonging to a different account) would silently fail every
+  download and reading-position request with 404. Both the manual link route
+  and the upload-duplicate resolver now probe `get_download_url` first; a
+  failed probe returns a clear 400 error suggesting the user upload or
+  re-search, and the existing link (if any) is never overwritten. Already-broken
+  links require re-uploading and re-linking; valid links self-sync on the next
+  cycle.
+
 - **Upgraded multi-user BookOrbit matches now keep each reader's library identity.**
   The 7.2.0 ownership migration could silently skip legacy rows whose shared book
   had no creator ID, leaving sync clients to reuse a shared BookOrbit ebook or

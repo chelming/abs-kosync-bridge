@@ -9523,6 +9523,26 @@ def api_bookfusion_link(abs_id: str) -> object:
     bookfusion_id = str(payload.get("bookfusion_id") or "").strip()
     if not bookfusion_id:
         return jsonify({"success": False, "error": "Missing BookFusion book id"}), 400
+    reader_client = uc().bookfusion_client
+    if not reader_client.is_configured():
+        return jsonify({"success": False, "error": "BookFusion not configured"}), 400
+    try:
+        probe_url = reader_client.get_download_url(bookfusion_id)
+    except Exception as exc:
+        logger.warning(
+            "BookFusion link probe failed for id %s: %s",
+            bookfusion_id, exc,
+        )
+        probe_url = None
+    if not probe_url:
+        return jsonify({
+            "success": False,
+            "error": (
+                "This BookFusion result is not available to the reader API "
+                "and cannot be linked yet. Upload the book to BookFusion first, "
+                "then re-search and link it."
+            ),
+        }), 400
     link = database_service.set_user_bookfusion_link(
         user_id,
         abs_id,
@@ -9718,9 +9738,24 @@ def _resolve_duplicate_bookfusion_id(upload_client, title: str, author: str = ""
             if first_author != author_lower:
                 continue
         try:
-            return int(item_id)
+            candidate_id = int(item_id)
         except (ValueError, TypeError):
             continue
+        try:
+            probe_url = reader_client.get_download_url(candidate_id)
+        except Exception as exc:
+            logger.debug(
+                "BookFusion duplicate probe failed for id %s: %s",
+                candidate_id, exc,
+            )
+            continue
+        if not probe_url:
+            logger.debug(
+                "BookFusion duplicate id %s not accessible, skipping",
+                candidate_id,
+            )
+            continue
+        return candidate_id
     return None
 
 
