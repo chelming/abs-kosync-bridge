@@ -8,7 +8,7 @@ import unittest
 from datetime import datetime, timezone
 from unittest.mock import patch
 
-from diagnostics_receiver.app import create_receiver_app, init_db
+from diagnostics_receiver.app import create_receiver_app, init_db, rebuild_findings
 
 
 def _valid_payload(**overrides: object) -> dict:
@@ -375,6 +375,630 @@ class TestUnexpectedException(unittest.TestCase):
             self.assertFalse(resp.get_json()["ok"])
         finally:
             mod._get_db = original_get_db  # type: ignore[assignment]
+
+
+class TestFindings(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmpdir = tempfile.mkdtemp()
+        self._db_path = os.path.join(self._tmpdir, "test.db")
+        self._app = create_receiver_app(db_path=self._db_path)
+        self._client = self._app.test_client()
+
+    def tearDown(self) -> None:
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def _post(self, payload: dict) -> dict:
+        resp = self._client.post(
+            "/api/v1/diagnostics",
+            data=json.dumps(payload),
+            content_type="application/json",
+        )
+        return resp.get_json()
+
+    def test_post_creates_two_findings(self) -> None:
+        payload = _valid_payload()
+        data = self._post(payload)
+        self.assertTrue(data["ok"])
+
+        with sqlite3.connect(self._db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute("SELECT * FROM findings ORDER BY template").fetchall()
+            self.assertEqual(len(rows), 2)
+
+            sync = [r for r in rows if r["template"] == "Sync failed after # retries"][0]
+            self.assertEqual(sync["total_count"], 5)
+            self.assertEqual(sync["instance_count"], 1)
+            self.assertEqual(sync["first_seen"], "2026-07-14T12:00:00+00:00")
+            self.assertEqual(sync["last_seen"], "2026-07-15T11:58:00+00:00")
+            self.assertEqual(sync["sample_message"], "Sync failed after 3 retries")
+            self.assertIsNotNone(sync["sample_context"])
+            versions = json.loads(sync["app_versions_json"])
+            self.assertIn("7.2.0", versions)
+
+    def test_second_instance_merges_findings(self) -> None:
+        p1 = _valid_payload(
+            instance_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            warnings=[{"template": "Foo #", "count": 3,
+                       "first_seen": "2026-07-14T00:00:00Z",
+                       "last_seen": "2026-07-14T12:00:00Z"}],
+        )
+        self._post(p1)
+        p2 = _valid_payload(
+            instance_id="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            app_version="7.3.0",
+            warnings=[{"template": "Foo #", "count": 7,
+                       "first_seen": "2026-07-13T00:00:00Z",
+                       "last_seen": "2026-07-15T00:00:00Z"}],
+        )
+        self._post(p2)
+
+        with sqlite3.connect(self._db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT * FROM findings").fetchone()
+            self.assertEqual(row["total_count"], 10)
+            self.assertEqual(row["instance_count"], 2)
+            self.assertEqual(row["first_seen"], "2026-07-13T00:00:00Z")
+            self.assertEqual(row["last_seen"], "2026-07-15T00:00:00Z")
+            versions = json.loads(row["app_versions_json"])
+            self.assertEqual(sorted(versions), ["7.2.0", "7.3.0"])
+
+    def test_same_instance_twice_accumulates_count(self) -> None:
+        p = _valid_payload(
+            warnings=[{"template": "Foo #", "count": 3,
+                       "first_seen": "2026-07-14T00:00:00Z",
+                       "last_seen": "2026-07-14T12:00:00Z"}],
+        )
+        self._post(p)
+        self._post(p)
+
+        with sqlite3.connect(self._db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT * FROM findings").fetchone()
+            self.assertEqual(row["total_count"], 6)
+            self.assertEqual(row["instance_count"], 1)
+
+    def test_reopen_fixed_finding(self) -> None:
+        p = _valid_payload(
+            warnings=[{"template": "Foo #", "count": 1,
+                       "first_seen": "2026-07-14T00:00:00Z",
+                       "last_seen": "2026-07-14T00:00:00Z"}],
+        )
+        self._post(p)
+
+        # Find the finding id
+        with sqlite3.connect(self._db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            fid = conn.execute("SELECT id FROM findings").fetchone()["id"]
+
+        # Mark as fixed
+        self._client.patch(
+            f"/api/v1/findings/{fid}",
+            data=json.dumps({"status": "fixed"}),
+            content_type="application/json",
+        )
+
+        # Same template recurs
+        self._post(p)
+
+        with sqlite3.connect(self._db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT * FROM findings WHERE id = ?", (fid,)).fetchone()
+            self.assertEqual(row["status"], "open")
+            self.assertIsNotNone(row["reopened_at"])
+
+    def test_ignored_finding_not_reopened(self) -> None:
+        p = _valid_payload(
+            warnings=[{"template": "Bar #", "count": 1,
+                       "first_seen": "2026-07-14T00:00:00Z",
+                       "last_seen": "2026-07-14T00:00:00Z"}],
+        )
+        self._post(p)
+
+        with sqlite3.connect(self._db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            fid = conn.execute("SELECT id FROM findings").fetchone()["id"]
+
+        self._client.patch(
+            f"/api/v1/findings/{fid}",
+            data=json.dumps({"status": "ignored"}),
+            content_type="application/json",
+        )
+
+        self._post(p)
+
+        with sqlite3.connect(self._db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT * FROM findings WHERE id = ?", (fid,)).fetchone()
+            self.assertEqual(row["status"], "ignored")
+            self.assertIsNone(row["reopened_at"])
+
+    def test_needs_triage_filter(self) -> None:
+        p = _valid_payload(
+            warnings=[{"template": "Tri #", "count": 1,
+                       "first_seen": "2026-07-14T00:00:00Z",
+                       "last_seen": "2026-07-14T00:00:00Z"}],
+        )
+        self._post(p)
+
+        # Fresh finding appears in needs_triage
+        resp = self._client.get("/api/v1/findings?needs_triage=1")
+        data = resp.get_json()
+        self.assertEqual(len(data["findings"]), 1)
+        fid = data["findings"][0]["id"]
+
+        # Add analysis — should disappear from needs_triage
+        self._client.patch(
+            f"/api/v1/findings/{fid}",
+            data=json.dumps({"analysis_md": "Root cause identified"}),
+            content_type="application/json",
+        )
+        resp = self._client.get("/api/v1/findings?needs_triage=1")
+        data = resp.get_json()
+        self.assertEqual(len(data["findings"]), 0)
+
+        # Reopen it — should reappear
+        self._client.patch(
+            f"/api/v1/findings/{fid}",
+            data=json.dumps({"status": "fixed"}),
+            content_type="application/json",
+        )
+        self._post(p)
+        resp = self._client.get("/api/v1/findings?needs_triage=1")
+        data = resp.get_json()
+        self.assertEqual(len(data["findings"]), 1)
+
+    def test_get_list_ordering_and_light_fields(self) -> None:
+        p_a = _valid_payload(
+            instance_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            warnings=[{"template": "A #", "count": 1,
+                       "first_seen": "2026-07-14T00:00:00Z",
+                       "last_seen": "2026-07-14T00:00:00Z"}],
+        )
+        p_b = _valid_payload(
+            instance_id="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            warnings=[{"template": "B #", "count": 1,
+                       "first_seen": "2026-07-14T00:00:00Z",
+                       "last_seen": "2026-07-14T00:00:00Z"}],
+        )
+        # B appears twice
+        self._post(p_a)
+        self._post(p_b)
+        self._post(p_b)
+
+        resp = self._client.get("/api/v1/findings")
+        data = resp.get_json()
+        findings = data["findings"]
+        self.assertEqual(findings[0]["template"], "B #")
+        self.assertEqual(findings[0]["instance_count"], 1)
+        self.assertEqual(findings[0]["total_count"], 2)
+        # Light fields
+        self.assertNotIn("analysis_md", findings[0])
+        self.assertNotIn("sample_context", findings[0])
+        self.assertIn("has_analysis", findings[0])
+
+    def test_get_detail_with_analysis_and_evidence(self) -> None:
+        p = _valid_payload(
+            warnings=[{"template": "Detail #", "count": 1,
+                       "first_seen": "2026-07-14T00:00:00Z",
+                       "last_seen": "2026-07-14T00:00:00Z",
+                       "context": ["ctx line 1"]}],
+        )
+        self._post(p)
+
+        with sqlite3.connect(self._db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            fid = conn.execute("SELECT id FROM findings").fetchone()["id"]
+
+        self._client.patch(
+            f"/api/v1/findings/{fid}",
+            data=json.dumps({"analysis_md": "A fix"}),
+            content_type="application/json",
+        )
+
+        resp = self._client.get(f"/api/v1/findings/{fid}")
+        data = resp.get_json()
+        self.assertEqual(data["id"], fid)
+        self.assertEqual(data["analysis_md"], "A fix")
+        self.assertEqual(data["status"], "triaged")
+        self.assertEqual(len(data["recent_evidence"]), 1)
+        self.assertIn("context_text", data["recent_evidence"][0])
+
+    def test_get_detail_404(self) -> None:
+        resp = self._client.get("/api/v1/findings/99999")
+        self.assertEqual(resp.status_code, 404)
+
+    def test_patch_validation_bad_status(self) -> None:
+        p = _valid_payload(
+            warnings=[{"template": "V #", "count": 1,
+                       "first_seen": "2026-07-14T00:00:00Z",
+                       "last_seen": "2026-07-14T00:00:00Z"}],
+        )
+        self._post(p)
+
+        with sqlite3.connect(self._db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            fid = conn.execute("SELECT id FROM findings").fetchone()["id"]
+
+        resp = self._client.patch(
+            f"/api/v1/findings/{fid}",
+            data=json.dumps({"status": "banana"}),
+            content_type="application/json",
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_rebuild_findings(self) -> None:
+        p = _valid_payload(
+            instance_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            warnings=[{"template": "X #", "count": 3,
+                       "first_seen": "2026-07-14T00:00:00Z",
+                       "last_seen": "2026-07-14T12:00:00Z"}],
+        )
+        self._post(p)
+        p2 = _valid_payload(
+            instance_id="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            warnings=[{"template": "X #", "count": 5,
+                       "first_seen": "2026-07-13T00:00:00Z",
+                       "last_seen": "2026-07-15T00:00:00Z"}],
+        )
+        self._post(p2)
+
+        with sqlite3.connect(self._db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT * FROM findings").fetchone()
+            orig_total = row["total_count"]
+            orig_inst = row["instance_count"]
+
+        count = rebuild_findings(self._db_path)
+        self.assertEqual(count, 1)
+
+        with sqlite3.connect(self._db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT * FROM findings").fetchone()
+            self.assertEqual(row["total_count"], orig_total)
+            self.assertEqual(row["instance_count"], orig_inst)
+            # analysis/status reset on rebuild
+            self.assertEqual(row["status"], "open")
+            self.assertIsNone(row["analysis_md"])
+
+    def test_auto_backfill_on_factory_init(self) -> None:
+        """Create app, POST batch, delete findings, create second app → repopulated."""
+        app1 = create_receiver_app(db_path=self._db_path)
+        client1 = app1.test_client()
+
+        payload = _valid_payload(
+            warnings=[{"template": "Back #", "count": 2,
+                       "first_seen": "2026-07-14T00:00:00Z",
+                       "last_seen": "2026-07-14T12:00:00Z"}],
+        )
+        client1.post(
+            "/api/v1/diagnostics",
+            data=json.dumps(payload),
+            content_type="application/json",
+        )
+
+        # Verify findings exist
+        with sqlite3.connect(self._db_path) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM findings").fetchone()[0], 1)
+
+        # Wipe findings
+        with sqlite3.connect(self._db_path) as conn:
+            conn.execute("DELETE FROM findings")
+            conn.execute("DELETE FROM finding_instances")
+            conn.commit()
+
+        # Create second app on same DB → auto-backfill fires
+        app2 = create_receiver_app(db_path=self._db_path)
+        with sqlite3.connect(self._db_path) as conn:
+            count = conn.execute("SELECT COUNT(*) FROM findings").fetchone()[0]
+        self.assertEqual(count, 1)
+
+    def test_patch_explicit_status_not_overridden_by_analysis_md(self) -> None:
+        p = _valid_payload(
+            warnings=[{"template": "P #", "count": 1,
+                       "first_seen": "2026-07-14T00:00:00Z",
+                       "last_seen": "2026-07-14T00:00:00Z"}],
+        )
+        self._post(p)
+
+        with sqlite3.connect(self._db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            fid = conn.execute("SELECT id FROM findings").fetchone()["id"]
+
+        resp = self._client.patch(
+            f"/api/v1/findings/{fid}",
+            data=json.dumps({"status": "fixed", "analysis_md": "root cause ..."}),
+            content_type="application/json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        data = resp.get_json()
+        self.assertEqual(data["status"], "fixed")
+        self.assertIsNotNone(data.get("analysis_at"))
+
+        with sqlite3.connect(self._db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT * FROM findings WHERE id = ?", (fid,)).fetchone()
+            self.assertEqual(row["status"], "fixed")
+            self.assertIsNotNone(row["analysis_at"])
+
+    def test_summary_includes_findings(self) -> None:
+        p = _valid_payload(
+            warnings=[{"template": "Sum #", "count": 1,
+                       "first_seen": "2026-07-14T00:00:00Z",
+                       "last_seen": "2026-07-14T00:00:00Z"}],
+        )
+        self._post(p)
+
+        resp = self._client.get("/api/v1/summary?days=30")
+        data = resp.get_json()
+        self.assertIn("findings", data)
+        self.assertEqual(data["findings"]["by_status"]["open"], 1)
+        self.assertIn("unknown", data["findings"]["by_category"])
+        self.assertEqual(data["findings"]["needs_triage"], 1)
+
+
+class TestHygiene(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmpdir = tempfile.mkdtemp()
+        self._db_path = os.path.join(self._tmpdir, "test.db")
+        self._app = create_receiver_app(db_path=self._db_path)
+        self._client = self._app.test_client()
+        self._orig_retention: str | None = os.environ.get("DIAG_RETENTION_DAYS")
+        self._orig_cap: str | None = os.environ.get("DIAG_MAX_TEMPLATES_PER_LOGGER")
+
+    def tearDown(self) -> None:
+        import shutil
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+        if self._orig_retention is None:
+            os.environ.pop("DIAG_RETENTION_DAYS", None)
+        else:
+            os.environ["DIAG_RETENTION_DAYS"] = self._orig_retention
+        if self._orig_cap is None:
+            os.environ.pop("DIAG_MAX_TEMPLATES_PER_LOGGER", None)
+        else:
+            os.environ["DIAG_MAX_TEMPLATES_PER_LOGGER"] = self._orig_cap
+
+    def _post(self, payload: dict) -> dict:
+        resp = self._client.post(
+            "/api/v1/diagnostics",
+            data=json.dumps(payload),
+            content_type="application/json",
+        )
+        return resp.get_json()
+
+    # -- retention tests ------------------------------------------------------
+
+    def test_retention_deletes_old_batches_and_warnings(self) -> None:
+        """Old batch (>90d) and its warnings are cleaned up; fresh batch remains."""
+        os.environ["DIAG_RETENTION_DAYS"] = "90"
+        self.addCleanup(
+            lambda: os.environ.pop("DIAG_RETENTION_DAYS", None)
+        )
+        # Insert old batch directly (100 days ago)
+        with sqlite3.connect(self._db_path) as conn:
+            cur = conn.execute(
+                "INSERT INTO batches (instance_id, received_at, dropped) VALUES (?, ?, 0)",
+                ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "2026-04-01T00:00:00+00:00"),
+            )
+            old_batch_id = cur.lastrowid
+            conn.execute(
+                "INSERT INTO warnings (batch_id, instance_id, template, count, first_seen, last_seen) VALUES (?, ?, ?, 3, ?, ?)",
+                (old_batch_id, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "Old #",
+                 "2026-04-01T00:00:00Z", "2026-04-01T00:00:00Z"),
+            )
+            conn.commit()
+
+        # Record finding count before (should be 0 — no findings yet)
+        with sqlite3.connect(self._db_path) as conn:
+            finding_count_before = conn.execute("SELECT COUNT(*) FROM findings").fetchone()[0]
+
+        # POST fresh payload — triggers cleanup which deletes the old batch
+        self._post(_valid_payload(
+            instance_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            warnings=[{"template": "Fresh #", "count": 1,
+                       "first_seen": "2026-07-15T00:00:00Z",
+                       "last_seen": "2026-07-15T00:00:00Z"}],
+        ))
+
+        with sqlite3.connect(self._db_path) as conn:
+            # Old batch gone
+            old_batch = conn.execute("SELECT * FROM batches WHERE id = ?", (old_batch_id,)).fetchone()
+            self.assertIsNone(old_batch)
+            # Old warnings gone
+            old_warn_count = conn.execute(
+                "SELECT COUNT(*) FROM warnings WHERE template = 'Old #'"
+            ).fetchone()[0]
+            self.assertEqual(old_warn_count, 0)
+            # Fresh batch still present
+            fresh_warns = conn.execute(
+                "SELECT COUNT(*) FROM warnings WHERE template = 'Fresh #'"
+            ).fetchone()[0]
+            self.assertGreater(fresh_warns, 0)
+            # Findings table only has the fresh warning's finding (old warnings never created findings)
+            finding_count_after = conn.execute("SELECT COUNT(*) FROM findings").fetchone()[0]
+            self.assertEqual(finding_count_after, 1)
+
+    def test_retention_24h_gate_prevents_second_cleanup(self) -> None:
+        """After a cleanup, a second POST within 24h does not lower row counts further."""
+        os.environ["DIAG_RETENTION_DAYS"] = "90"
+        self.addCleanup(
+            lambda: os.environ.pop("DIAG_RETENTION_DAYS", None)
+        )
+        # First POST triggers cleanup (no old rows), sets last_cleanup_at
+        self._post(_valid_payload(
+            instance_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            warnings=[{"template": "Keep #", "count": 2,
+                       "first_seen": "2026-07-15T00:00:00Z",
+                       "last_seen": "2026-07-15T00:00:00Z"}],
+        ))
+
+        # Now insert an old batch directly (after cleanup already ran)
+        with sqlite3.connect(self._db_path) as conn:
+            cur = conn.execute(
+                "INSERT INTO batches (instance_id, received_at, dropped) VALUES (?, ?, 0)",
+                ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "2026-04-01T00:00:00+00:00"),
+            )
+            old_id = cur.lastrowid
+            conn.execute(
+                "INSERT INTO warnings (batch_id, instance_id, template, count, first_seen, last_seen) VALUES (?, ?, ?, 1, ?, ?)",
+                (old_id, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "Old2 #",
+                 "2026-04-01T00:00:00Z", "2026-04-01T00:00:00Z"),
+            )
+            conn.commit()
+
+        # Second POST — 24h gate prevents cleanup
+        self._post(_valid_payload(
+            instance_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            warnings=[{"template": "Keep #", "count": 1,
+                       "first_seen": "2026-07-15T00:00:00Z",
+                       "last_seen": "2026-07-15T00:00:00Z"}],
+        ))
+        with sqlite3.connect(self._db_path) as conn:
+            # The old batch is still there (gate blocked cleanup)
+            reinserted = conn.execute("SELECT * FROM batches WHERE id = ?", (old_id,)).fetchone()
+            self.assertIsNotNone(reinserted)
+
+    def test_retention_disabled_does_not_delete(self) -> None:
+        """DIAG_RETENTION_DAYS=0 prevents any deletion."""
+        os.environ["DIAG_RETENTION_DAYS"] = "0"
+        self.addCleanup(
+            lambda: os.environ.pop("DIAG_RETENTION_DAYS", None)
+        )
+        # Insert old batch directly
+        with sqlite3.connect(self._db_path) as conn:
+            cur = conn.execute(
+                "INSERT INTO batches (instance_id, received_at, dropped) VALUES (?, ?, 0)",
+                ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "2026-01-01T00:00:00+00:00"),
+            )
+            old_id = cur.lastrowid
+            conn.execute(
+                "INSERT INTO warnings (batch_id, instance_id, template, count, first_seen, last_seen) VALUES (?, ?, ?, 1, ?, ?)",
+                (old_id, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "Old3 #",
+                 "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"),
+            )
+            conn.commit()
+
+        # POST triggers cleanup (but disabled)
+        self._post(_valid_payload(
+            instance_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            warnings=[{"template": "Fresh2 #", "count": 1,
+                       "first_seen": "2026-07-15T00:00:00Z",
+                       "last_seen": "2026-07-15T00:00:00Z"}],
+        ))
+        with sqlite3.connect(self._db_path) as conn:
+            old_batch = conn.execute("SELECT * FROM batches WHERE id = ?", (old_id,)).fetchone()
+            self.assertIsNotNone(old_batch)
+            old_warn = conn.execute(
+                "SELECT COUNT(*) FROM warnings WHERE template = 'Old3 #'"
+            ).fetchone()[0]
+            self.assertEqual(old_warn, 1)
+
+    # -- cardinality tests ----------------------------------------------------
+
+    def test_cardinality_cap_collapses_excess_templates(self) -> None:
+        """5 distinct templates with cap=3 yields 3 real + 1 overflow finding."""
+        os.environ["DIAG_MAX_TEMPLATES_PER_LOGGER"] = "3"
+        self.addCleanup(
+            lambda: os.environ.pop("DIAG_MAX_TEMPLATES_PER_LOGGER", None)
+        )
+        instance = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        templates = [f"tpl-{i} #" for i in range(5)]
+        for tpl in templates:
+            self._post(_valid_payload(
+                instance_id=instance,
+                warnings=[{"template": tpl, "logger": "src.sync_manager",
+                           "level": "WARNING", "count": 2,
+                           "first_seen": "2026-07-15T00:00:00Z",
+                           "last_seen": "2026-07-15T00:00:00Z"}],
+            ))
+
+        with sqlite3.connect(self._db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT * FROM findings WHERE logger = 'src.sync_manager'"
+            ).fetchall()
+            self.assertEqual(len(rows), 4)
+            overflow = [r for r in rows if r["template"] == "[cardinality-overflow]"]
+            self.assertEqual(len(overflow), 1)
+            # 2 excess templates collapsed into overflow, each with count=2
+            self.assertEqual(overflow[0]["total_count"], 4)
+            self.assertEqual(overflow[0]["category"], "unknown")
+            self.assertIn("Cardinality cap reached", overflow[0]["sample_message"])
+
+    def test_cardinality_known_template_still_updates(self) -> None:
+        """Posting a known template after cap hit updates its own finding, not overflow."""
+        os.environ["DIAG_MAX_TEMPLATES_PER_LOGGER"] = "2"
+        self.addCleanup(
+            lambda: os.environ.pop("DIAG_MAX_TEMPLATES_PER_LOGGER", None)
+        )
+        instance = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        # First 2 templates create findings normally
+        self._post(_valid_payload(
+            instance_id=instance,
+            warnings=[{"template": "known-a #", "logger": "src.sync_manager",
+                       "level": "WARNING", "count": 1,
+                       "first_seen": "2026-07-15T00:00:00Z",
+                       "last_seen": "2026-07-15T00:00:00Z"}],
+        ))
+        self._post(_valid_payload(
+            instance_id=instance,
+            warnings=[{"template": "known-b #", "logger": "src.sync_manager",
+                       "level": "WARNING", "count": 1,
+                       "first_seen": "2026-07-15T00:00:00Z",
+                       "last_seen": "2026-07-15T00:00:00Z"}],
+        ))
+        # Third template hits overflow
+        self._post(_valid_payload(
+            instance_id=instance,
+            warnings=[{"template": "excess-c #", "logger": "src.sync_manager",
+                       "level": "WARNING", "count": 3,
+                       "first_seen": "2026-07-15T00:00:00Z",
+                       "last_seen": "2026-07-15T00:00:00Z"}],
+        ))
+        # Now post known-a again — should update known-a, not overflow
+        self._post(_valid_payload(
+            instance_id=instance,
+            warnings=[{"template": "known-a #", "logger": "src.sync_manager",
+                       "level": "WARNING", "count": 5,
+                       "first_seen": "2026-07-15T00:00:00Z",
+                       "last_seen": "2026-07-15T12:00:00Z"}],
+        ))
+        with sqlite3.connect(self._db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            known_a = conn.execute(
+                "SELECT * FROM findings WHERE template = 'known-a #' AND logger = 'src.sync_manager'"
+            ).fetchone()
+            self.assertIsNotNone(known_a)
+            self.assertEqual(known_a["total_count"], 6)
+            overflow = conn.execute(
+                "SELECT * FROM findings WHERE template = '[cardinality-overflow]' AND logger = 'src.sync_manager'"
+            ).fetchone()
+            self.assertEqual(overflow["total_count"], 3)
+
+    def test_cardinality_disabled_allows_unlimited(self) -> None:
+        """DIAG_MAX_TEMPLATES_PER_LOGGER=0 creates all findings."""
+        os.environ["DIAG_MAX_TEMPLATES_PER_LOGGER"] = "0"
+        self.addCleanup(
+            lambda: os.environ.pop("DIAG_MAX_TEMPLATES_PER_LOGGER", None)
+        )
+        instance = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        for i in range(5):
+            self._post(_valid_payload(
+                instance_id=instance,
+                warnings=[{"template": f"unlim-{i} #", "logger": "src.sync_manager",
+                           "level": "WARNING", "count": 1,
+                           "first_seen": "2026-07-15T00:00:00Z",
+                           "last_seen": "2026-07-15T00:00:00Z"}],
+            ))
+        with sqlite3.connect(self._db_path) as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM findings WHERE logger = 'src.sync_manager'"
+            ).fetchone()[0]
+            self.assertEqual(count, 5)
+            overflow = conn.execute(
+                "SELECT COUNT(*) FROM findings WHERE template = '[cardinality-overflow]'"
+            ).fetchone()[0]
+            self.assertEqual(overflow, 0)
 
 
 if __name__ == "__main__":

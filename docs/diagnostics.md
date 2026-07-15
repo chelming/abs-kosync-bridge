@@ -151,6 +151,19 @@ The public `DIAGNOSTICS_ENDPOINT_URL` that opted-in instances POST to
 is still TBD; when deployed behind a reverse proxy, the URL will point
 at the proxy's external address (port 20129 on the internal network).
 
+### Hygiene
+
+The receiver includes two configurable hygiene controls:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DIAG_RETENTION_DAYS` | `90` | Raw `warnings` and `batches` rows older than this many days are deleted. Set to `0` to disable. Findings are never touched. |
+| `DIAG_MAX_TEMPLATES_PER_LOGGER` | `100` | Maximum distinct finding templates allowed per logger. Excess distinct templates collapse into a single `[cardinality-overflow]` finding. Set to `0` to disable. |
+
+Retention cleanup runs at most once per 24 hours on ingest (tracked via a
+`meta` table key `last_cleanup_at`).  The cardinality guard is enforced per
+`_upsert_finding` call and does not affect updates to already-known templates.
+
 ### Automated Review Integration
 
 `scripts/automated-review/run-diagnostics-scan.ps1` fetches the export
@@ -161,3 +174,68 @@ for fleet-wide warning patterns across opted-in instances and appends
 findings to `BUG_REPORT.md`.  The scan mirrors the log-scan script in
 structure, state handling, and failure semantics (state is NOT advanced
 on failure so the window is re-scanned).
+
+### Findings API (Phase 5)
+
+The receiver aggregates raw warnings into deduplicated, stateful
+**findings**.  The same bug recurring daily across many instances is one
+row with counts, not endless re-reports.
+
+#### Findings Schema
+
+Two additional tables (created idempotently):
+
+- **`findings`** — one row per unique `(template, logger, level)` key.
+  Tracks `category` (code-bug / config-issue / docs-gap / environment /
+  unknown), `status` (open / triaged / fixed / ignored), optional
+  `severity` (low / medium / high), `first_seen`, `last_seen`,
+  `total_count`, `instance_count`, `app_versions_json`, sample
+  message/context, and triage fields (`analysis_md`, `analysis_at`,
+  `reopened_at`).
+- **`finding_instances`** — join table linking findings to the instance
+  IDs that reported them; drives `instance_count`.
+
+#### Lifecycle
+
+1. A new warning arrives → finding created with status **open**.
+2. Triage sets `analysis_md` → status auto-promotes to **triaged**.
+3. Fix verified → manual PATCH to status **fixed**.
+4. Same warning recurs while fixed → status auto-reopens to **open**
+   (`reopened_at` stamped).  Status **ignored** is never auto-reopened.
+
+#### Ranking
+
+`instance_count` (number of distinct fleet instances reporting the same
+template) is the primary ranking key.  `total_count` and `last_seen`
+break ties.
+
+#### Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/v1/findings` | List findings (filtered, paginated) |
+| `GET` | `/api/v1/findings/<id>` | Full finding detail + recent evidence |
+| `PATCH` | `/api/v1/findings/<id>` | Update status/category/severity/analysis |
+
+**GET /api/v1/findings** query parameters:
+
+| Param | Default | Description |
+|-------|---------|-------------|
+| `status` | `open` | Filter by status; `all` returns every status |
+| `category` | (none) | Filter by category |
+| `needs_triage` | (none) | Set `1` to filter findings needing triage |
+| `limit` | `50` | Max results (capped at 200) |
+
+Response rows omit `analysis_md` and `sample_context` for a lighter
+payload; `has_analysis` boolean indicates whether an analysis exists.
+
+**PATCH /api/v1/findings/<id>** JSON body fields (all optional):
+
+| Field | Values | Effect |
+|-------|--------|--------|
+| `status` | `open`, `triaged`, `fixed`, `ignored` | Update status |
+| `category` | `code-bug`, `config-issue`, `docs-gap`, `environment`, `unknown` | Update category |
+| `severity` | `low`, `medium`, `high` | Update severity |
+| `analysis_md` | string | Set analysis text; stamps `analysis_at` and auto-promotes `open` → `triaged` |
+
+Invalid values return `400`.

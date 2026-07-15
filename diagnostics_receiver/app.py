@@ -66,6 +66,39 @@ CREATE INDEX IF NOT EXISTS idx_warnings_instance    ON warnings(instance_id);
 CREATE INDEX IF NOT EXISTS idx_warnings_batch       ON warnings(batch_id);
 CREATE INDEX IF NOT EXISTS idx_batches_instance     ON batches(instance_id);
 CREATE INDEX IF NOT EXISTS idx_batches_received_at  ON batches(received_at);
+
+CREATE TABLE IF NOT EXISTS findings (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    template           TEXT NOT NULL,
+    logger             TEXT NOT NULL DEFAULT '',
+    level              TEXT NOT NULL DEFAULT '',
+    category           TEXT NOT NULL DEFAULT 'unknown',
+    status             TEXT NOT NULL DEFAULT 'open',
+    severity           TEXT,
+    first_seen         TEXT NOT NULL,
+    last_seen          TEXT NOT NULL,
+    total_count        INTEGER NOT NULL DEFAULT 0,
+    instance_count     INTEGER NOT NULL DEFAULT 0,
+    app_versions_json  TEXT NOT NULL DEFAULT '[]',
+    sample_message     TEXT,
+    sample_context     TEXT,
+    analysis_md        TEXT,
+    analysis_at        TEXT,
+    reopened_at        TEXT,
+    UNIQUE(template, logger, level)
+);
+
+CREATE TABLE IF NOT EXISTS finding_instances (
+    finding_id   INTEGER NOT NULL REFERENCES findings(id),
+    instance_id  TEXT NOT NULL,
+    PRIMARY KEY (finding_id, instance_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_findings_status    ON findings(status);
+CREATE INDEX IF NOT EXISTS idx_findings_category  ON findings(category);
+CREATE INDEX IF NOT EXISTS idx_findings_last_seen ON findings(last_seen);
+
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 """
 
 
@@ -75,6 +108,59 @@ def init_db(db_path: str) -> None:
     with sqlite3.connect(db_path, timeout=10) as conn:
         conn.executescript(_DDL)
     logger.info("Database initialised at %s", db_path)
+
+
+def _maybe_cleanup(db: sqlite3.Connection, now_iso: str) -> None:
+    """Delete raw warnings/batches older than the retention window.
+
+    Runs at most once per 24 hours.  Controlled by the ``DIAG_RETENTION_DAYS``
+    environment variable (default 90; 0 disables cleanup).  Findings are never
+    touched.
+    """
+    try:
+        retention_days = int(os.environ.get("DIAG_RETENTION_DAYS", "90"))
+    except ValueError:
+        retention_days = 90
+    if retention_days <= 0:
+        return
+
+    # Check last cleanup timestamp
+    try:
+        now_dt = datetime.fromisoformat(now_iso)
+    except (ValueError, TypeError):
+        return
+    row = db.execute(
+        "SELECT value FROM meta WHERE key = ?", ("last_cleanup_at",)
+    ).fetchone()
+    if row is not None:
+        try:
+            last_dt = datetime.fromisoformat(row["value"])
+            if (now_dt - last_dt) < timedelta(hours=24):
+                return
+        except (ValueError, TypeError):
+            pass
+
+    cutoff_dt = now_dt - timedelta(days=retention_days)
+    cutoff_iso = cutoff_dt.isoformat()
+
+    deleted_warnings = db.execute(
+        "DELETE FROM warnings WHERE batch_id IN (SELECT id FROM batches WHERE received_at < ?)",
+        (cutoff_iso,),
+    ).rowcount
+    deleted_batches = db.execute(
+        "DELETE FROM batches WHERE received_at < ?",
+        (cutoff_iso,),
+    ).rowcount
+
+    # Upsert meta
+    db.execute(
+        "INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        ("last_cleanup_at", now_iso),
+    )
+    logger.info(
+        "Retention cleanup: deleted %d warnings and %d batches older than %d days",
+        deleted_warnings, deleted_batches, retention_days,
+    )
 
 
 def _get_db() -> sqlite3.Connection:
@@ -91,6 +177,254 @@ def _close_db(exc: BaseException | None) -> None:
     db = g.pop("db", None)
     if db is not None:
         db.close()
+
+
+# ---------------------------------------------------------------------------
+# Findings aggregation
+# ---------------------------------------------------------------------------
+
+_VALID_CATEGORIES = {"code-bug", "config-issue", "docs-gap", "environment", "unknown"}
+_VALID_STATUSES = {"open", "triaged", "fixed", "ignored"}
+_VALID_SEVERITIES = {"low", "medium", "high"}
+
+
+def _upsert_finding(
+    db: sqlite3.Connection,
+    template: str,
+    logger_name: str,
+    level: str,
+    count: int,
+    w_first_seen: str,
+    w_last_seen: str,
+    sample_message: str | None,
+    sample_context: str | None,
+    instance_id: str,
+    app_version: str | None,
+    now_iso: str,
+) -> None:
+    """Upsert a findings row from a single warning entry.
+
+    Merges counts, timestamps, and app-version list.  Regression rule:
+    if the existing finding is status ``'fixed'`` it is reopened.
+    Status ``'ignored'`` is never auto-reopened.
+    """
+    key = (template or "", logger_name or "", level or "")
+    first_seen = w_first_seen or now_iso
+    last_seen = w_last_seen or now_iso
+
+    existing = db.execute(
+        "SELECT * FROM findings WHERE template=? AND logger=? AND level=?",
+        key,
+    ).fetchone()
+
+    if existing is None:
+        # Cardinality guard: cap distinct templates per logger
+        try:
+            cap = int(os.environ.get("DIAG_MAX_TEMPLATES_PER_LOGGER", "100"))
+        except ValueError:
+            cap = 100
+        if cap > 0:
+            tpl_count = db.execute(
+                "SELECT COUNT(*) FROM findings WHERE logger = ?",
+                (logger_name,),
+            ).fetchone()[0]
+            if tpl_count >= cap:
+                # Reroute to overflow key
+                overflow_key = ("[cardinality-overflow]", logger_name, "")
+                overflow_existing = db.execute(
+                    "SELECT * FROM findings WHERE template=? AND logger=? AND level=?",
+                    overflow_key,
+                ).fetchone()
+                if overflow_existing is None:
+                    # Create overflow finding directly (bypass cap)
+                    versions: list[str] = []
+                    if app_version:
+                        versions.append(app_version)
+                    db.execute(
+                        """\
+                        INSERT INTO findings
+                            (template, logger, level, category,
+                             first_seen, last_seen,
+                             total_count, instance_count, app_versions_json,
+                             sample_message, sample_context)
+                        VALUES (?, ?, ?, 'unknown', ?, ?, ?, 0, ?, ?, ?)
+                        """,
+                        (
+                            "[cardinality-overflow]",
+                            logger_name or "",
+                            "",
+                            first_seen,
+                            last_seen,
+                            count,
+                            json.dumps(sorted(set(versions))),
+                            "Cardinality cap reached for this logger; new distinct templates are being collapsed into this finding.",
+                            None,
+                        ),
+                    )
+                    finding_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+                else:
+                    # Merge into existing overflow row
+                    new_first = first_seen if first_seen < overflow_existing["first_seen"] else overflow_existing["first_seen"]
+                    new_last = last_seen if last_seen > overflow_existing["last_seen"] else overflow_existing["last_seen"]
+                    new_total = overflow_existing["total_count"] + count
+                    try:
+                        vers: list[str] = json.loads(overflow_existing["app_versions_json"])
+                    except (json.JSONDecodeError, TypeError):
+                        vers = []
+                    if app_version and app_version not in vers:
+                        vers.append(app_version)
+                    vers.sort()
+                    new_status = overflow_existing["status"]
+                    new_reopened = overflow_existing["reopened_at"]
+                    if overflow_existing["status"] == "fixed":
+                        new_status = "open"
+                        new_reopened = now_iso
+                    db.execute(
+                        """\
+                        UPDATE findings SET
+                            first_seen = ?, last_seen = ?, total_count = ?,
+                            app_versions_json = ?, status = ?, reopened_at = ?
+                        WHERE id = ?
+                        """,
+                        (new_first, new_last, new_total, json.dumps(vers),
+                         new_status, new_reopened, overflow_existing["id"]),
+                    )
+                    finding_id = overflow_existing["id"]
+
+                # Link instance + recompute instance_count
+                db.execute(
+                    "INSERT OR IGNORE INTO finding_instances (finding_id, instance_id) VALUES (?, ?)",
+                    (finding_id, instance_id),
+                )
+                inst_count = db.execute(
+                    "SELECT COUNT(*) FROM finding_instances WHERE finding_id = ?",
+                    (finding_id,),
+                ).fetchone()[0]
+                db.execute(
+                    "UPDATE findings SET instance_count = ? WHERE id = ?",
+                    (inst_count, finding_id),
+                )
+                return
+
+        # Normal creation path (no cap hit)
+        versions: list[str] = []
+        if app_version:
+            versions.append(app_version)
+        db.execute(
+            """\
+            INSERT INTO findings
+                (template, logger, level, first_seen, last_seen,
+                 total_count, instance_count, app_versions_json,
+                 sample_message, sample_context)
+            VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+            """,
+            (
+                template or "",
+                logger_name or "",
+                level or "",
+                first_seen,
+                last_seen,
+                count,
+                json.dumps(sorted(set(versions))),
+                sample_message,
+                sample_context,
+            ),
+        )
+        finding_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+    else:
+        new_first = first_seen if first_seen < existing["first_seen"] else existing["first_seen"]
+        new_last = last_seen if last_seen > existing["last_seen"] else existing["last_seen"]
+        new_total = existing["total_count"] + count
+        # merge app versions
+        try:
+            vers: list[str] = json.loads(existing["app_versions_json"])
+        except (json.JSONDecodeError, TypeError):
+            vers = []
+        if app_version and app_version not in vers:
+            vers.append(app_version)
+        vers.sort()
+
+        new_status = existing["status"]
+        new_reopened = existing["reopened_at"]
+        if existing["status"] == "fixed":
+            new_status = "open"
+            new_reopened = now_iso
+        # 'ignored' is never auto-reopened — no change
+
+        db.execute(
+            """\
+            UPDATE findings SET
+                first_seen = ?, last_seen = ?, total_count = ?,
+                app_versions_json = ?, status = ?, reopened_at = ?
+            WHERE id = ?
+            """,
+            (new_first, new_last, new_total, json.dumps(vers),
+             new_status, new_reopened, existing["id"]),
+        )
+        finding_id = existing["id"]
+
+    # Link instance
+    db.execute(
+        "INSERT OR IGNORE INTO finding_instances (finding_id, instance_id) VALUES (?, ?)",
+        (finding_id, instance_id),
+    )
+    # Recompute instance_count
+    inst_count = db.execute(
+        "SELECT COUNT(*) FROM finding_instances WHERE finding_id = ?",
+        (finding_id,),
+    ).fetchone()[0]
+    db.execute(
+        "UPDATE findings SET instance_count = ? WHERE id = ?",
+        (inst_count, finding_id),
+    )
+
+
+def rebuild_findings(db_path: str) -> int:
+    """Wipe and rebuild the findings tables from the warnings/batches data.
+
+    This is a bootstrap/repair tool.  **All** analysis_md, analysis_at,
+    reopened_at, category, status, and severity values are lost on rebuild
+    — findings revert to their default (``'unknown'`` category,
+    ``'open'`` status).
+
+    Returns the number of findings rows created.
+    """
+    with sqlite3.connect(db_path, timeout=10) as db:
+        db.row_factory = sqlite3.Row
+        db.execute("DELETE FROM finding_instances")
+        db.execute("DELETE FROM findings")
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        warning_rows = db.execute(
+            """\
+            SELECT w.template, w.logger, w.level, w.count,
+                   w.first_seen, w.last_seen, w.message,
+                   w.context_text, w.instance_id, b.app_version
+            FROM warnings w
+            JOIN batches b ON w.batch_id = b.id
+            ORDER BY w.first_seen ASC
+            """
+        ).fetchall()
+
+        for wr in warning_rows:
+            _upsert_finding(
+                db,
+                template=wr["template"] or "",
+                logger_name=wr["logger"] or "",
+                level=wr["level"] or "",
+                count=wr["count"] or 1,
+                w_first_seen=wr["first_seen"] or now_iso,
+                w_last_seen=wr["last_seen"] or now_iso,
+                sample_message=wr["message"],
+                sample_context=wr["context_text"],
+                instance_id=wr["instance_id"],
+                app_version=wr["app_version"],
+                now_iso=now_iso,
+            )
+
+        count = db.execute("SELECT COUNT(*) FROM findings").fetchone()[0]
+        db.commit()
+        return count
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +450,14 @@ def create_receiver_app(db_path: Optional[str] = None) -> Flask:
     app.teardown_appcontext(_close_db)
 
     init_db(db_path)
+
+    # Auto-backfill: populate findings from existing warnings if empty
+    with sqlite3.connect(db_path, timeout=10) as _boot_db:
+        _warn_count = _boot_db.execute("SELECT COUNT(*) FROM warnings").fetchone()[0]
+        _finding_count = _boot_db.execute("SELECT COUNT(*) FROM findings").fetchone()[0]
+    if _finding_count == 0 and _warn_count > 0:
+        logger.info("Findings table empty but warnings exist — running backfill")
+        rebuild_findings(db_path)
 
     # -- health ---------------------------------------------------------------
     @app.route("/api/v1/health")
@@ -237,6 +579,31 @@ def create_receiver_app(db_path: Optional[str] = None) -> Flask:
                     warning_rows,
                 )
 
+            # Aggregate findings
+            for w in warnings_raw:
+                ctx = w.get("context")
+                if isinstance(ctx, list):
+                    ctx_text = "\n".join(str(c) for c in ctx)
+                else:
+                    ctx_text = None
+                _upsert_finding(
+                    db,
+                    template=w.get("template") or "",
+                    logger_name=w.get("logger") or "",
+                    level=w.get("level") or "",
+                    count=w.get("count", 1),
+                    w_first_seen=w.get("first_seen") or now_iso,
+                    w_last_seen=w.get("last_seen") or now_iso,
+                    sample_message=w.get("message"),
+                    sample_context=ctx_text,
+                    instance_id=instance_id,
+                    app_version=payload.get("app_version"),
+                    now_iso=now_iso,
+                )
+
+            # Age out old raw data
+            _maybe_cleanup(db, now_iso)
+
             db.commit()
             return jsonify({"ok": True, "batch_id": batch_id, "warnings_stored": len(warning_rows)})
 
@@ -319,7 +686,176 @@ def create_receiver_app(db_path: Optional[str] = None) -> Flask:
                 "warnings": totals["warnings"],
             },
             "top_templates": [dict(r) for r in top_rows],
+            "findings": {
+                "by_status": {
+                    r["status"]: r["cnt"]
+                    for r in db.execute(
+                        "SELECT status, COUNT(*) AS cnt FROM findings GROUP BY status"
+                    ).fetchall()
+                },
+                "by_category": {
+                    r["category"]: r["cnt"]
+                    for r in db.execute(
+                        "SELECT category, COUNT(*) AS cnt FROM findings GROUP BY category"
+                    ).fetchall()
+                },
+                "needs_triage": db.execute(
+                    """\
+                    SELECT COUNT(*) FROM findings
+                    WHERE analysis_md IS NULL
+                       OR (reopened_at IS NOT NULL
+                           AND reopened_at > COALESCE(analysis_at, ''))
+                    """
+                ).fetchone()[0],
+            },
         })
+
+    # -- findings list --------------------------------------------------------
+    @app.route("/api/v1/findings")
+    def list_findings() -> Any:
+        db = _get_db()
+        status_filter = request.args.get("status", "open")
+        category_filter = request.args.get("category")
+        needs_triage = request.args.get("needs_triage") == "1"
+        try:
+            limit = min(int(request.args.get("limit", "50")), 200)
+        except ValueError:
+            limit = 50
+
+        where_clauses: list[str] = []
+        params: list[Any] = []
+        if status_filter != "all":
+            where_clauses.append("f.status = ?")
+            params.append(status_filter)
+        if category_filter:
+            where_clauses.append("f.category = ?")
+            params.append(category_filter)
+        if needs_triage:
+            where_clauses.append(
+                "(f.analysis_md IS NULL OR (f.reopened_at IS NOT NULL AND f.reopened_at > COALESCE(f.analysis_at, '')))"
+            )
+
+        where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+        query = f"""\
+            SELECT f.id, f.template, f.logger, f.level, f.category,
+                   f.status, f.severity, f.first_seen, f.last_seen,
+                   f.total_count, f.instance_count, f.app_versions_json,
+                   f.analysis_md, f.reopened_at
+            FROM findings f
+            {where_sql}
+            ORDER BY f.instance_count DESC, f.total_count DESC, f.last_seen DESC
+            LIMIT ?
+        """
+        params.append(limit)
+        rows = db.execute(query, params).fetchall()
+
+        findings_list: list[dict[str, Any]] = []
+        for r in rows:
+            rd = dict(r)
+            try:
+                rd["app_versions"] = json.loads(rd.pop("app_versions_json"))
+            except (json.JSONDecodeError, TypeError):
+                rd["app_versions"] = []
+            rd["has_analysis"] = rd.pop("analysis_md") is not None
+            findings_list.append(rd)
+
+        return jsonify({
+            "findings": findings_list,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        })
+
+    # -- findings detail ------------------------------------------------------
+    @app.route("/api/v1/findings/<int:finding_id>")
+    def get_finding(finding_id: int) -> Any:
+        db = _get_db()
+        row = db.execute("SELECT * FROM findings WHERE id = ?", (finding_id,)).fetchone()
+        if row is None:
+            return jsonify({"ok": False}), 404
+
+        rd = dict(row)
+        try:
+            rd["app_versions"] = json.loads(rd.pop("app_versions_json"))
+        except (json.JSONDecodeError, TypeError):
+            rd["app_versions"] = []
+
+        recent = db.execute(
+            """\
+            SELECT w.template, w.logger, w.level, w.message, w.context_text,
+                   w.count, w.first_seen, w.last_seen,
+                   b.instance_id, b.app_version, b.received_at
+            FROM warnings w
+            JOIN batches b ON w.batch_id = b.id
+            WHERE w.template = ?
+              AND COALESCE(w.logger, '') = ?
+              AND COALESCE(w.level, '') = ?
+            ORDER BY w.last_seen DESC
+            LIMIT 5
+            """,
+            (rd["template"], rd["logger"], rd["level"]),
+        ).fetchall()
+        rd["recent_evidence"] = [dict(r) for r in recent]
+        return jsonify(rd)
+
+    # -- findings update ------------------------------------------------------
+    @app.route("/api/v1/findings/<int:finding_id>", methods=["PATCH"])
+    def update_finding(finding_id: int) -> Any:
+        db = _get_db()
+        row = db.execute("SELECT * FROM findings WHERE id = ?", (finding_id,)).fetchone()
+        if row is None:
+            return jsonify({"ok": False}), 404
+
+        body = request.get_json(force=False, silent=True)
+        if body is None or not isinstance(body, dict):
+            return jsonify({"ok": False, "error": "invalid JSON body"}), 400
+
+        set_clauses: list[str] = []
+        params: list[Any] = []
+
+        if "status" in body:
+            if body["status"] not in _VALID_STATUSES:
+                return jsonify({"ok": False, "error": f"invalid status: {body['status']}"}), 400
+            set_clauses.append("status = ?")
+            params.append(body["status"])
+
+        if "category" in body:
+            if body["category"] not in _VALID_CATEGORIES:
+                return jsonify({"ok": False, "error": f"invalid category: {body['category']}"}), 400
+            set_clauses.append("category = ?")
+            params.append(body["category"])
+
+        if "severity" in body:
+            if body["severity"] not in _VALID_SEVERITIES:
+                return jsonify({"ok": False, "error": f"invalid severity: {body['severity']}"}), 400
+            set_clauses.append("severity = ?")
+            params.append(body["severity"])
+
+        if "analysis_md" in body:
+            now_iso = datetime.now(timezone.utc).isoformat()
+            set_clauses.append("analysis_md = ?")
+            params.append(body["analysis_md"])
+            set_clauses.append("analysis_at = ?")
+            params.append(now_iso)
+            if "status" not in body and row["status"] == "open":
+                set_clauses.append("status = ?")
+                params.append("triaged")
+
+        if not set_clauses:
+            return jsonify({"ok": False, "error": "no valid fields to update"}), 400
+
+        params.append(finding_id)
+        db.execute(
+            f"UPDATE findings SET {', '.join(set_clauses)} WHERE id = ?",
+            params,
+        )
+        db.commit()
+
+        updated = db.execute("SELECT * FROM findings WHERE id = ?", (finding_id,)).fetchone()
+        rd = dict(updated)
+        try:
+            rd["app_versions"] = json.loads(rd.pop("app_versions_json"))
+        except (json.JSONDecodeError, TypeError):
+            rd["app_versions"] = []
+        return jsonify(rd)
 
     return app
 
