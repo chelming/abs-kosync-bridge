@@ -439,6 +439,10 @@ _AUTH_EXEMPT_ENDPOINTS = {
     'kosync_admin.admin_plugin_version',
     'kosync_admin.admin_plugin_download',
 }
+_LOGIN_FAILURES: dict[tuple[str, str], list[float]] = {}
+_LOGIN_FAILURES_LOCK = threading.Lock()
+_LOGIN_FAILURE_LIMIT = 5
+_LOGIN_FAILURE_WINDOW = 60
 
 # Endpoints only admins may reach. Regular users get a simple home + match /
 # forge / sync; global engine config, library-wide tools, logs, stats and
@@ -908,11 +912,25 @@ def login():
     if request.method == 'POST':
         username = (request.form.get('username') or '').strip()
         password = request.form.get('password') or ''
+        failure_key = (username.lower(), request.remote_addr or "")
+        now = time.time()
+        with _LOGIN_FAILURES_LOCK:
+            failures = [t for t in _LOGIN_FAILURES.get(failure_key, []) if now - t < _LOGIN_FAILURE_WINDOW]
+            if failures:
+                _LOGIN_FAILURES[failure_key] = failures
+            else:
+                _LOGIN_FAILURES.pop(failure_key, None)
+        if len(failures) >= _LOGIN_FAILURE_LIMIT:
+            return render_template('login.html', error="Too many login attempts. Try again shortly."), 429
         user = None
         if database_service is not None:
             user = database_service.verify_user_credentials(username, password)
         if user:
+            with _LOGIN_FAILURES_LOCK:
+                _LOGIN_FAILURES.pop(failure_key, None)
             return _establish_session_and_redirect(user)
+        with _LOGIN_FAILURES_LOCK:
+            _LOGIN_FAILURES[failure_key] = failures + [now]
         error = "Invalid username or password"
         logger.warning("Failed login attempt for username '%s' from %s", username, request.remote_addr)
 
@@ -7704,6 +7722,13 @@ def update_hash(abs_id):
     user = current_user()
     if not _user_may_modify_book(user, abs_id):
         return _forbidden_book_response()
+    claimants = database_service.get_book_user_ids(abs_id)
+    if (
+        user is not None
+        and not user.is_admin
+        and len(claimants) > 1
+    ):
+        return ("Forbidden: only an administrator can change a shared book hash", 403)
 
     old_hash = book.kosync_doc_id
 
@@ -10335,6 +10360,8 @@ def create_app(test_container=None):
     )
     if str(os.environ.get("SESSION_COOKIE_SECURE", "")).strip().lower() in ("true", "1", "yes", "on"):
         app.config["SESSION_COOKIE_SECURE"] = True
+
+    app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024
 
     # Tests inject a test_container and exercise routes without a session; honor
     # Flask's conventional LOGIN_DISABLED so the auth guard is a no-op there.

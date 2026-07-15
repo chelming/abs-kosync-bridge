@@ -26,6 +26,13 @@ All notable changes to BookBridge will be documented in this file.
 
 ### Fixed
 
+- **Hardened dashboard and KoSync trust boundaries.** Storyteller search results
+  are rendered as text instead of executable HTML; requests are capped at 8 MiB;
+  unknown-document discovery uses a bounded worker queue; repeated login and
+  KoSync authentication failures are throttled; KoSync document access now
+  requires the authenticated user's book claim; and regular users cannot change
+  a hash shared with another claimant.
+
 - **KOReader device setup now suggests a reachable sync-server address.** Reverse-proxied
   HTTPS keeps the browser-visible origin without exposing the internal KoSync port, while
   direct LAN access uses the configured KoSync port. Loopback addresses now show a warning
