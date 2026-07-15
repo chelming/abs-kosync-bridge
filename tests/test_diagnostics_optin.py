@@ -168,11 +168,19 @@ class TestDashboardModal(_DiagnosticsOptInBase):
 
     def test_modal_shown_when_not_prompted(self):
         os.environ.pop('DIAGNOSTICS_PROMPTED', None)
+        os.environ['DIAGNOSTICS_ENDPOINT_URL'] = 'http://collector.example.com/api/v1/diagnostics'
         ctx = self._get_index_render_args()
         self.assertTrue(ctx.get('show_diagnostics_modal'))
 
     def test_modal_hidden_when_prompted(self):
         os.environ['DIAGNOSTICS_PROMPTED'] = 'true'
+        os.environ['DIAGNOSTICS_ENDPOINT_URL'] = 'http://collector.example.com/api/v1/diagnostics'
+        ctx = self._get_index_render_args()
+        self.assertFalse(ctx.get('show_diagnostics_modal'))
+
+    def test_modal_hidden_when_no_endpoint(self):
+        os.environ.pop('DIAGNOSTICS_PROMPTED', None)
+        os.environ.pop('DIAGNOSTICS_ENDPOINT_URL', None)
         ctx = self._get_index_render_args()
         self.assertFalse(ctx.get('show_diagnostics_modal'))
 

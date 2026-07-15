@@ -4392,6 +4392,7 @@ def index():
 
     show_diagnostics_modal = (
         not env_truthy('DIAGNOSTICS_PROMPTED')
+        and bool(os.environ.get('DIAGNOSTICS_ENDPOINT_URL', '').strip())
         and (current_app.config.get('LOGIN_DISABLED') or (user and getattr(user, 'is_admin', False)))
     )
 
