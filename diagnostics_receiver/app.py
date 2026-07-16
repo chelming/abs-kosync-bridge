@@ -632,9 +632,9 @@ def create_receiver_app(db_path: Optional[str] = None) -> Flask:
             # Global new-instance registration cap
             if row is None:
                 try:
-                    reg_cap = int(os.environ.get("DIAG_NEW_INSTANCES_PER_HOUR", "10"))
+                    reg_cap = int(os.environ.get("DIAG_NEW_INSTANCES_PER_HOUR", "50"))
                 except ValueError:
-                    reg_cap = 10
+                    reg_cap = 50
                 if reg_cap > 0:
                     cutoff = (now_dt - timedelta(hours=1)).isoformat()
                     new_count = db.execute(

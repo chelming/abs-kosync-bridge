@@ -283,7 +283,7 @@ Two per-call env-var quotas protect the receiver:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `DIAG_MIN_BATCH_INTERVAL_HOURS` | `20` | Minimum hours between batches from the same instance. Exceeded → `429 {"error": "too_frequent", "retry_after_hours": N}`. Set to `0` to disable. |
-| `DIAG_NEW_INSTANCES_PER_HOUR` | `10` | Maximum new instance registrations per hour (global). Exceeded → `429 {"error": "registration_limited"}`. Set to `0` to disable. |
+| `DIAG_NEW_INSTANCES_PER_HOUR` | `50` | Maximum new instance registrations per hour (global). Exceeded → `429 {"error": "registration_limited"}`. Set to `0` to disable. |
 
 ### Read-Token Gate
 
