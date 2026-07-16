@@ -179,7 +179,7 @@ DEFAULT_CONFIG = {
     'DIAGNOSTICS_OPT_IN': 'false',
     'DIAGNOSTICS_PROMPTED': '',
     'DIAGNOSTICS_INSTANCE_ID': '',
-    'DIAGNOSTICS_ENDPOINT_URL': '',
+    'DIAGNOSTICS_ENDPOINT_URL': 'https://bookbridge-diagnostics.duckdns.org/api/v1/diagnostics',
     'DIAGNOSTICS_LAST_SENT': '',
     'DIAGNOSTICS_INGEST_TOKEN': '',
     'SHELFMARK_URL': '',
