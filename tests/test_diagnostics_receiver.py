@@ -863,6 +863,7 @@ class TestFindings(unittest.TestCase):
         self.assertEqual(data["status"], "triaged")
         self.assertEqual(len(data["recent_evidence"]), 1)
         self.assertIn("context_text", data["recent_evidence"][0])
+        self.assertIn("services_json", data["recent_evidence"][0])
 
     def test_get_detail_404(self) -> None:
         resp = self._client.get("/api/v1/findings/99999")

@@ -1,0 +1,9 @@
+services:
+  bookbridge_reports:
+    build: .
+    container_name: bookbridge_reports
+    restart: unless-stopped
+    ports:
+      - "5761:8000"
+    volumes:
+      - ./docs:/site/docs:ro

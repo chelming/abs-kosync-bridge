@@ -58,3 +58,10 @@ tests/test_omni_mcp_server.py
 plans/
 phase1_schema_design.md
 pytest_output.txt
+
+# reports_site: generated analytics content stays local-only (public repo)
+reports_site/docs/findings.md
+reports_site/docs/reports/*
+!reports_site/docs/reports/index.md
+!reports_site/docs/reports/2026-07-16_sample-finding.md
+reports_site/site/

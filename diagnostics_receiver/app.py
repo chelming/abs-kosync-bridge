@@ -988,7 +988,7 @@ def create_receiver_app(db_path: Optional[str] = None) -> Flask:
             """\
             SELECT w.template, w.logger, w.level, w.message, w.context_text,
                    w.count, w.first_seen, w.last_seen,
-                   b.instance_id, b.app_version, b.received_at
+                   b.instance_id, b.app_version, b.received_at, b.services_json
             FROM warnings w
             JOIN batches b ON w.batch_id = b.id
             WHERE w.template = ?
