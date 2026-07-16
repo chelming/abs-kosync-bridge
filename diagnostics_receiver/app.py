@@ -12,6 +12,7 @@ import os
 import re
 import secrets
 import sqlite3
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -23,6 +24,10 @@ _SCHEMA_VERSION = 1
 _MAX_BODY_BYTES = 1_000_000
 _DEFAULT_EXPORT_CAP = 500
 _CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_COMMENT_BODY_CAP = 2000
+_USER_MESSAGE_CAP = 2000
+_FINDING_RESPONSE_CAP = 10000
+_MANUAL_REPORTS_PER_DAY = 5
 
 
 def _sanitize_text(value: Any, max_len: int) -> str:
@@ -68,16 +73,20 @@ CREATE TABLE IF NOT EXISTS instances (
 );
 
 CREATE TABLE IF NOT EXISTS batches (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    instance_id  TEXT NOT NULL,
-    received_at  TEXT NOT NULL,
-    sent_at      TEXT,
-    app_version  TEXT,
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    instance_id   TEXT NOT NULL,
+    received_at   TEXT NOT NULL,
+    sent_at       TEXT,
+    app_version   TEXT,
     services_json TEXT,
-    total_books  INTEGER,
-    window_start TEXT,
-    window_end   TEXT,
-    dropped      INTEGER NOT NULL DEFAULT 0
+    total_books   INTEGER,
+    window_start  TEXT,
+    window_end    TEXT,
+    dropped       INTEGER NOT NULL DEFAULT 0,
+    is_manual     INTEGER NOT NULL DEFAULT 0,
+    user_message  TEXT,
+    response_md   TEXT,
+    response_at   TEXT
 );
 
 CREATE TABLE IF NOT EXISTS warnings (
@@ -118,6 +127,8 @@ CREATE TABLE IF NOT EXISTS findings (
     analysis_md        TEXT,
     analysis_at        TEXT,
     reopened_at        TEXT,
+    response_md        TEXT,
+    response_at        TEXT,
     UNIQUE(template, logger, level)
 );
 
@@ -127,9 +138,20 @@ CREATE TABLE IF NOT EXISTS finding_instances (
     PRIMARY KEY (finding_id, instance_id)
 );
 
+CREATE TABLE IF NOT EXISTS finding_comments (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    finding_id   INTEGER NOT NULL REFERENCES findings(id) ON DELETE CASCADE,
+    instance_id  TEXT NOT NULL REFERENCES instances(instance_id),
+    body         TEXT NOT NULL,
+    created_at   TEXT NOT NULL,
+    hidden       INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE INDEX IF NOT EXISTS idx_findings_status    ON findings(status);
 CREATE INDEX IF NOT EXISTS idx_findings_category  ON findings(category);
 CREATE INDEX IF NOT EXISTS idx_findings_last_seen ON findings(last_seen);
+CREATE INDEX IF NOT EXISTS idx_fc_finding         ON finding_comments(finding_id);
+CREATE INDEX IF NOT EXISTS idx_fc_instance        ON finding_comments(instance_id);
 
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 """
@@ -138,7 +160,7 @@ CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 def init_db(db_path: str) -> None:
     """Create the schema if it does not already exist (idempotent)."""
     os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
-    with sqlite3.connect(db_path, timeout=10) as conn:
+    with closing(sqlite3.connect(db_path, timeout=10)) as conn, conn:
         conn.executescript(_DDL)
     _ensure_columns(db_path)
     logger.info("Database initialised at %s", db_path)
@@ -155,8 +177,18 @@ def _ensure_columns(db_path: str) -> None:
             "token": "TEXT",
             "banned": "INTEGER NOT NULL DEFAULT 0",
         },
+        "batches": {
+            "is_manual": "INTEGER NOT NULL DEFAULT 0",
+            "user_message": "TEXT",
+            "response_md": "TEXT",
+            "response_at": "TEXT",
+        },
+        "findings": {
+            "response_md": "TEXT",
+            "response_at": "TEXT",
+        },
     }
-    with sqlite3.connect(db_path, timeout=10) as conn:
+    with closing(sqlite3.connect(db_path, timeout=10)) as conn, conn:
         for table, columns in expected.items():
             existing = {
                 row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
@@ -165,6 +197,27 @@ def _ensure_columns(db_path: str) -> None:
                 if col not in existing:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typedef}")
                     logger.info("Added column %s.%s", table, col)
+
+        # Ensure finding_comments table exists for DBs created before Phase 11
+        existing_tables = {
+            row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        if "finding_comments" not in existing_tables:
+            conn.executescript("""\
+                CREATE TABLE IF NOT EXISTS finding_comments (
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    finding_id   INTEGER NOT NULL REFERENCES findings(id) ON DELETE CASCADE,
+                    instance_id  TEXT NOT NULL REFERENCES instances(instance_id),
+                    body         TEXT NOT NULL,
+                    created_at   TEXT NOT NULL,
+                    hidden       INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS idx_fc_finding  ON finding_comments(finding_id);
+                CREATE INDEX IF NOT EXISTS idx_fc_instance ON finding_comments(instance_id);
+            """)
+            logger.info("Created finding_comments table")
 
 
 def _maybe_cleanup(db: sqlite3.Connection, now_iso: str) -> None:
@@ -251,14 +304,72 @@ def _bearer_token() -> str:
 def _read_authorized() -> bool:
     """Check whether the request is authorised for read/PATCH endpoints.
 
-    ``DIAG_READ_TOKEN`` env var controls access.  When unset or empty,
-    all requests are allowed.  When set, the request must carry a matching
-    ``Authorization: Bearer <token>`` header.
+    ``DIAG_READ_TOKEN`` is mandatory.  Requests fail closed when it is unset
+    and otherwise must carry a matching ``Authorization: Bearer <token>``
+    header.
     """
     required = os.environ.get("DIAG_READ_TOKEN", "").strip()
     if not required:
-        return True
+        return False
     return hmac.compare_digest(_bearer_token(), required)
+
+
+def _authenticate_instance_token(
+    db: sqlite3.Connection,
+) -> Optional[sqlite3.Row]:
+    """Authenticate the request via Bearer token against ``instances.token``.
+
+    Returns the matching instance row, or *None* if no/invalid token.
+    Uses a direct parameterized lookup.
+    """
+    token = _bearer_token()
+    if not token:
+        return None
+    row = db.execute(
+        "SELECT * FROM instances WHERE token = ?", (token,)
+    ).fetchone()
+    return row
+
+
+def _linked_findings(
+    db: sqlite3.Connection,
+    batch_id: int,
+) -> list[dict[str, Any]]:
+    """Return findings represented by warning keys in one batch."""
+    rows = db.execute(
+        """\
+        SELECT DISTINCT f.id, f.template, f.category, f.status, f.severity,
+                        f.analysis_md
+        FROM warnings w
+        JOIN findings f
+          ON f.template = COALESCE(w.template, '')
+         AND f.logger = COALESCE(w.logger, '')
+         AND f.level = COALESCE(w.level, '')
+        WHERE w.batch_id = ?
+        ORDER BY f.id
+        """,
+        (batch_id,),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _admin_submission(
+    db: sqlite3.Connection,
+    row: sqlite3.Row,
+) -> dict[str, Any]:
+    """Serialize a manual submission for the maintainer API."""
+    result = {
+        "id": row["id"],
+        "instance_id": row["instance_id"],
+        "submitted_at": row["received_at"],
+        "app_version": row["app_version"],
+        "user_message": row["user_message"],
+        "response_md": row["response_md"],
+        "response_at": row["response_at"],
+        "status": "replied" if (row["response_md"] or "").strip() else "received",
+    }
+    result["linked_findings"] = _linked_findings(db, row["id"])
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -473,6 +584,7 @@ def rebuild_findings(db_path: str) -> int:
     """
     with sqlite3.connect(db_path, timeout=10) as db:
         db.row_factory = sqlite3.Row
+        db.execute("DELETE FROM finding_comments")
         db.execute("DELETE FROM finding_instances")
         db.execute("DELETE FROM findings")
         now_iso = datetime.now(timezone.utc).isoformat()
@@ -581,12 +693,27 @@ def create_receiver_app(db_path: Optional[str] = None) -> Flask:
         if not isinstance(warnings_raw, list):
             return jsonify({"ok": False, "error": "warnings must be a list"}), 400
 
+        manual = payload.get("manual", False)
+        if not isinstance(manual, bool):
+            return jsonify({"ok": False, "error": "manual must be a boolean"}), 400
+
+        raw_user_message = payload.get("user_message")
+        if raw_user_message is not None and not isinstance(raw_user_message, str):
+            return jsonify({"ok": False, "error": "user_message must be a string"}), 400
+        user_message: Optional[str] = None
+        if manual and raw_user_message is not None:
+            sanitized_message = _sanitize_text(raw_user_message, _USER_MESSAGE_CAP).strip()
+            if sanitized_message:
+                user_message = sanitized_message
+
         now_iso = datetime.now(timezone.utc).isoformat()
         now_dt = datetime.now(timezone.utc)
         services_json = json.dumps(payload.get("services"), separators=(",", ":"))
 
         try:
             db = _get_db()
+            # Serialize quota checks with their insert across receiver workers.
+            db.execute("BEGIN IMMEDIATE")
 
             # -- auth / quota checks ----------------------------------------
             row = db.execute(
@@ -603,31 +730,63 @@ def create_receiver_app(db_path: Optional[str] = None) -> Flask:
                 if not hmac.compare_digest(_bearer_token(), row["token"]):
                     return jsonify({"ok": False, "error": "invalid token"}), 401
 
-            # Per-instance batch-interval quota
-            try:
-                interval_hours = int(os.environ.get("DIAG_MIN_BATCH_INTERVAL_HOURS", "20"))
-            except ValueError:
-                interval_hours = 20
-            if interval_hours > 0 and row is not None:
-                last_batch = db.execute(
-                    "SELECT received_at FROM batches WHERE instance_id = ? ORDER BY received_at DESC LIMIT 1",
-                    (instance_id,),
+            if manual:
+                cutoff = (now_dt - timedelta(hours=24)).isoformat()
+                manual_usage = db.execute(
+                    """\
+                    SELECT COUNT(*) AS report_count, MIN(received_at) AS oldest_at
+                    FROM batches
+                    WHERE instance_id = ? AND is_manual = 1 AND received_at > ?
+                    """,
+                    (instance_id, cutoff),
                 ).fetchone()
-                if last_batch and last_batch["received_at"]:
+                if manual_usage["report_count"] >= _MANUAL_REPORTS_PER_DAY:
+                    retry = 24.0
                     try:
-                        last_dt = datetime.fromisoformat(last_batch["received_at"])
-                        if last_dt.tzinfo is None:
-                            last_dt = last_dt.replace(tzinfo=timezone.utc)
-                        elapsed_h = (now_dt - last_dt).total_seconds() / 3600
-                        if elapsed_h < interval_hours:
-                            retry = round(interval_hours - elapsed_h, 2)
-                            return jsonify({
-                                "ok": False,
-                                "error": "too_frequent",
-                                "retry_after_hours": retry,
-                            }), 429
+                        oldest_dt = datetime.fromisoformat(manual_usage["oldest_at"])
+                        if oldest_dt.tzinfo is None:
+                            oldest_dt = oldest_dt.replace(tzinfo=timezone.utc)
+                        retry = max(
+                            0.01,
+                            (oldest_dt + timedelta(hours=24) - now_dt).total_seconds() / 3600,
+                        )
                     except (ValueError, TypeError):
                         pass
+                    return jsonify({
+                        "ok": False,
+                        "error": "manual_report_quota_exceeded",
+                        "retry_after_hours": round(retry, 2),
+                    }), 429
+            else:
+                # Manual reports neither consume nor reset the automatic cadence.
+                try:
+                    interval_hours = int(os.environ.get("DIAG_MIN_BATCH_INTERVAL_HOURS", "20"))
+                except ValueError:
+                    interval_hours = 20
+                if interval_hours > 0 and row is not None:
+                    last_batch = db.execute(
+                        """\
+                        SELECT received_at FROM batches
+                        WHERE instance_id = ? AND is_manual = 0
+                        ORDER BY received_at DESC LIMIT 1
+                        """,
+                        (instance_id,),
+                    ).fetchone()
+                    if last_batch and last_batch["received_at"]:
+                        try:
+                            last_dt = datetime.fromisoformat(last_batch["received_at"])
+                            if last_dt.tzinfo is None:
+                                last_dt = last_dt.replace(tzinfo=timezone.utc)
+                            elapsed_h = (now_dt - last_dt).total_seconds() / 3600
+                            if elapsed_h < interval_hours:
+                                retry = round(interval_hours - elapsed_h, 2)
+                                return jsonify({
+                                    "ok": False,
+                                    "error": "too_frequent",
+                                    "retry_after_hours": retry,
+                                }), 429
+                        except (ValueError, TypeError):
+                            pass
 
             # Global new-instance registration cap
             if row is None:
@@ -708,8 +867,9 @@ def create_receiver_app(db_path: Optional[str] = None) -> Flask:
                 """\
                 INSERT INTO batches
                     (instance_id, received_at, sent_at, app_version, services_json,
-                     total_books, window_start, window_end, dropped)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     total_books, window_start, window_end, dropped, is_manual,
+                     user_message)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     instance_id,
@@ -721,6 +881,8 @@ def create_receiver_app(db_path: Optional[str] = None) -> Flask:
                     window.get("start"),
                     window.get("end"),
                     payload.get("dropped", 0),
+                    1 if manual else 0,
+                    user_message,
                 ),
             )
             batch_id = cur.lastrowid
@@ -878,6 +1040,38 @@ def create_receiver_app(db_path: Optional[str] = None) -> Flask:
             (since,),
         ).fetchall()
 
+        submission_totals = db.execute(
+            """\
+            SELECT COUNT(*) AS total,
+                   COALESCE(SUM(
+                       CASE WHEN TRIM(COALESCE(user_message, '')) <> '' THEN 1 ELSE 0 END
+                   ), 0) AS with_message,
+                   COALESCE(SUM(
+                       CASE WHEN TRIM(COALESCE(user_message, '')) <> ''
+                                  AND TRIM(COALESCE(response_md, '')) = ''
+                            THEN 1 ELSE 0 END
+                   ), 0) AS awaiting_response,
+                   COALESCE(SUM(
+                       CASE WHEN TRIM(COALESCE(user_message, '')) <> ''
+                                  AND TRIM(COALESCE(response_md, '')) <> ''
+                            THEN 1 ELSE 0 END
+                   ), 0) AS responded
+            FROM batches
+            WHERE is_manual = 1 AND received_at > ?
+            """,
+            (since,),
+        ).fetchone()
+        awaiting_response_all_time = db.execute(
+            """\
+            SELECT COUNT(*) FROM batches
+            WHERE is_manual = 1
+              AND TRIM(COALESCE(user_message, '')) <> ''
+              AND TRIM(COALESCE(response_md, '')) = ''
+            """
+        ).fetchone()[0]
+        submission_summary = dict(submission_totals)
+        submission_summary["awaiting_response_all_time"] = awaiting_response_all_time
+
         return jsonify({
             "window_days": days,
             "totals": {
@@ -886,6 +1080,7 @@ def create_receiver_app(db_path: Optional[str] = None) -> Flask:
                 "warnings": totals["warnings"],
             },
             "top_templates": [dict(r) for r in top_rows],
+            "submissions": submission_summary,
             "findings": {
                 "by_status": {
                     r["status"]: r["cnt"]
@@ -902,9 +1097,10 @@ def create_receiver_app(db_path: Optional[str] = None) -> Flask:
                 "needs_triage": db.execute(
                     """\
                     SELECT COUNT(*) FROM findings
-                    WHERE analysis_md IS NULL
-                       OR (reopened_at IS NOT NULL
-                           AND reopened_at > COALESCE(analysis_at, ''))
+                    WHERE status IN ('open', 'triaged')
+                      AND (analysis_md IS NULL
+                           OR (reopened_at IS NOT NULL
+                               AND reopened_at > COALESCE(analysis_at, '')))
                     """
                 ).fetchone()[0],
             },
@@ -943,7 +1139,7 @@ def create_receiver_app(db_path: Optional[str] = None) -> Flask:
             SELECT f.id, f.template, f.logger, f.level, f.category,
                    f.status, f.severity, f.first_seen, f.last_seen,
                    f.total_count, f.instance_count, f.app_versions_json,
-                   f.analysis_md, f.reopened_at
+                   f.analysis_md, f.analysis_at, f.reopened_at
             FROM findings f
             {where_sql}
             ORDER BY f.instance_count DESC, f.total_count DESC, f.last_seen DESC
@@ -959,7 +1155,24 @@ def create_receiver_app(db_path: Optional[str] = None) -> Flask:
                 rd["app_versions"] = json.loads(rd.pop("app_versions_json"))
             except (json.JSONDecodeError, TypeError):
                 rd["app_versions"] = []
-            rd["has_analysis"] = rd.pop("analysis_md") is not None
+            rd["has_analysis"] = rd["analysis_md"] is not None
+            feedback = db.execute(
+                """\
+                SELECT COUNT(DISTINCT b.id) AS feedback_count,
+                       COUNT(DISTINCT CASE
+                           WHEN TRIM(COALESCE(b.response_md, '')) = '' THEN b.id
+                       END) AS unanswered_feedback_count
+                FROM batches b
+                JOIN warnings w ON w.batch_id = b.id
+                WHERE b.is_manual = 1
+                  AND TRIM(COALESCE(b.user_message, '')) <> ''
+                  AND COALESCE(w.template, '') = ?
+                  AND COALESCE(w.logger, '') = ?
+                  AND COALESCE(w.level, '') = ?
+                """,
+                (rd["template"], rd["logger"], rd["level"]),
+            ).fetchone()
+            rd.update(dict(feedback))
             findings_list.append(rd)
 
         return jsonify({
@@ -988,7 +1201,7 @@ def create_receiver_app(db_path: Optional[str] = None) -> Flask:
             """\
             SELECT w.template, w.logger, w.level, w.message, w.context_text,
                    w.count, w.first_seen, w.last_seen,
-                   b.instance_id, b.app_version, b.received_at
+                   b.instance_id, b.app_version, b.received_at, b.services_json
             FROM warnings w
             JOIN batches b ON w.batch_id = b.id
             WHERE w.template = ?
@@ -1000,6 +1213,38 @@ def create_receiver_app(db_path: Optional[str] = None) -> Flask:
             (rd["template"], rd["logger"], rd["level"]),
         ).fetchall()
         rd["recent_evidence"] = [dict(r) for r in recent]
+
+        comments = db.execute(
+            """\
+            SELECT id, body, created_at, hidden, instance_id
+            FROM finding_comments
+            WHERE finding_id = ?
+            ORDER BY created_at ASC
+            """,
+            (finding_id,),
+        ).fetchall()
+        rd["comments"] = [dict(c) for c in comments]
+
+        feedback = db.execute(
+            """\
+            SELECT DISTINCT b.id AS submission_id, b.instance_id,
+                            b.received_at AS submitted_at, b.user_message,
+                            b.response_md, b.response_at,
+                            CASE WHEN TRIM(COALESCE(b.response_md, '')) <> ''
+                                 THEN 'replied' ELSE 'received' END AS status
+            FROM batches b
+            JOIN warnings w ON w.batch_id = b.id
+            WHERE b.is_manual = 1
+              AND TRIM(COALESCE(b.user_message, '')) <> ''
+              AND COALESCE(w.template, '') = ?
+              AND COALESCE(w.logger, '') = ?
+              AND COALESCE(w.level, '') = ?
+            ORDER BY b.received_at DESC
+            """,
+            (rd["template"], rd["logger"], rd["level"]),
+        ).fetchall()
+        rd["user_feedback"] = [dict(item) for item in feedback]
+
         return jsonify(rd)
 
     # -- findings update ------------------------------------------------------
@@ -1048,6 +1293,21 @@ def create_receiver_app(db_path: Optional[str] = None) -> Flask:
                 set_clauses.append("status = ?")
                 params.append("triaged")
 
+        if "response_md" in body:
+            value = body["response_md"]
+            if value is not None and not isinstance(value, str):
+                return jsonify({"ok": False, "error": "response_md must be a string or null"}), 400
+            now_iso = datetime.now(timezone.utc).isoformat()
+            if value:
+                truncated = value[:_FINDING_RESPONSE_CAP]
+                set_clauses.append("response_md = ?")
+                params.append(truncated)
+                set_clauses.append("response_at = ?")
+                params.append(now_iso)
+            else:
+                set_clauses.append("response_md = NULL")
+                set_clauses.append("response_at = NULL")
+
         if not set_clauses:
             return jsonify({"ok": False, "error": "no valid fields to update"}), 400
 
@@ -1065,6 +1325,295 @@ def create_receiver_app(db_path: Optional[str] = None) -> Flask:
         except (json.JSONDecodeError, TypeError):
             rd["app_versions"] = []
         return jsonify(rd)
+
+    # -- maintainer submission list -----------------------------------------
+    @app.route("/api/v1/submissions")
+    def list_submissions() -> Any:
+        if not _read_authorized():
+            return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+        try:
+            limit = max(1, min(int(request.args.get("limit", "100")), 200))
+        except ValueError:
+            limit = 100
+        db = _get_db()
+        rows = db.execute(
+            """\
+            SELECT id, instance_id, received_at, app_version, user_message,
+                   response_md, response_at
+            FROM batches
+            WHERE is_manual = 1
+            ORDER BY received_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return jsonify({
+            "submissions": [_admin_submission(db, row) for row in rows],
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        })
+
+    # -- maintainer submission detail / response ----------------------------
+    @app.route("/api/v1/submissions/<int:submission_id>", methods=["GET", "PATCH"])
+    def submission_detail(submission_id: int) -> Any:
+        if not _read_authorized():
+            return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+        db = _get_db()
+        row = db.execute(
+            """\
+            SELECT id, instance_id, received_at, app_version, user_message,
+                   response_md, response_at
+            FROM batches
+            WHERE id = ? AND is_manual = 1
+            """,
+            (submission_id,),
+        ).fetchone()
+        if row is None:
+            return jsonify({"ok": False, "error": "not found"}), 404
+
+        if request.method == "GET":
+            return jsonify(_admin_submission(db, row))
+
+        if not (row["user_message"] or "").strip():
+            return jsonify({
+                "ok": False,
+                "error": "submission has no user message",
+            }), 400
+
+        body = request.get_json(force=False, silent=True)
+        if body is None or not isinstance(body, dict):
+            return jsonify({"ok": False, "error": "invalid JSON body"}), 400
+        if "response_md" not in body:
+            return jsonify({"ok": False, "error": "response_md is required"}), 400
+        response_md = body["response_md"]
+        if response_md is not None and not isinstance(response_md, str):
+            return jsonify({
+                "ok": False,
+                "error": "response_md must be a string or null",
+            }), 400
+
+        stored_response = (
+            response_md[:_FINDING_RESPONSE_CAP].strip()
+            if isinstance(response_md, str)
+            else ""
+        )
+        if stored_response:
+            response_at = datetime.now(timezone.utc).isoformat()
+        else:
+            stored_response = None
+            response_at = None
+        db.execute(
+            "UPDATE batches SET response_md = ?, response_at = ? WHERE id = ?",
+            (stored_response, response_at, submission_id),
+        )
+        db.commit()
+        updated = db.execute(
+            """\
+            SELECT id, instance_id, received_at, app_version, user_message,
+                   response_md, response_at
+            FROM batches WHERE id = ?
+            """,
+            (submission_id,),
+        ).fetchone()
+        return jsonify(_admin_submission(db, updated))
+
+    # -- instance submission history ----------------------------------------
+    @app.route("/api/v1/my/submissions")
+    def my_submissions() -> Any:
+        db = _get_db()
+        instance = _authenticate_instance_token(db)
+        if instance is None:
+            return jsonify({"ok": False, "error": "unauthorized"}), 401
+        if instance["banned"]:
+            return jsonify({"ok": False, "error": "banned"}), 403
+
+        rows = db.execute(
+            """\
+            SELECT id, received_at AS submitted_at, user_message,
+                   response_md, response_at,
+                   CASE WHEN TRIM(COALESCE(response_md, '')) <> ''
+                        THEN 'replied' ELSE 'received' END AS status
+            FROM batches
+            WHERE instance_id = ? AND is_manual = 1
+            ORDER BY received_at DESC
+            LIMIT 50
+            """,
+            (instance["instance_id"],),
+        ).fetchall()
+        return jsonify({"submissions": [dict(row) for row in rows]})
+
+    # -- my findings (instance-token auth) ----------------------------------
+    @app.route("/api/v1/my/findings")
+    def my_findings() -> Any:
+        db = _get_db()
+        instance = _authenticate_instance_token(db)
+        if instance is None:
+            return jsonify({"ok": False, "error": "unauthorized"}), 401
+        if instance["banned"]:
+            return jsonify({"ok": False, "error": "banned"}), 403
+
+        iid = instance["instance_id"]
+        rows = db.execute(
+            """\
+            SELECT f.id, f.template, f.logger, f.level, f.category,
+                   f.status, f.severity, f.first_seen, f.last_seen,
+                   f.total_count, f.instance_count, f.app_versions_json,
+                   f.analysis_md, f.analysis_at, f.reopened_at,
+                   f.response_md, f.response_at
+            FROM findings f
+            JOIN finding_instances fi ON f.id = fi.finding_id
+            WHERE fi.instance_id = ?
+            ORDER BY f.instance_count DESC, f.total_count DESC, f.last_seen DESC
+            """,
+            (iid,),
+        ).fetchall()
+
+        findings_list: list[dict[str, Any]] = []
+        for r in rows:
+            rd = dict(r)
+            try:
+                rd["app_versions"] = json.loads(rd.pop("app_versions_json"))
+            except (json.JSONDecodeError, TypeError):
+                rd["app_versions"] = []
+            rd["has_analysis"] = rd.pop("analysis_md") is not None
+            rd.pop("analysis_at", None)
+
+            comments = db.execute(
+                """\
+                SELECT id, body, created_at, instance_id
+                FROM finding_comments
+                WHERE finding_id = ? AND instance_id = ? AND hidden = 0
+                ORDER BY created_at ASC
+                """,
+                (rd["id"], iid),
+            ).fetchall()
+            rd["comments"] = [
+                {
+                    "id": c["id"],
+                    "body": c["body"],
+                    "created_at": c["created_at"],
+                    "is_mine": c["instance_id"] == iid,
+                }
+                for c in comments
+            ]
+            findings_list.append(rd)
+
+        return jsonify({
+            "findings": findings_list,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        })
+
+    # -- instance comments: create ------------------------------------------
+    @app.route("/api/v1/findings/<int:finding_id>/comments", methods=["POST"])
+    def create_comment(finding_id: int) -> Any:
+        db = _get_db()
+        instance = _authenticate_instance_token(db)
+        if instance is None:
+            return jsonify({"ok": False, "error": "unauthorized"}), 401
+        if instance["banned"]:
+            return jsonify({"ok": False, "error": "banned"}), 403
+
+        iid = instance["instance_id"]
+
+        # Verify finding exists and instance is a member
+        finding = db.execute(
+            "SELECT id FROM findings WHERE id = ?", (finding_id,)
+        ).fetchone()
+        if finding is None:
+            return jsonify({"ok": False, "error": "not found"}), 404
+
+        member = db.execute(
+            "SELECT 1 FROM finding_instances WHERE finding_id = ? AND instance_id = ?",
+            (finding_id, iid),
+        ).fetchone()
+        if member is None:
+            return jsonify({"ok": False, "error": "not found"}), 404
+
+        body = request.get_json(force=False, silent=True)
+        if body is None or not isinstance(body, dict):
+            return jsonify({"ok": False, "error": "invalid JSON body"}), 400
+
+        raw_body = body.get("body")
+        if not isinstance(raw_body, str) or not raw_body.strip():
+            return jsonify({"ok": False, "error": "body must be a non-empty string"}), 400
+
+        sanitized = _sanitize_text(raw_body, _COMMENT_BODY_CAP)
+        if not sanitized.strip():
+            return jsonify({"ok": False, "error": "body must be a non-empty string"}), 400
+
+        # Rolling 24h per-instance comment quota
+        try:
+            quota = int(os.environ.get("DIAG_MAX_COMMENTS_PER_DAY", "20"))
+        except ValueError:
+            quota = 20
+        if quota > 0:
+            cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+            recent_count = db.execute(
+                "SELECT COUNT(*) FROM finding_comments WHERE instance_id = ? AND created_at > ?",
+                (iid, cutoff),
+            ).fetchone()[0]
+            if recent_count >= quota:
+                return jsonify({
+                    "ok": False,
+                    "error": "comment_quota_exceeded",
+                }), 429
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        cur = db.execute(
+            """\
+            INSERT INTO finding_comments (finding_id, instance_id, body, created_at, hidden)
+            VALUES (?, ?, ?, ?, 0)
+            """,
+            (finding_id, iid, sanitized, now_iso),
+        )
+        db.commit()
+
+        return jsonify({
+            "id": cur.lastrowid,
+            "body": sanitized,
+            "created_at": now_iso,
+            "is_mine": True,
+        }), 201
+
+    # -- admin comment moderation -------------------------------------------
+    @app.route(
+        "/api/v1/findings/<int:finding_id>/comments/<int:comment_id>",
+        methods=["PATCH"],
+    )
+    def update_comment(finding_id: int, comment_id: int) -> Any:
+        if not _read_authorized():
+            return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+        db = _get_db()
+
+        comment = db.execute(
+            "SELECT * FROM finding_comments WHERE id = ? AND finding_id = ?",
+            (comment_id, finding_id),
+        ).fetchone()
+        if comment is None:
+            return jsonify({"ok": False, "error": "not found"}), 404
+
+        body = request.get_json(force=False, silent=True)
+        if body is None or not isinstance(body, dict):
+            return jsonify({"ok": False, "error": "invalid JSON body"}), 400
+
+        if "hidden" not in body or not isinstance(body["hidden"], bool):
+            return jsonify({"ok": False, "error": "hidden must be a boolean"}), 400
+
+        db.execute(
+            "UPDATE finding_comments SET hidden = ? WHERE id = ?",
+            (1 if body["hidden"] else 0, comment_id),
+        )
+        db.commit()
+
+        return jsonify({
+            "id": comment_id,
+            "hidden": body["hidden"],
+            "body": comment["body"],
+            "created_at": comment["created_at"],
+            "instance_id": comment["instance_id"],
+        })
 
     return app
 

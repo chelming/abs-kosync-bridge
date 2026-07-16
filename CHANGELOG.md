@@ -8,14 +8,24 @@ All notable changes to BookBridge will be documented in this file.
 
 ### Added
 
+- Added manual diagnostics bug reports with an optional written note and a
+  compact, instance-private reply history under Settings. All admins on one
+  BookBridge installation share that history; regular users and other
+  installations cannot read it.
+- Added a private local maintainer dashboard with fleet totals, clickable
+  Bugscout anomaly analysis, technical evidence, links to written user feedback,
+  and submission-level response forms. It runs only on `localhost:5761` and
+  keeps receiver credentials server-side.
+
 - **Opt-in anonymous diagnostics.** Help improve BookBridge by sharing a small
   daily diagnostic report: deduplicated warning lines from your sync logs with
   book titles, file paths, and URLs replaced by anonymous tokens — never your
   library contents or credentials. Admins are asked once via a dashboard
   prompt (existing installs see it after upgrading), and the choice can be
-  reviewed anytime under Settings → Diagnostics, which also shows the
-  instance ID, the last send time, and a "Send report now" button. Nothing is
-  ever collected or sent unless you opt in.
+  reviewed anytime under Settings → Diagnostics, which also shows the last
+  automatic send, an optional problem-description box, a "Send bug report"
+  button, and recent replies. Nothing is ever collected or sent unless you opt
+  in.
 
 - **CUDA container images are now published alongside CPU images.** Use a
   `-cuda` tag such as `latest-cuda` or `dev-cuda` on amd64 hosts with NVIDIA
@@ -25,6 +35,18 @@ All notable changes to BookBridge will be documented in this file.
   [@ykpdang](https://github.com/ykpdang). (#320)
 
 ### Fixed
+
+- Diagnostics maintainer APIs now fail closed when their read token is missing,
+  manual-report quota checks are atomic, overlapping sender runs cannot consume
+  unsent warning evidence, and private dashboard requests reject redirects and
+  non-loopback plain HTTP endpoints.
+
+- **Audiobookshelf audiobook-to-ebook sync now handles unopened and separate ebook items.**
+  Explicit ABS ebook mappings participate from a 0% baseline before their first read,
+  legacy direct matches resolve the separate ebook item ID, and percentage-only audio
+  locations are converted to a validated EPUB CFI before ABS is updated. Zero-progress
+  resets now target the ebook item as well. Existing mappings self-heal on their next
+  sync cycle without rematching or database changes. (#322)
 
 - **Hardened dashboard and KoSync trust boundaries.** Storyteller search results
   are rendered as text instead of executable HTML; requests are capped at 8 MiB;
