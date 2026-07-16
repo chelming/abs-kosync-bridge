@@ -309,3 +309,9 @@ The bridge exposes an admin-only **My Reports** page. Its backend reads the
 instance's existing ingest token at request time and proxies finding reads and
 comment writes to the receiver. The receiver URL and bearer token are never
 included in browser responses.
+
+The local reports console regenerates active finding pages from receiver state
+on every diagnostics scan. Maintainers can respond from the repository root
+with `powershell -ExecutionPolicy Bypass -File reports_site/respond-finding.ps1
+<id> "<message>"`; the next scan renders that response and visible submitter
+comments into the corresponding MkDocs page.

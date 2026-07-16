@@ -8,6 +8,9 @@ All notable changes to BookBridge will be documented in this file.
 
 ### Added
 
+- Added a maintainer response helper and receiver-backed regeneration of the
+  local diagnostics reports console, including current responses and visible
+  submitter comments.
 - Added an admin-only My Reports dashboard where opted-in instances can read
   maintainer responses and add comments without exposing diagnostics tokens to
   the browser.

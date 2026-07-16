@@ -1,5 +1,5 @@
 site_name: BookBridge Bug Reports
-site_description: Internal bug-report analytics from the opt-in diagnostics pipeline, with developer responses.
+site_description: Internal bug-report analytics from the opt-in diagnostics pipeline, with fully regenerated reports, maintainer responses, and submitter comments.
 
 theme:
   name: material
