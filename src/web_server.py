@@ -1065,12 +1065,7 @@ def account_integrations():
 # Library-lookup credentials the primary admin's account also lends to the
 # engine's global singletons (shelf-watch, scans, suggestions, ABS socket,
 # manifest). Mirrored to the global settings when the primary admin saves.
-_ENGINE_MIRROR_KEYS = (
-    "ABS_KEY", "ABS_LIBRARY_ID",
-    "BOOKLORE_USER", "BOOKLORE_PASSWORD", "BOOKLORE_SHELF_NAME", "BOOKLORE_LIBRARY_ID",
-    "BOOKORBIT_USER", "BOOKORBIT_PASSWORD", "BOOKORBIT_SHELF_NAME",
-    "CWA_USERNAME", "CWA_PASSWORD", "CWA_SYNC_TOKEN",
-)
+from src.utils.user_config import ENGINE_MIRROR_KEYS as _ENGINE_MIRROR_KEYS
 
 
 def _apply_user_integrations(user_id):
