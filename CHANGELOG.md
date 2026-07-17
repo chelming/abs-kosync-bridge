@@ -47,6 +47,17 @@ All notable changes to BookBridge will be documented in this file.
   GPU passed through to the container before choosing CUDA. Contributed by
   [@ykpdang](https://github.com/ykpdang). (#320)
 
+### Changed
+
+- Updated dashboard service cards and top library shortcuts with official
+  BookOrbit, Shelfmark, KOReader, BookFusion, and Hardcover artwork. The shared
+  navigation now links to the signed-in user's configured audiobook and ebook
+  libraries instead of always presenting Audiobookshelf plus every enabled
+  reading integration.
+
+- Replaced the Account menu's Docs emoji with a consistent vector icon and
+  repaired the GitHub Pages logo, favicon, and homepage hero buttons.
+
 ### Fixed
 
 - **Missing remote annotations and already-absent collection items no longer

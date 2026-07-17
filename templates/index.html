@@ -129,7 +129,7 @@
                 {% if integrations.bookorbitaudio and mapping.audio_source == 'BookOrbit' %}
                 <a href="{{ mapping.bookorbit_audio_url|default(get_val('BOOKORBIT_SERVER'), true) }}" target="_blank" rel="noopener noreferrer"
                     class="service-item" title="Open BookOrbit audiobook">
-                    <span class="service-icon-emoji">🪐</span>
+                    <img src="/static/bookorbit.svg" alt="BOA" class="service-icon">
                     <span class="service-name">BO Audio</span>
                     {% if mapping.states.bookorbitaudio is defined %}
                     <span class="service-value">{{ '%.1f' | format(mapping.states.bookorbitaudio.percentage|default(0)) }}%</span>
@@ -160,7 +160,7 @@
                     title="Update KoReader Hash (Current: {{ mapping.kosync_doc_id }})"
                     data-abs-id="{{ mapping.abs_id }}" data-title="{{ mapping.abs_title|escape }}"
                     data-hash="{{ mapping.kosync_doc_id }}" onclick="updateKoSyncHash(event)">
-                    <span class="service-icon-emoji">📖</span>
+                    <img src="/static/koreader.png" alt="KO" class="service-icon">
                     <span class="service-name">KoSync</span>
                     {% if mapping.states.kosync is defined %}
                     <span class="service-value">{{ '%.1f' | format(mapping.states.kosync.percentage|default(0))
@@ -216,7 +216,7 @@
                 {% if integrations.bookorbit and (mapping.states.bookorbit is defined or mapping.ebook_source == 'BookOrbit') %}
                 <a href="{{ mapping.bookorbit_url|default(get_val('BOOKORBIT_SERVER'), true) }}" target="_blank" rel="noopener noreferrer"
                     class="service-item" title="Open in BookOrbit">
-                    <span class="service-icon-emoji">🪐</span>
+                    <img src="/static/bookorbit.svg" alt="BO" class="service-icon">
                     <span class="service-name">BookOrbit</span>
                     <span class="service-value">
                         {% if mapping.states.bookorbit is defined %}
@@ -230,7 +230,8 @@
 
                 {% if integrations.bookfusion %}
                 <div class="service-item progress-item-hc" title="{% if mapping.bookfusion_linked %}BookFusion linked{% else %}Link to BookFusion{% endif %}">
-                    <span class="service-icon-emoji {% if not mapping.bookfusion_linked %}grayscale-muted{% endif %}">BF</span>
+                    <img src="/static/bookfusion.png" alt="BF"
+                        class="service-icon {% if not mapping.bookfusion_linked %}grayscale-muted{% endif %}">
                     <span class="service-name">BookFusion</span>
                     <span class="service-value cursor-pointer color-inherit" title="Click to edit BookFusion link"
                         data-abs-id="{{ mapping.abs_id }}" data-title="{{ mapping.display_title|default(mapping.abs_title)|escape }}"
@@ -256,7 +257,7 @@
                         rel="noopener noreferrer"
                         title="{% if mapping.hardcover_book_id %}Open {{ mapping.hardcover_title }} in Hardcover{% else %}Not linked to Hardcover{% endif %}"
                         class="hc-link {% if not mapping.hardcover_book_id %}pe-none{% endif %}">
-                        <img src="/static/hardcover.png" alt="HC"
+                        <img src="/static/hardcover.svg" alt="HC"
                             class="service-icon {% if not mapping.hardcover_book_id %}grayscale-muted{% endif %}"
                             onerror="this.style.display='none'; this.nextElementSibling.classList.remove('hidden');">
                         <span class="hidden service-icon-emoji">📚</span>

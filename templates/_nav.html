@@ -30,45 +30,61 @@
         {% endif %}
     </div>
 
+    {% macro library_link(url, icon, title) -%}
+    <a href="{{ url }}" class="nav-icon-link" target="_blank" rel="noopener noreferrer" title="{{ title }}">
+        {% if icon %}
+        <img src="{{ icon }}" alt="{{ title }}">
+        {% else %}
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" aria-label="{{ title }}">
+            <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"></path>
+            <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"></path>
+        </svg>
+        {% endif %}
+    </a>
+    {%- endmacro %}
+
+    {% set abs_library_url = get_user_val('ABS_SERVER', abs_server) %}
+    {% set grimmory_url = get_user_val('BOOKLORE_SERVER', booklore_server) %}
+    {% set bookorbit_url = get_user_val('BOOKORBIT_SERVER', get_val('BOOKORBIT_SERVER')) %}
+    {% set cwa_url = get_user_val('CWA_SERVER', get_val('CWA_SERVER')) %}
+    {% set grimmory_configured = grimmory_url and get_user_bool('BOOKLORE_ENABLED') %}
+    {% set bookorbit_configured = bookorbit_url and get_user_bool('BOOKORBIT_ENABLED') %}
+    {% set cwa_configured = cwa_url and get_user_bool('CWA_ENABLED') %}
+
     <div class="library-links">
-        {% if abs_server %}
-        <a href="{{ abs_server }}" class="nav-icon-link" target="_blank" rel="noopener noreferrer" title="Audiobookshelf">
-            <img src="/static/audiobookshelf.png" alt="Audiobookshelf">
-        </a>
+        {% set audio_source = '' %}
+        {% if abs_library_url and abs_library_url|lower != 'disabled' %}
+            {% set audio_source = 'abs' %}
+            {{ library_link(abs_library_url, '/static/audiobookshelf.png', 'Audiobookshelf audiobook library') }}
+        {% elif grimmory_configured %}
+            {% set audio_source = 'grimmory' %}
+            {{ library_link(grimmory_url, '/static/grimmory.webp', 'Grimmory audiobook library') }}
+        {% elif bookorbit_configured %}
+            {% set audio_source = 'bookorbit' %}
+            {{ library_link(bookorbit_url, '/static/bookorbit.svg', 'BookOrbit audiobook library') }}
         {% endif %}
 
-        {# Ebook/reading-app links reflect THIS user's enabled integration:
-           admin -> BookOrbit/Grimmory, another user -> their CWA, etc. #}
-        {% if booklore_server and get_user_bool('BOOKLORE_ENABLED') %}
-        <a href="{{ booklore_server }}" class="nav-icon-link" target="_blank" rel="noopener noreferrer" title="Ebook Library">
-            <img src="/static/grimmory.webp" alt="Ebook Library">
-        </a>
+        {% set ebook_source = '' %}
+        {% if cwa_configured %}
+            {% set ebook_source = 'cwa' %}
+        {% elif grimmory_configured %}
+            {% set ebook_source = 'grimmory' %}
+        {% elif bookorbit_configured %}
+            {% set ebook_source = 'bookorbit' %}
         {% endif %}
-
-        {% if get_val('BOOKORBIT_SERVER') and get_user_bool('BOOKORBIT_ENABLED') %}
-        <a href="{{ get_val('BOOKORBIT_SERVER') }}" class="nav-icon-link" target="_blank" rel="noopener noreferrer" title="BookOrbit Library">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"></path>
-                <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"></path>
-            </svg>
-        </a>
-        {% endif %}
-
-        {% if get_val('CWA_SERVER') and get_user_bool('CWA_ENABLED') %}
-        <a href="{{ get_val('CWA_SERVER') }}" class="nav-icon-link" target="_blank" rel="noopener noreferrer" title="Calibre-Web Library">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"></path>
-                <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"></path>
-            </svg>
-        </a>
+        {% if ebook_source and ebook_source != audio_source %}
+            {% if ebook_source == 'cwa' %}
+                {{ library_link(cwa_url, '', 'Calibre-Web ebook library') }}
+            {% elif ebook_source == 'grimmory' %}
+                {{ library_link(grimmory_url, '/static/grimmory.webp', 'Grimmory ebook library') }}
+            {% elif ebook_source == 'bookorbit' %}
+                {{ library_link(bookorbit_url, '/static/bookorbit.svg', 'BookOrbit ebook library') }}
+            {% endif %}
         {% endif %}
 
         {% if shelfmark_url and (get_bool('SHELFMARK_ENABLED') or (get_val('SHELFMARK_URL') != '' and get_val('SHELFMARK_ENABLED') == '')) %}
         <a href="/shelfmark" class="nav-icon-link" target="_blank" rel="noopener noreferrer" title="Shelfmark Tool">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"></path>
-                <line x1="7" y1="7" x2="7.01" y2="7"></line>
-            </svg>
+            <img src="/static/shelfmark.png" alt="Shelfmark Tool">
         </a>
         {% endif %}
     </div>
@@ -82,7 +98,14 @@
         <div class="user-menu-dropdown" role="menu">
             <a href="/account" class="user-menu-item" role="menuitem">👤 Account</a>
             <a href="https://cporcellijr.github.io/bookbridge/" class="user-menu-item" role="menuitem"
-                target="_blank" rel="noopener noreferrer">📚 Docs</a>
+                target="_blank" rel="noopener noreferrer" title="Documentation">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                    stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"></path>
+                    <path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"></path>
+                </svg>
+                <span>Docs</span>
+            </a>
             <a href="/logout" class="user-menu-item" role="menuitem">🚪 Logout</a>
         </div>
     </div>
