@@ -44,6 +44,13 @@ All notable changes to BookBridge will be documented in this file.
 
 ### Fixed
 
+- **Unavailable linked books no longer create false diagnostics or lead sync.**
+  BookFusion highlight pulls quietly skip a saved book that now returns 404
+  without deleting local annotation state, while genuine server failures still
+  warn. Storyteller books whose linked ReadAloud EPUB cannot be resolved or
+  recovered are excluded before leader selection, preventing a stale UUID from
+  rolling another service back to 0%.
+
 - **BookFusion ReadAloud uploads now reject incomplete Storyteller packages.**
   Before upload and automatic linking, BookBridge verifies that every narration
   reference in the EPUB's SMIL overlays points to an audio file actually present
