@@ -1,4 +1,5 @@
 import os
+import random
 import time
 import logging
 import threading
@@ -205,6 +206,12 @@ class BookloreClient:
         return (
             "uq_refresh_token" in text
             or ("duplicate entry" in text and "refresh_token" in text)
+            # Grimmory's GlobalExceptionHandler sanitizes the DB error to a
+            # generic message; the raw duplicate-key text only reaches the
+            # server logs. The sole unique-key insert during login is the
+            # refresh-token row, so a data-conflict response here can only
+            # mean two logins in the same second produced identical JWTs.
+            or "a data conflict occurred" in text
         )
 
     def _current_token_is_fresh(self) -> bool:
@@ -237,14 +244,17 @@ class BookloreClient:
 
                     duplicate_conflict = self._is_duplicate_refresh_token_failure(response)
                     if duplicate_conflict and attempt < self._token_login_max_attempts:
+                        # Jitter so two clients that collided also don't retry
+                        # in lockstep and collide again in the same second.
+                        delay = self._token_login_retry_delay + random.uniform(0, 0.4)
                         logger.warning(
                             "Grimmory login conflict (duplicate refresh token). "
                             "Retrying in %.1fs (attempt %d/%d).",
-                            self._token_login_retry_delay,
+                            delay,
                             attempt,
                             self._token_login_max_attempts,
                         )
-                        time.sleep(self._token_login_retry_delay)
+                        time.sleep(delay)
                         continue
 
                     logger.error(

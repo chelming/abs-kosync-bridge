@@ -343,7 +343,35 @@ def test_get_fresh_token_retries_duplicate_refresh_token_conflict(booklore_clien
 
     assert token == "token-123"
     assert booklore_client.session.post.call_count == 2
-    mock_sleep.assert_called_once_with(booklore_client._token_login_retry_delay)
+    mock_sleep.assert_called_once()
+    slept = mock_sleep.call_args[0][0]
+    assert booklore_client._token_login_retry_delay <= slept <= booklore_client._token_login_retry_delay + 0.4
+
+
+def test_get_fresh_token_retries_sanitized_data_conflict(booklore_client):
+    """Grimmory's exception handler hides the duplicate-key detail behind a
+    generic 'data conflict' message — the retry must still trigger on it."""
+    conflict_response = MagicMock()
+    conflict_response.status_code = 400
+    conflict_response.text = (
+        '{"message":"A data conflict occurred. The operation could not be '
+        'completed.","status":400,"timestamp":"2026-07-08T14:13:14.453310552"}'
+    )
+
+    success_response = MagicMock()
+    success_response.status_code = 200
+    success_response.json.return_value = {"accessToken": "token-456"}
+
+    booklore_client.session.post = MagicMock(
+        side_effect=[conflict_response, success_response]
+    )
+
+    with patch("time.sleep") as mock_sleep:
+        token = booklore_client._get_fresh_token()
+
+    assert token == "token-456"
+    assert booklore_client.session.post.call_count == 2
+    mock_sleep.assert_called_once()
 
 
 def test_get_fresh_token_skips_login_when_cached_token_is_fresh(booklore_client):
